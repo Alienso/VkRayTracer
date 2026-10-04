@@ -52,10 +52,13 @@ void Application::initVulkan() {
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
     createLightBuffers();
     updateScene();  // uploads the geometry, builds the BLASes and collects the instances
+    chooseExtents();
     createRayTracingImages();
-    createExposureResources();  // the trace shader's descriptor set points at its buffer
+    createDisplayImages();
+    createExposureResources();
     createRayTracingDescriptors();
     createRayTracingPipeline();
+    createDisplayResources();  // reads the radiance image and the exposure buffer
 
     initImGui();
 }
@@ -86,6 +89,7 @@ void Application::cleanup() {
     cleanupImGui();
     cleanupSwapChain();
     destroyRayTracingImages();
+    destroyDisplayImages();
     cleanupRayTracing();
 
     vkDestroyRenderPass(device, renderPass, nullptr);

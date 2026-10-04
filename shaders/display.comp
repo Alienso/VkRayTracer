@@ -1,0 +1,49 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+// Display pass: exposure and tone mapping. Turns the linear HDR image (path traced; later DLSS output) into the
+// 8-bit image that gets blitted to the swapchain. Kept out of the trace shader so that whatever sits between
+// the two (DLSS) gets linear, unbounded input. One thread per output pixel, in 8x8 tiles.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;
+layout(binding = 1, rgba8) uniform writeonly image2D displayImage;
+// Automatic exposure, measured by exposure.comp from this frame's HDR image just before this pass
+// (only the multiplier is needed here; the histograms before it are skipped: 2 x 256 uints)
+layout(binding = 2, scalar) readonly buffer ExposureState {
+    uint exposureHistograms[512];
+    float measuredExposure;
+};
+
+// Must match DisplayPushConstants in Application.h
+layout(push_constant) uniform DisplaySettings {
+    float exposure;     // manual multiplier, or the compensation (2^stops) on top of the measured exposure
+    uint autoExposure;  // 1 = also multiply by measuredExposure
+    uint toneMapping;   // 0 = clamp, 1 = ACES filmic curve
+    uint passThrough;   // 1 = debug view: show the values as they are (no exposure, no tone mapping)
+} display;
+
+// Squeezes unbounded brightness into [0, 1] with a film-like S-curve instead of clipping it.
+// (Krzysztof Narkowicz's fit of the ACES curve)
+vec3 toneMapACES(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(displayImage);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;  // the last tiles can stick out past the image edge
+    }
+
+    vec3 color = imageLoad(hdrImage, pixel).rgb;
+    if (display.passThrough == 0) {
+        color = color * display.exposure * (display.autoExposure != 0 ? measuredExposure : 1.0);
+        if (display.toneMapping != 0) {
+            color = toneMapACES(color);
+        }
+    }
+    // Linear values; values above 1 are clamped when stored as 8 bit. The blit to the sRGB swapchain encodes them.
+    imageStore(displayImage, pixel, vec4(color, 1.0));
+}

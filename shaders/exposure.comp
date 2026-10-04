@@ -2,20 +2,19 @@
 //
 // Automatic exposure, like a camera's light meter or the eye adapting to a dark room.
 //
-// Pass 0 (one invocation per pixel): sorts every pixel of the accumulated (linear, unbounded) image into a
+// Pass 0 (one invocation per pixel): sorts every pixel of the HDR image (linear, unbounded) into a
 //   histogram of brightness, on a log scale: each bin is the same fraction of a stop wide.
 // Pass 1 (a single workgroup): ignores the darkest and brightest percentages (deep shadows; the sun, the sky,
 //   fireflies), averages the rest in log space, picks the exposure that maps that average to middle grey
 //   and moves the current exposure towards it a bit (adaptation over time).
 //
-// The result stays on the GPU: the trace shader reads it next frame (binding 13 there). One frame late is
-// invisible, the adaptation takes many frames anyway.
+// The result stays on the GPU: display.comp reads it right afterwards, in the same frame (binding 2 there).
 //
 #extension GL_EXT_scalar_block_layout : require
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba32f) uniform readonly image2D accumulationImage;
+layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;  // the image display.comp shows
 
 const uint BIN_COUNT = 256;  // bin 0: black (ignored), bins 1..255: log2(luminance) from minLog2 to minLog2 + log2Range
 
@@ -61,9 +60,9 @@ void buildHistogram() {
 
     // Count into shared memory first: 256 threads hammering 256 global counters would be much slower.
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(accumulationImage);
+    ivec2 size = imageSize(hdrImage);
     if (pixel.x < size.x && pixel.y < size.y) {
-        vec3 color = imageLoad(accumulationImage, pixel).rgb;
+        vec3 color = imageLoad(hdrImage, pixel).rgb;
         float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
         uint bin = 0;  // black, or broken: not metered (a black background shouldn't make everything brighter)
         if (luminance >= exp2(pc.minLog2) && !isinf(luminance)) {

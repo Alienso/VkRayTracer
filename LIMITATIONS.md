@@ -129,15 +129,15 @@ Only glTF / GLB is loaded.
 
 ## Display
 
-### Auto exposure is one frame late and meters like a camera
-The exposure is measured from the finished image and used for the next frame (invisible: adaptation takes
-many frames anyway). Like a real light meter, it maps the average to middle grey, so a mostly white scene
+### Auto exposure meters like a camera
+The exposure is measured from the finished HDR image and applied by the display pass in the same frame.
+Like a real light meter, it maps the average to middle grey, so a mostly white scene
 (the sunlit default floor) comes out greyer than with a hand-picked exposure; use Compensation. The
 histogram covers luminance 2^-20 .. 2^12; darker pixels count as black and are not metered. While
 accumulating, the measurement comes from the averaged image, so early noisy frames may meter slightly
 differently from the converged result.
-- Where: shaders/exposure.comp, source/Exposure.cpp.
-- Fix (if it matters): meter before tracing from a cheap low-resolution pass; a smarter metering mode.
+- Where: shaders/exposure.comp, source/Exposure.cpp (applied in shaders/display.comp).
+- Fix (if it matters): a smarter metering mode.
 
 ## DLSS / Streamline (Phase 7)
 

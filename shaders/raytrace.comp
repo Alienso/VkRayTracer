@@ -7,9 +7,10 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
-layout(binding = 1, rgba8) uniform writeonly image2D outColor;
+// Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
+// view). Exposure and tone mapping happen later, in display.comp.
+layout(binding = 1, rgba32f) uniform image2D radianceImage;
 layout(binding = 2, r32f) uniform writeonly image2D outDepth;     // hit distance along the ray, 0 = miss
-layout(binding = 6, rgba32f) uniform image2D accumulationImage;  // running average over frames
 
 // Must match SceneUniforms in Application.h
 layout(binding = 3) uniform SceneUniforms {
@@ -29,15 +30,12 @@ layout(binding = 3) uniform SceneUniforms {
     uint maxBounces;        // number of surfaces a path may hit
     uint frameIndex;        // changes every frame, seeds the random numbers
     uint shadowsEnabled;
-    uint accumulatedFrames; // frames already averaged into accumulationImage (0 = start over)
+    uint accumulatedFrames; // frames already averaged into radianceImage (0 = start over)
     uint accumulate;        // 0 = show only this frame
-    float exposure;         // brightness multiplier applied before tone mapping
-    uint toneMapping;       // 0 = clamp, 1 = ACES filmic curve
     uint debugView;         // 0 = path traced, otherwise one property of the first hit, see DebugView in Application.h
     uint emissiveTriangleCount;
     uint emissiveSampling;  // 0 = bounces only, 1 = light sampling only, 2 = both with MIS
     uint blurCaustics;      // 1 = path regularization, see tracePath
-    uint autoExposure;      // 1 = also multiply by the measured exposure (exposure.comp)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -63,7 +61,7 @@ struct MeshInfo {
 
 layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
 layout(binding = 5, scalar) readonly buffer Indices { uint indices[]; };
-layout(binding = 7, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
+layout(binding = 6, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
 
 // Must match GpuMaterial in Application.h. Each value is a constant, multiplied by its texture if the index is >= 0.
 struct Material {
@@ -84,7 +82,7 @@ struct Material {
     uint solid;                    // transmissive: 1 = closed volume that refracts, 0 = thin (light passes straight)
     vec3 absorption;               // inside a solid: light left after distance d is exp(-absorption * d)
 };
-layout(binding = 9, scalar) readonly buffer Materials { Material materials[]; };
+layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
 
 const uint ALPHA_OPAQUE = 0;
 const uint ALPHA_MASK = 1;
@@ -99,21 +97,14 @@ struct EmissiveTriangle {
     float cdf;              // running sum of the probabilities, for the binary search
     float area;
 };
-layout(binding = 10, scalar) readonly buffer EmissiveTriangles { EmissiveTriangle emissiveTriangles[]; };
+layout(binding = 9, scalar) readonly buffer EmissiveTriangles { EmissiveTriangle emissiveTriangles[]; };
 // Per TLAS instance: where its triangles start in emissiveTriangles, or -1 if it doesn't glow.
-layout(binding = 11, scalar) readonly buffer InstanceFirstLight { int instanceFirstLight[]; };
+layout(binding = 10, scalar) readonly buffer InstanceFirstLight { int instanceFirstLight[]; };
 
 // How much light the GGX reflection returns in total (see createSpecularAlbedoTable in Materials.cpp):
 // entry [roughness * SIZE + view angle], total for a given F0 = F0 * x + y.
-layout(binding = 12, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
+layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
 const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
-
-// Automatic exposure, measured by exposure.comp after the previous frame (only the multiplier is needed here;
-// the histogram before it is skipped: 2 x 256 uints)
-layout(binding = 13, scalar) readonly buffer ExposureState {
-    uint exposureHistograms[512];
-    float measuredExposure;
-};
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
 const uint EMISSIVE_LIGHT_SAMPLING = 1;
@@ -121,7 +112,7 @@ const uint EMISSIVE_MIS = 2;
 
 // All textures of all models in one array. Neighboring pixels can hit different materials, so the
 // index differs between the threads of a warp: nonuniformEXT tells the compiler to handle that.
-layout(binding = 8) uniform sampler2D textures[];
+layout(binding = 7) uniform sampler2D textures[];
 
 const float PI = 3.14159265359;
 
@@ -851,13 +842,6 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
     return emission * transmittance * brdf * l.z / pdfLight * weight;
 }
 
-// Squeezes unbounded brightness into [0, 1] with a film-like S-curve instead of clipping it.
-// (Krzysztof Narkowicz's fit of the ACES curve)
-vec3 toneMapACES(vec3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
-
 // ---------------------------------------------------------------------------------------------
 
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
@@ -1068,7 +1052,7 @@ vec3 debugColor(vec3 direction, inout uint seed, out float depth) {
         case 2: return vec3(fract(hit.uv), 0.0);
         case 3: return randomColor(hit.meshIndex);
         case 4: return randomColor(hit.materialIndex);
-        // linear values; the blit to the sRGB swapchain makes them look right
+        // linear values, shown without exposure or tone mapping; the blit to the sRGB swapchain makes them look right
         case 5: return hit.albedo;
         case 6: return vec3(hit.metallic);
         case 7: return vec3(hit.roughness);
@@ -1081,7 +1065,7 @@ vec3 debugColor(vec3 direction, inout uint seed, out float depth) {
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(outColor);
+    ivec2 size = imageSize(radianceImage);
     if (pixel.x >= size.x || pixel.y >= size.y) {
         return;  // the last tiles can stick out past the image edge
     }
@@ -1091,7 +1075,7 @@ void main() {
     if (scene.debugView != 0) {
         float depth;
         vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed, depth);
-        imageStore(outColor, pixel, vec4(color, 1.0));
+        imageStore(radianceImage, pixel, vec4(color, 1.0));
         imageStore(outDepth, pixel, vec4(depth));
         return;
     }
@@ -1117,16 +1101,11 @@ void main() {
 
     // Running average: the n-th frame gets weight 1/(n+1), so every frame counts equally.
     if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {
-        vec3 previous = imageLoad(accumulationImage, pixel).rgb;
+        vec3 previous = imageLoad(radianceImage, pixel).rgb;
         color = mix(previous, color, 1.0 / float(scene.accumulatedFrames + 1));
     }
-    imageStore(accumulationImage, pixel, vec4(color, 1.0));  // stays linear and unbounded
-
-    // Only what is displayed gets exposure and tone mapping, so changing them does not restart accumulation.
-    vec3 displayColor = color * scene.exposure * (scene.autoExposure != 0 ? measuredExposure : 1.0);
-    if (scene.toneMapping != 0) {
-        displayColor = toneMapACES(displayColor);
-    }
-    imageStore(outColor, pixel, vec4(displayColor, 1.0));  // values above 1 are clamped when stored as 8 bit
+    // Stays linear and unbounded. Exposure and tone mapping only affect the displayed image (display.comp),
+    // so changing them does not restart accumulation.
+    imageStore(radianceImage, pixel, vec4(color, 1.0));
     imageStore(outDepth, pixel, vec4(depth));
 }

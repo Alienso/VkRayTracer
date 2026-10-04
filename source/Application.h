@@ -43,16 +43,13 @@ struct SceneUniforms {
     uint32_t shadowsEnabled;
     uint32_t accumulatedFrames;
     uint32_t accumulate;
-    float exposure;
-    uint32_t toneMapping;
     uint32_t debugView;
     uint32_t emissiveTriangleCount;  // entries in the light list
     uint32_t emissiveSampling;       // EmissiveSampling
     uint32_t blurCaustics;           // 1 = path regularization, see tracePath in the shader
-    uint32_t autoExposure;           // 1 = multiply by the measured exposure (ExposureState) as well
 };
 
-// Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the trace shader
+// Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the display pass
 // reads the exposure from it, and a copy comes back to the CPU (a few frames late) for the UI.
 static constexpr uint32_t exposureBinCount = 256;
 struct ExposureState {
@@ -81,6 +78,14 @@ struct ExposurePushConstants {
     float brightenSpeed;
     float darkenSpeed;
     float deltaTime;
+};
+
+// Must match the push constants in shaders/display.comp
+struct DisplayPushConstants {
+    float exposure;         // manual multiplier, or 2^compensation on top of the measured exposure
+    uint32_t autoExposure;  // 1 = multiply by the measured exposure (ExposureState) as well
+    uint32_t toneMapping;   // 0 = clamp, 1 = ACES
+    uint32_t passThrough;   // 1 = debug view, shown without exposure and tone mapping
 };
 
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
@@ -337,16 +342,18 @@ private:
     bool addAtOriginalSize = false;  // UI: new objects keep the file's size (whole scenes like Sponza)
     std::string loadError;
 
-    // Ray tracing output, recreated with the swapchain
-    VkImage rtColorImage;
-    VkDeviceMemory rtColorImageMemory;
-    VkImageView rtColorImageView;
+    // Two sizes (chooseExtents): the path tracer renders at renderExtent, the display pass writes outputExtent
+    // (the window). Equal for now; DLSS will render smaller and upscale.
+    VkExtent2D renderExtent{};
+    VkExtent2D outputExtent{};
+
+    // Ray tracing output at render size, recreated with the swapchain
+    VkImage radianceImage;  // linear HDR: running average while accumulating, else this frame (or a debug view)
+    VkDeviceMemory radianceImageMemory;
+    VkImageView radianceImageView;
     VkImage rtDepthImage;
     VkDeviceMemory rtDepthImageMemory;
     VkImageView rtDepthImageView;
-    VkImage accumulationImage;
-    VkDeviceMemory accumulationImageMemory;
-    VkImageView accumulationImageView;
 
     VkDescriptorSetLayout rtDescriptorSetLayout;
     VkDescriptorPool rtDescriptorPool;
@@ -380,6 +387,16 @@ private:
     VkPipelineLayout exposurePipelineLayout;
     VkPipeline exposurePipeline;
     float frameDeltaTime = 0.0f;   // seconds, set in mainLoop
+
+    // Display pass (Display.cpp): exposure + tone mapping into an 8-bit image at output size, blitted to the swapchain
+    VkImage displayImage;
+    VkDeviceMemory displayImageMemory;
+    VkImageView displayImageView;
+    VkDescriptorSetLayout displayDescriptorSetLayout;
+    VkDescriptorPool displayDescriptorPool;
+    VkDescriptorSet displayDescriptorSet;
+    VkPipelineLayout displayPipelineLayout;
+    VkPipeline displayPipeline;
 
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
@@ -487,6 +504,15 @@ private:
     void recordExposure(VkCommandBuffer commandBuffer);
     void destroyExposureResources();
     void buildExposureUi();
+
+    // Display.cpp
+    void chooseExtents();
+    void createDisplayImages();
+    void destroyDisplayImages();
+    void createDisplayResources();
+    void updateDisplayDescriptorSet();
+    void recordDisplay(VkCommandBuffer commandBuffer);
+    void destroyDisplayResources();
 
     void createRayTracingImages();
     void destroyRayTracingImages();

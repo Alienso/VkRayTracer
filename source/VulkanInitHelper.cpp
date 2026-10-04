@@ -488,13 +488,18 @@ void Application::recreateSwapChain() {
     cleanupSwapChain();
     destroyRenderFinishedSemaphores();
     destroyRayTracingImages();
+    destroyDisplayImages();
 
     createSwapChain();
     createImageViews();
     createFramebuffers();
     createRenderFinishedSemaphores();
+    chooseExtents();
     createRayTracingImages();
+    createDisplayImages();
     updateRayTracingDescriptorSet();
+    updateExposureDescriptorSet();
+    updateDisplayDescriptorSet();
 }
 
 void Application::cleanupSwapChain() {

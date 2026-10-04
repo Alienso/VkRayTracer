@@ -14,9 +14,8 @@
 
 std::vector<char> readFile(const std::string& filename);
 
-static const VkFormat rtColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 static const VkFormat rtDepthFormat = VK_FORMAT_R32_SFLOAT;
-static const VkFormat accumulationFormat = VK_FORMAT_R32G32B32A32_SFLOAT;  // float, so tiny 1/n contributions don't round away
+static const VkFormat radianceFormat = VK_FORMAT_R32G32B32A32_SFLOAT;  // float, so tiny 1/n contributions don't round away
 
 void Application::createUniformBuffer() {
     createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -310,28 +309,19 @@ void Application::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
     resetAccumulation = true;  // the scene changed, the accumulated image is outdated
 }
 
+// The images the trace shader writes, at render size (the display image is in Display.cpp)
 void Application::createRayTracingImages() {
-    // The color image gets blitted into the swapchain, which converts the format (RGBA -> BGRA, linear -> sRGB).
-    VkFormatProperties swapchainFormatProperties;
-    vkGetPhysicalDeviceFormatProperties(physicalDevice, swapChainImageFormat, &swapchainFormatProperties);
-    if (!(swapchainFormatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-        throw std::runtime_error("swap chain format does not support blitting into it!");
-    }
-
-    createImage(swapChainExtent.width, swapChainExtent.height, rtColorFormat,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                rtColorImage, rtColorImageMemory, rtColorImageView);
-    createImage(swapChainExtent.width, swapChainExtent.height, rtDepthFormat,
+    createImage(renderExtent.width, renderExtent.height, rtDepthFormat,
                 VK_IMAGE_USAGE_STORAGE_BIT,
                 rtDepthImage, rtDepthImageMemory, rtDepthImageView);
-    createImage(swapChainExtent.width, swapChainExtent.height, accumulationFormat,
+    createImage(renderExtent.width, renderExtent.height, radianceFormat,
                 VK_IMAGE_USAGE_STORAGE_BIT,
-                accumulationImage, accumulationImageMemory, accumulationImageView);
+                radianceImage, radianceImageMemory, radianceImageView);
 
-    // Depth and accumulation images stay in GENERAL forever. The color image is transitioned every frame.
+    // Both stay in GENERAL forever
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barriers[2]{};
-        VkImage images[2] = {rtDepthImage, accumulationImage};
+        VkImage images[2] = {rtDepthImage, radianceImage};
         for (int i = 0; i < 2; i++) {
             barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -351,41 +341,36 @@ void Application::createRayTracingImages() {
 }
 
 void Application::destroyRayTracingImages() {
-    vkDestroyImageView(device, rtColorImageView, nullptr);
-    vkDestroyImage(device, rtColorImage, nullptr);
-    vkFreeMemory(device, rtColorImageMemory, nullptr);
     vkDestroyImageView(device, rtDepthImageView, nullptr);
     vkDestroyImage(device, rtDepthImage, nullptr);
     vkFreeMemory(device, rtDepthImageMemory, nullptr);
-    vkDestroyImageView(device, accumulationImageView, nullptr);
-    vkDestroyImage(device, accumulationImage, nullptr);
-    vkFreeMemory(device, accumulationImageMemory, nullptr);
+    vkDestroyImageView(device, radianceImageView, nullptr);
+    vkDestroyImage(device, radianceImage, nullptr);
+    vkFreeMemory(device, radianceImageMemory, nullptr);
 }
 
 void Application::createRayTracingDescriptors() {
-    // 0: TLAS, 1: color output, 2: depth output, 3: scene uniforms, 4: vertices, 5: indices, 6: accumulation,
-    // 7: mesh infos, 8: all textures, 9: materials, 10: emissive triangles, 11: first light per instance,
-    // 12: specular albedo table, 13: auto exposure state
-    std::vector<VkDescriptorSetLayoutBinding> bindings(14);
+    // 0: TLAS, 1: radiance (HDR output), 2: depth output, 3: scene uniforms, 4: vertices, 5: indices,
+    // 6: mesh infos, 7: all textures, 8: materials, 9: emissive triangles, 10: first light per instance,
+    // 11: specular albedo table
+    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[3] = {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[4] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[7] = {7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[8] = {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[9] = {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[10] = {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[11] = {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[12] = {12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[13] = {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
-    bindingFlags[8] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    bindingFlags[7] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
     bindingFlagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
     bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
@@ -402,9 +387,9 @@ void Application::createRayTracingDescriptors() {
 
     VkDescriptorPoolSize poolSizes[] = {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -435,24 +420,22 @@ void Application::updateRayTracingDescriptorSet() {
     asInfo.accelerationStructureCount = 1;
     asInfo.pAccelerationStructures = &tlas.handle;
 
-    VkDescriptorImageInfo colorInfo{VK_NULL_HANDLE, rtColorImageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo radianceInfo{VK_NULL_HANDLE, radianceImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo depthInfo{VK_NULL_HANDLE, rtDepthImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo uniformInfo{uniformBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo vertexInfo{vertexBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo indexInfo{indexBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorImageInfo accumulationInfo{VK_NULL_HANDLE, accumulationImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo meshInfo{meshInfoBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo materialInfo{materialBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo emissiveTriangleInfo{emissiveTriangleBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo instanceLightInfo{instanceLightBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo specularAlbedoInfo{specularAlbedoBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo exposureInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(14);
+    std::vector<VkWriteDescriptorSet> writes(12);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -462,7 +445,7 @@ void Application::updateRayTracingDescriptorSet() {
     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     writes[0].pNext = &asInfo;  // acceleration structures are passed through pNext
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &colorInfo;
+    writes[1].pImageInfo = &radianceInfo;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[2].pImageInfo = &depthInfo;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -471,29 +454,24 @@ void Application::updateRayTracingDescriptorSet() {
     writes[4].pBufferInfo = &vertexInfo;
     writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[5].pBufferInfo = &indexInfo;
-    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[6].pImageInfo = &accumulationInfo;
-    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[7].pBufferInfo = &meshInfo;
-    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[8].descriptorCount = static_cast<uint32_t>(textureInfos.size());
-    writes[8].pImageInfo = textureInfos.data();
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[6].pBufferInfo = &meshInfo;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[7].descriptorCount = static_cast<uint32_t>(textureInfos.size());
+    writes[7].pImageInfo = textureInfos.data();
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[8].pBufferInfo = &materialInfo;
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[9].pBufferInfo = &materialInfo;
+    writes[9].pBufferInfo = &emissiveTriangleInfo;
     writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[10].pBufferInfo = &emissiveTriangleInfo;
+    writes[10].pBufferInfo = &instanceLightInfo;
     writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[11].pBufferInfo = &instanceLightInfo;
-    writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[12].pBufferInfo = &specularAlbedoInfo;
-    writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[13].pBufferInfo = &exposureInfo;
+    writes[11].pBufferInfo = &specularAlbedoInfo;
     if (textureInfos.empty()) {
-        writes.erase(writes.begin() + 8);  // nothing to write yet; a write with 0 descriptors isn't allowed
+        writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    updateExposureDescriptorSet();  // also reads the accumulation image
 }
 
 void Application::createRayTracingPipeline() {
@@ -521,8 +499,6 @@ void Application::createRayTracingPipeline() {
     vkDestroyShaderModule(device, shaderModule, nullptr);
 }
 
-// Ray trace into rtColorImage, then blit it into the swapchain image.
-// Afterwards the swapchain image is in TRANSFER_DST_OPTIMAL, which is what the render pass expects.
 SceneUniforms Application::buildSceneUniforms() {
     float azimuth = glm::radians(settings.sunAzimuth);
     float elevation = glm::radians(settings.sunElevation);
@@ -537,7 +513,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.cameraUp = glm::vec4(camera.up(), 0.0f);
     uniforms.jitter = glm::vec2(0.0f);
     uniforms.tanHalfFov = std::tan(glm::radians(camera.fov) * 0.5f);
-    uniforms.aspectRatio = (float) swapChainExtent.width / (float) swapChainExtent.height;
+    uniforms.aspectRatio = (float) renderExtent.width / (float) renderExtent.height;
     uniforms.sunDirection = glm::vec4(towardsSun, std::cos(glm::radians(settings.sunAngularRadius)));
     // Sun off = sun color 0 (the shader then skips its shadow rays). Black environment = all sky colors 0.
     float sun = settings.sunEnabled ? settings.sunIntensity : 0.0f;
@@ -556,10 +532,11 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
     uniforms.accumulate = settings.accumulate ? 1 : 0;
+    uniforms.debugView = static_cast<uint32_t>(settings.debugView);  // debug views overwrite the radiance image
 
     // Anything that changes the image (camera moved, slider dragged, ...) restarts accumulation.
-    // frameIndex and accumulatedFrames change every frame by design, and exposure/tone mapping only affect
-    // the displayed image, not the accumulated one, so those are filled in after comparing.
+    // frameIndex and accumulatedFrames change every frame by design, so those are filled in after comparing.
+    // (Exposure and tone mapping aren't in here: they only affect the display pass, see recordDisplay.)
     if (resetAccumulation || std::memcmp(&uniforms, &previousUniforms, sizeof(SceneUniforms)) != 0) {
         accumulatedFrames = 0;
         resetAccumulation = false;
@@ -568,17 +545,15 @@ SceneUniforms Application::buildSceneUniforms() {
 
     uniforms.frameIndex = frameIndex;
     uniforms.accumulatedFrames = accumulatedFrames;
-    // Auto: the measured exposure (from the GPU buffer) times the compensation. Manual: the slider.
-    uniforms.autoExposure = settings.autoExposure ? 1 : 0;
-    uniforms.exposure = settings.autoExposure ? std::exp2(settings.exposureCompensation) : settings.exposure;
-    uniforms.toneMapping = settings.toneMapping ? 1 : 0;
-    uniforms.debugView = static_cast<uint32_t>(settings.debugView);
     if (settings.accumulate) {
         accumulatedFrames++;
     }
     return uniforms;
 }
 
+// Trace into the radiance image (render size), measure the exposure, tone map into the display image (output
+// size), then blit that into the swapchain image. Afterwards the swapchain image is in TRANSFER_DST_OPTIMAL,
+// which is what the render pass expects.
 void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
     VkImageSubresourceRange colorRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -616,30 +591,32 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     uniformBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     uniformBarrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
 
-    // 1: make the output images writable. The previous frame may still be blitting from the color
-    //    image, so wait for transfers. Its old contents are not needed, hence UNDEFINED.
+    // 1: make the output images writable.
     VkImageMemoryBarrier preBarriers[3]{};
     preBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    preBarriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    preBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     preBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    preBarriers[0].srcAccessMask = 0;
+    preBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     preBarriers[0].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    preBarriers[0].image = rtColorImage;
+    preBarriers[0].image = rtDepthImage;
 
+    // The previous frame's read-modify-write of the running average, and its reads in the exposure and
+    // display passes, must finish before this one starts.
     preBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     preBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     preBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    preBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    preBarriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    preBarriers[1].image = rtDepthImage;
+    preBarriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    preBarriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    preBarriers[1].image = radianceImage;
 
-    // The previous frame's read-modify-write of the running average must finish before this one starts.
+    // Written by the display pass later in this frame. The previous frame may still be blitting from it,
+    // so wait for transfers. Its old contents are not needed, hence UNDEFINED.
     preBarriers[2].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    preBarriers[2].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    preBarriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     preBarriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    preBarriers[2].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    preBarriers[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    preBarriers[2].image = accumulationImage;
+    preBarriers[2].srcAccessMask = 0;
+    preBarriers[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    preBarriers[2].image = displayImage;
 
     for (auto& barrier : preBarriers) {
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -655,12 +632,13 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     // 2: trace
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
-    vkCmdDispatch(commandBuffer, (swapChainExtent.width + 7) / 8, (swapChainExtent.height + 7) / 8, 1);
+    vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
 
-    // 2b: measure the image for the next frame's exposure
+    // 3: measure the image for the exposure, then exposure + tone mapping into the display image
     recordExposure(commandBuffer);
+    recordDisplay(commandBuffer);
 
-    // 3: color image -> blit source, swapchain image -> blit destination.
+    // 4: display image -> blit source, swapchain image -> blit destination.
     //    The swapchain image only becomes available at the TRANSFER stage (see the semaphore wait in drawFrame).
     VkImageMemoryBarrier blitBarriers[2]{};
     blitBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -668,7 +646,7 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     blitBarriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     blitBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     blitBarriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    blitBarriers[0].image = rtColorImage;
+    blitBarriers[0].image = displayImage;
 
     blitBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     blitBarriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -687,14 +665,14 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 2, blitBarriers);
 
-    // 4: blit (same size, so this is a copy plus format conversion)
+    // 5: blit (output size = swapchain size, so this is a copy plus format conversion)
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[1] = {(int32_t) swapChainExtent.width, (int32_t) swapChainExtent.height, 1};
+    blit.srcOffsets[1] = {(int32_t) outputExtent.width, (int32_t) outputExtent.height, 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[1] = {(int32_t) swapChainExtent.width, (int32_t) swapChainExtent.height, 1};
     vkCmdBlitImage(commandBuffer,
-                   rtColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   displayImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    swapChainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &blit, VK_FILTER_NEAREST);
 }
@@ -710,6 +688,7 @@ void Application::cleanupRayTracing() {
     destroyMaterialBuffer();
     destroySpecularAlbedoTable();
     destroyExposureResources();
+    destroyDisplayResources();
     destroyTextures();
     destroyLightBuffers();
 

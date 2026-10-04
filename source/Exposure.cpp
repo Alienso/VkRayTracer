@@ -1,8 +1,8 @@
 //
 // Automatic exposure: measures how bright the rendered image is and picks the exposure for it, like a
 // camera's light meter. The measuring happens on the GPU (shaders/exposure.comp) right after tracing:
-// a histogram of the accumulated image's brightness, then one small pass that turns it into an exposure.
-// The trace shader uses that exposure on the next frame; the CPU only gets a copy for the UI.
+// a histogram of the HDR image's brightness, then one small pass that turns it into an exposure.
+// The display pass (Display.cpp) applies that exposure in the same frame; the CPU only gets a copy for the UI.
 //
 
 #include <vulkan/vulkan.h>
@@ -48,7 +48,7 @@ void Application::createExposureResources() {
         std::memset(exposureReadbackMapped[i], 0, sizeof(ExposureState));
     }
 
-    // Descriptors: 0 = accumulation image (read), 1 = state buffer
+    // Descriptors: 0 = HDR image (read, the one the display pass shows), 1 = state buffer
     VkDescriptorSetLayoutBinding bindings[2] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -107,9 +107,9 @@ void Application::createExposureResources() {
     vkDestroyShaderModule(device, shaderModule, nullptr);
 }
 
-// The accumulation image is recreated with the swapchain; called from updateRayTracingDescriptorSet.
+// The HDR image is recreated with the swapchain; called from recreateSwapChain.
 void Application::updateExposureDescriptorSet() {
-    VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, accumulationImageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, radianceImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bufferInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet writes[2]{};
     for (int i = 0; i < 2; i++) {
@@ -142,7 +142,7 @@ void Application::recordExposure(VkCommandBuffer commandBuffer) {
         return;
     }
 
-    // The trace shader's writes to the accumulation image must land before the histogram reads it
+    // The trace shader's writes to the HDR image must land before the histogram reads it
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -169,10 +169,10 @@ void Application::recordExposure(VkCommandBuffer commandBuffer) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, exposurePipelineLayout, 0, 1,
                             &exposureDescriptorSet, 0, nullptr);
 
-    // Pass 0: histogram, one invocation per pixel
+    // Pass 0: histogram, one invocation per pixel of the image that gets displayed (output size)
     push.pass = 0;
     vkCmdPushConstants(commandBuffer, exposurePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(commandBuffer, (swapChainExtent.width + 15) / 16, (swapChainExtent.height + 15) / 16, 1);
+    vkCmdDispatch(commandBuffer, (outputExtent.width + 15) / 16, (outputExtent.height + 15) / 16, 1);
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
@@ -181,7 +181,8 @@ void Application::recordExposure(VkCommandBuffer commandBuffer) {
     vkCmdPushConstants(commandBuffer, exposurePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(commandBuffer, 1, 1, 1);
 
-    // The result is read by the next frame's shaders (trace: exposure, histogram: counters) and copied for the UI
+    // The result is read by the display pass right after (exposure), by the next frame's histogram pass (counters)
+    // and copied for the UI
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
