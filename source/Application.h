@@ -49,6 +49,38 @@ struct SceneUniforms {
     uint32_t emissiveTriangleCount;  // entries in the light list
     uint32_t emissiveSampling;       // EmissiveSampling
     uint32_t blurCaustics;           // 1 = path regularization, see tracePath in the shader
+    uint32_t autoExposure;           // 1 = multiply by the measured exposure (ExposureState) as well
+};
+
+// Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the trace shader
+// reads the exposure from it, and a copy comes back to the CPU (a few frames late) for the UI.
+static constexpr uint32_t exposureBinCount = 256;
+struct ExposureState {
+    uint32_t histogram[exposureBinCount];      // being filled during a frame
+    uint32_t lastHistogram[exposureBinCount];  // the finished histogram of the last metered frame
+    float exposure;          // current multiplier
+    float targetExposure;    // where the adaptation is heading
+    float averageLuminance;  // of the metered part of the image
+    float lowLuminance;      // metered range: darker and brighter pixels are ignored
+    float highLuminance;
+    uint32_t meteredPixels;
+};
+
+// Must match the push constants in shaders/exposure.comp
+struct ExposurePushConstants {
+    uint32_t pass;
+    uint32_t reset;
+    uint32_t centerWeighted;
+    float minLog2;
+    float log2Range;
+    float lowFraction;
+    float highFraction;
+    float key;
+    float minExposure;
+    float maxExposure;
+    float brightenSpeed;
+    float darkenSpeed;
+    float deltaTime;
 };
 
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
@@ -188,7 +220,17 @@ struct RenderSettings {
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool accumulate = true;
 
-    float exposure = 0.6f;
+    float exposure = 0.6f;          // manual: brightness multiplier
+    bool autoExposure = true;       // measure the image and pick the exposure like a camera
+    float exposureCompensation = 0.0f;  // auto: stops brighter (+) or darker (-) than measured
+    float exposureKey = 0.18f;      // auto: the metered average becomes this (middle grey)
+    float meterLowPercent = 40.0f;  // auto: darkest pixels ignored (deep shadows, black background)
+    float meterHighPercent = 95.0f; // auto: pixels above this ignored (sun, sky, fireflies)
+    bool centerWeighted = false;    // auto: the image center counts up to 4x
+    float minExposureStops = -4.0f; // auto: limits of the multiplier, in stops (multiplier 2^stops)
+    float maxExposureStops = 10.0f;  // Sponza's courtyard in the default sun wants about +8.5
+    float brightenSpeed = 1.5f;     // auto: adaptation rates per second (exponential); like the eye,
+    float darkenSpeed = 3.0f;       //       getting used to the dark is slower than to bright light
     bool toneMapping = true;
     int debugView = static_cast<int>(DebugView::None);
 };
@@ -312,6 +354,23 @@ private:
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
 
+    // Automatic exposure (Exposure.cpp): histogram + adapted exposure on the GPU, read back for the UI
+    VkBuffer exposureBuffer;
+    VkDeviceMemory exposureMemory;
+    std::vector<VkBuffer> exposureReadbackBuffers;  // one per frame in flight
+    std::vector<VkDeviceMemory> exposureReadbackMemories;
+    std::vector<void*> exposureReadbackMapped;
+    ExposureState exposureInfo{};  // latest copy for the UI
+    bool exposureInfoValid = false;
+    bool exposureReset = true;     // snap to the target instead of adapting (start, auto just switched on)
+    bool exposureWasAuto = false;
+    VkDescriptorSetLayout exposureDescriptorSetLayout;
+    VkDescriptorPool exposureDescriptorPool;
+    VkDescriptorSet exposureDescriptorSet;
+    VkPipelineLayout exposurePipelineLayout;
+    VkPipeline exposurePipeline;
+    float frameDeltaTime = 0.0f;   // seconds, set in mainLoop
+
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
     VkDeviceMemory uniformBufferMemory;
@@ -405,6 +464,13 @@ private:
     void recordMaterialUpdate(VkCommandBuffer commandBuffer);
     void createSpecularAlbedoTable();
     void destroySpecularAlbedoTable();
+    // Exposure.cpp
+    void createExposureResources();
+    void updateExposureDescriptorSet();
+    void recordExposure(VkCommandBuffer commandBuffer);
+    void destroyExposureResources();
+    void buildExposureUi();
+
     void createRayTracingImages();
     void destroyRayTracingImages();
     void createRayTracingDescriptors();

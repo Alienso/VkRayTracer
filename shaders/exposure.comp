@@ -1,0 +1,160 @@
+#version 460
+//
+// Automatic exposure, like a camera's light meter or the eye adapting to a dark room.
+//
+// Pass 0 (one invocation per pixel): sorts every pixel of the accumulated (linear, unbounded) image into a
+//   histogram of brightness, on a log scale: each bin is the same fraction of a stop wide.
+// Pass 1 (a single workgroup): ignores the darkest and brightest percentages (deep shadows; the sun, the sky,
+//   fireflies), averages the rest in log space, picks the exposure that maps that average to middle grey
+//   and moves the current exposure towards it a bit (adaptation over time).
+//
+// The result stays on the GPU: the trace shader reads it next frame (binding 13 there). One frame late is
+// invisible, the adaptation takes many frames anyway.
+//
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D accumulationImage;
+
+const uint BIN_COUNT = 256;  // bin 0: black (ignored), bins 1..255: log2(luminance) from minLog2 to minLog2 + log2Range
+
+// Must match ExposureState in Application.h
+layout(binding = 1, scalar) buffer ExposureState {
+    uint histogram[BIN_COUNT];      // filled by pass 0, emptied by pass 1
+    uint lastHistogram[BIN_COUNT];  // a copy for the UI
+    float exposure;                 // current brightness multiplier (adapted)
+    float targetExposure;           // where it is heading
+    float averageLuminance;         // of the metered part of the image
+    float lowLuminance;             // the metered part starts here (darker pixels ignored) ...
+    float highLuminance;            // ... and ends here (brighter pixels ignored)
+    uint meteredPixels;             // pixels in the histogram without the black ones (weighted)
+} state;
+
+// Must match ExposurePushConstants in Application.h
+layout(push_constant, scalar) uniform PushConstants {
+    uint pass;
+    uint reset;           // 1 = jump straight to the target (start, or auto exposure just switched on)
+    uint centerWeighted;  // 1 = pixels near the image center count up to 4x
+    float minLog2;        // darkest luminance the histogram tells apart (log2); darker = black
+    float log2Range;      // stops covered by bins 1..255
+    float lowFraction;    // ignore this fraction of the pixels, darkest first
+    float highFraction;   // ... and everything above this fraction (brightest)
+    float key;            // the metered average is mapped to this (0.18 = middle grey)
+    float minExposure;    // limits for the multiplier
+    float maxExposure;
+    float brightenSpeed;  // adaptation rates per second (exponential), when the image gets brighter ...
+    float darkenSpeed;    // ... or darker
+    float deltaTime;      // seconds since the last frame
+} pc;
+
+shared uint localHistogram[BIN_COUNT];
+
+float binCenterLog2(uint bin) {
+    return pc.minLog2 + (float(bin - 1) + 0.5) / float(BIN_COUNT - 1) * pc.log2Range;
+}
+
+void buildHistogram() {
+    uint index = gl_LocalInvocationIndex;
+    localHistogram[index] = 0;
+    barrier();
+
+    // Count into shared memory first: 256 threads hammering 256 global counters would be much slower.
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(accumulationImage);
+    if (pixel.x < size.x && pixel.y < size.y) {
+        vec3 color = imageLoad(accumulationImage, pixel).rgb;
+        float luminance = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        uint bin = 0;  // black, or broken: not metered (a black background shouldn't make everything brighter)
+        if (luminance >= exp2(pc.minLog2) && !isinf(luminance)) {
+            float position = clamp((log2(luminance) - pc.minLog2) / pc.log2Range, 0.0, 0.99999);
+            bin = 1 + uint(position * float(BIN_COUNT - 1));
+        }
+        uint weight = 1;
+        if (pc.centerWeighted != 0) {
+            vec2 fromCenter = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;  // -1..1 across the image
+            weight = 1 + uint(round(3.0 * clamp(1.0 - dot(fromCenter, fromCenter), 0.0, 1.0)));
+        }
+        atomicAdd(localHistogram[bin], weight);
+    }
+    barrier();
+
+    if (localHistogram[index] != 0) {
+        atomicAdd(state.histogram[index], localHistogram[index]);
+    }
+}
+
+void adaptExposure() {
+    uint index = gl_LocalInvocationIndex;
+    uint count = state.histogram[index];
+    localHistogram[index] = count;
+    state.lastHistogram[index] = count;
+    state.histogram[index] = 0;  // empty for the next frame
+    barrier();
+
+    if (index != 0) {
+        return;
+    }
+    // 255 bins: a plain loop in one thread is fast enough (and simpler than a parallel prefix sum).
+    uint total = 0;
+    for (uint bin = 1; bin < BIN_COUNT; bin++) {
+        total += localHistogram[bin];
+    }
+    state.meteredPixels = total;
+    if (total == 0) {
+        return;  // all black: keep the current exposure
+    }
+
+    // Average log2(luminance) over the pixels ranked between lowFraction and highFraction.
+    // A bin straddling a limit counts with the part that lies inside.
+    float low = pc.lowFraction * float(total);
+    float high = max(pc.highFraction, pc.lowFraction + 0.01) * float(total);
+    float below = 0.0;  // pixels in the bins before this one
+    float sum = 0.0;
+    float weight = 0.0;
+    float lowLog2 = binCenterLog2(1);
+    float highLog2 = binCenterLog2(BIN_COUNT - 1);
+    bool lowFound = false;
+    for (uint bin = 1; bin < BIN_COUNT; bin++) {
+        float count = float(localHistogram[bin]);
+        float inside = max(min(below + count, high) - max(below, low), 0.0);
+        if (inside > 0.0) {
+            sum += inside * binCenterLog2(bin);
+            weight += inside;
+            if (!lowFound) {
+                lowLog2 = binCenterLog2(bin);
+                lowFound = true;
+            }
+            highLog2 = binCenterLog2(bin);
+        }
+        below += count;
+    }
+    float averageLog2 = sum / max(weight, 1e-6);
+
+    // Exposure that maps the average to the key, within the limits
+    float targetLog2 = clamp(log2(pc.key) - averageLog2, log2(pc.minExposure), log2(pc.maxExposure));
+
+    // Adapt in stops, exponentially: covers the same fraction of the remaining distance every second,
+    // so big jumps start fast and settle smoothly. Independent of the frame rate.
+    float currentLog2 = log2(state.exposure);
+    if (pc.reset != 0 || isnan(currentLog2) || isinf(currentLog2)) {
+        currentLog2 = targetLog2;
+    } else {
+        float speed = targetLog2 > currentLog2 ? pc.brightenSpeed : pc.darkenSpeed;
+        currentLog2 += (targetLog2 - currentLog2) * (1.0 - exp(-pc.deltaTime * speed));
+    }
+
+    state.exposure = exp2(currentLog2);
+    state.targetExposure = exp2(targetLog2);
+    state.averageLuminance = exp2(averageLog2);
+    state.lowLuminance = exp2(lowLog2);
+    state.highLuminance = exp2(highLog2);
+}
+
+void main() {
+    if (pc.pass == 0) {
+        buildHistogram();
+    } else {
+        adaptExposure();
+    }
+}

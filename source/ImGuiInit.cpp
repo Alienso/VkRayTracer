@@ -105,7 +105,7 @@ void Application::buildImGui() {
     }
 
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        buildExposureUi();
         ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
         ImGui::Combo("Debug view", &settings.debugView,
                      "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"

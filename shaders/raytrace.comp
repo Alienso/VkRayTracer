@@ -37,6 +37,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint emissiveTriangleCount;
     uint emissiveSampling;  // 0 = bounces only, 1 = light sampling only, 2 = both with MIS
     uint blurCaustics;      // 1 = path regularization, see tracePath
+    uint autoExposure;      // 1 = also multiply by the measured exposure (exposure.comp)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -106,6 +107,13 @@ layout(binding = 11, scalar) readonly buffer InstanceFirstLight { int instanceFi
 // entry [roughness * SIZE + view angle], total for a given F0 = F0 * x + y.
 layout(binding = 12, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
 const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
+
+// Automatic exposure, measured by exposure.comp after the previous frame (only the multiplier is needed here;
+// the histogram before it is skipped: 2 x 256 uints)
+layout(binding = 13, scalar) readonly buffer ExposureState {
+    uint exposureHistograms[512];
+    float measuredExposure;
+};
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
 const uint EMISSIVE_LIGHT_SAMPLING = 1;
@@ -1115,7 +1123,7 @@ void main() {
     imageStore(accumulationImage, pixel, vec4(color, 1.0));  // stays linear and unbounded
 
     // Only what is displayed gets exposure and tone mapping, so changing them does not restart accumulation.
-    vec3 displayColor = color * scene.exposure;
+    vec3 displayColor = color * scene.exposure * (scene.autoExposure != 0 ? measuredExposure : 1.0);
     if (scene.toneMapping != 0) {
         displayColor = toneMapACES(displayColor);
     }

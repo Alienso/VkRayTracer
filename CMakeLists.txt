@@ -40,6 +40,7 @@ add_executable(vulkanDemo main.cpp
         source/Scene.cpp source/Materials.cpp
         source/BuiltInModels.cpp source/BuiltInModels.h
         source/Lights.cpp
+        source/Exposure.cpp
         include/cgltf/cgltf.h)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)

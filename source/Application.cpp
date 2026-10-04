@@ -52,6 +52,7 @@ void Application::initVulkan() {
     createLightBuffers();
     updateScene();  // uploads the geometry, builds the BLASes and collects the instances
     createRayTracingImages();
+    createExposureResources();  // the trace shader's descriptor set points at its buffer
     createRayTracingDescriptors();
     createRayTracingPipeline();
 
@@ -66,6 +67,7 @@ void Application::mainLoop() {
         double now = glfwGetTime();
         float deltaTime = static_cast<float>(now - lastTime);
         lastTime = now;
+        frameDeltaTime = deltaTime;
 
         buildImGui();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
