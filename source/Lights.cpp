@@ -105,13 +105,19 @@ void Application::buildLightList() {
 
     for (size_t i = 0; i < frameInstances.size(); i++) {
         const Mesh& mesh = sceneMeshes[frameInstanceMeshes[i]];
-        const Material& material = sceneMaterials[mesh.materialIndex].material;
-        // Only the constant is known here; an emissive texture can still make parts of the surface dark.
-        // Those parts get sampled for nothing, which costs some efficiency, but the result stays correct.
-        float brightness = luminance(material.emissiveColor * material.emissiveStrength);
-        if (brightness <= 0.0f) {
+        const SceneMaterial& sceneMaterial = sceneMaterials[mesh.materialIndex];
+        const Material& material = sceneMaterial.material;
+        glm::vec3 emission = material.emissiveColor * material.emissiveStrength;
+        if (luminance(emission) <= 0.0f) {
             continue;
         }
+        // With an emissive texture, each triangle is weighted by the texture's average over it (computed at
+        // load time), so the dark parts are (almost) never sampled. A triangle averaging black gets probability
+        // 0 but stays in the list, so the shader still finds every hit triangle at firstLight + primitive index.
+        // If a few bright texels were missed by the average, bounce rays still find them (MIS gives them full
+        // weight there), so the image stays correct.
+        bool useTexture = material.emissiveTexture >= 0 && sceneMaterial.useEmissiveTexture &&
+                          mesh.emissiveTextureAverage.size() * 3 == mesh.indices.size();
 
         // Every triangle of the mesh, in order, so the shader finds a hit triangle at firstLight + primitive index.
         instanceFirstLight[i] = static_cast<int32_t>(emissiveTriangles.size());
@@ -130,11 +136,15 @@ void Application::buildLightList() {
             triangle.uv2 = v2.uv;
             triangle.materialIndex = mesh.materialIndex;
             triangle.area = 0.5f * glm::length(glm::cross(triangle.p1 - triangle.p0, triangle.p2 - triangle.p0));
-            triangle.probability = triangle.area * brightness;  // a weight for now, normalized below
+            glm::vec3 color = useTexture ? emission * mesh.emissiveTextureAverage[t / 3] : emission;
+            triangle.probability = triangle.area * luminance(color);  // a weight for now, normalized below
             totalWeight += triangle.probability;
             emissiveTriangles.push_back(triangle);
         }
     }
+
+    sampledEmissiveTriangles = static_cast<size_t>(std::count_if(emissiveTriangles.begin(), emissiveTriangles.end(),
+                                                                 [](const EmissiveTriangle& t) { return t.probability > 0.0f; }));
 
     // Weights -> probabilities, and the running sum (CDF) the shader searches through.
     if (totalWeight > 0.0) {
@@ -146,9 +156,10 @@ void Application::buildLightList() {
         }
         emissiveTriangles.back().cdf = 1.0f;  // no rounding gap at the end
     } else {
-        // Glowing materials, but all triangles have zero area: nothing to sample.
+        // Glowing materials, but all triangles have zero area or a black texture: nothing to sample.
         emissiveTriangles.clear();
         instanceFirstLight.assign(frameInstances.size(), -1);
+        sampledEmissiveTriangles = 0;
     }
     lightsUploadPending = true;
 }

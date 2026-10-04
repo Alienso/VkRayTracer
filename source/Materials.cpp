@@ -8,7 +8,9 @@
 #include <vulkan/vulkan.h>
 #include <stdexcept>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
+#include <glm/gtc/constants.hpp>
 #include "Application.h"
 
 static VkSamplerAddressMode toVulkan(TextureWrap wrap) {
@@ -142,6 +144,13 @@ std::vector<GpuMaterial> Application::packMaterials() const {
         gpu.emissiveTexture = sceneMaterial.useEmissiveTexture ? m.emissiveTexture : -1;
         gpu.normalTexture = sceneMaterial.useNormalTexture ? m.normalTexture : -1;
         gpu.normalScale = m.normalScale;
+        gpu.solid = m.solid ? 1 : 0;
+        // Beer's law: after distance d, exp(-absorption * d) of the light is left. glTF gives the color left
+        // after attenuationDistance, so absorption = -ln(color) / distance per channel.
+        if (m.solid && m.attenuationDistance > 0.0f) {
+            glm::vec3 color = glm::clamp(m.attenuationColor, glm::vec3(1e-4f), glm::vec3(1.0f));
+            gpu.absorption = -glm::log(color) / m.attenuationDistance;
+        }
         packed.push_back(gpu);
     }
     return packed;
@@ -197,4 +206,84 @@ void Application::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
 
     materialsDirty = false;
     resetAccumulation = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Specular albedo table, for energy compensation of the GGX reflection
+//
+// The GGX model lets light reflect off exactly one microfacet; light that would hit a second one is simply
+// lost, up to ~70% for very rough surfaces. The table stores how much a reflection actually returns, per
+// view angle and roughness, and the shader uses it to put the lost light back (Turquin 2019) and to give the
+// diffuse layer of a plastic exactly the light the reflection doesn't take.
+//
+// With Schlick's Fresnel F = F0 + (1 - F0) * (1 - v.h)^5, the total reflected is linear in F0:
+//   E(F0) = F0 * scale + bias,  scale = average of (1 - (1 - v.h)^5),  bias = average of (1 - v.h)^5
+// so two numbers per entry cover every F0 (the "split sum" table of real-time engines). For a white
+// reflection (F0 = 1) the total is scale + bias.
+// These are the same formulas as in shaders/raytrace.comp; the two must agree.
+
+namespace {
+    float smithG1(float cosTheta, float alpha) {
+        float a2 = alpha * alpha;
+        return 2.0f * cosTheta / (cosTheta + std::sqrt(a2 + (1.0f - a2) * cosTheta * cosTheta));
+    }
+
+    float smithVisibility(float cosL, float cosV, float alpha) {
+        float a2 = alpha * alpha;
+        float gv = cosL * std::sqrt(cosV * cosV * (1.0f - a2) + a2);
+        float gl = cosV * std::sqrt(cosL * cosL * (1.0f - a2) + a2);
+        return 0.5f / std::max(gv + gl, 1e-12f);
+    }
+
+    // Visible normal sampling (Dupuy & Benyoub 2023)
+    glm::vec3 sampleGgxVisibleNormal(glm::vec3 v, float alpha, float u0, float u1) {
+        glm::vec3 vStretched = glm::normalize(glm::vec3(v.x * alpha, v.y * alpha, v.z));
+        float phi = 2.0f * glm::pi<float>() * u0;
+        float z = (1.0f - u1) * (1.0f + vStretched.z) - vStretched.z;
+        float sinTheta = std::sqrt(std::clamp(1.0f - z * z, 0.0f, 1.0f));
+        glm::vec3 h = glm::vec3(sinTheta * std::cos(phi), sinTheta * std::sin(phi), z) + vStretched;
+        return glm::normalize(glm::vec3(h.x * alpha, h.y * alpha, std::max(h.z, 0.0f)));
+    }
+}
+
+void Application::createSpecularAlbedoTable() {
+    const uint32_t n = specularAlbedoSize;
+    const uint32_t strata = 48;  // samples per entry: strata^2, spread evenly instead of randomly (less noise)
+    std::vector<glm::vec2> table(n * n);
+
+    // Entry [roughness * n + angle]. Grid points include both ends (cos = 1, roughness = 0 and 1), the shader
+    // interpolates between them. cos = 0 itself is undefined, the shader never goes below 1e-3 either.
+    for (uint32_t r = 0; r < n; r++) {
+        float roughness = static_cast<float>(r) / (n - 1);
+        float alpha = std::max(roughness * roughness, 1e-3f);  // ggxAlpha in the shader
+        for (uint32_t c = 0; c < n; c++) {
+            float cosV = std::max(static_cast<float>(c) / (n - 1), 1e-3f);
+            glm::vec3 v(std::sqrt(1.0f - cosV * cosV), 0.0f, cosV);
+
+            // The shader's sampling: weight = BRDF * cos / pdf = G2 / G1 for a white reflection
+            double scale = 0.0, bias = 0.0;
+            for (uint32_t i = 0; i < strata; i++) {
+                for (uint32_t j = 0; j < strata; j++) {
+                    glm::vec3 h = sampleGgxVisibleNormal(v, alpha, (i + 0.5f) / strata, (j + 0.5f) / strata);
+                    glm::vec3 l = glm::reflect(-v, h);
+                    if (l.z <= 0.0f) {
+                        continue;
+                    }
+                    float weight = smithVisibility(l.z, v.z, alpha) * 4.0f * l.z * v.z / smithG1(v.z, alpha);
+                    float fresnelTerm = std::pow(1.0f - std::clamp(glm::dot(v, h), 0.0f, 1.0f), 5.0f);
+                    scale += weight * (1.0f - fresnelTerm);
+                    bias += weight * fresnelTerm;
+                }
+            }
+            table[r * n + c] = glm::vec2(scale, bias) / static_cast<float>(strata * strata);
+        }
+    }
+
+    createDeviceLocalBuffer(table.data(), sizeof(glm::vec2) * table.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            specularAlbedoBuffer, specularAlbedoMemory);
+}
+
+void Application::destroySpecularAlbedoTable() {
+    vkDestroyBuffer(device, specularAlbedoBuffer, nullptr);
+    vkFreeMemory(device, specularAlbedoMemory, nullptr);
 }

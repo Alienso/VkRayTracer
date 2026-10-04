@@ -94,7 +94,10 @@ void Application::buildImGui() {
     }
 
     if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Combo("Environment", &settings.environment, "Sky gradient\0Black (only emissive surfaces light the scene)\0");
+        ImGui::Combo("Environment", &settings.environment, "Sky gradient\0Black (only emissive surfaces light the scene)\0White (furnace test)\0");
+        if (settings.environment == static_cast<int>(Environment::White)) {
+            ImGui::TextDisabled("turn the sun off; white materials should vanish into the background");
+        }
         ImGui::ColorEdit3("Zenith", &settings.skyZenithColor.x);
         ImGui::ColorEdit3("Horizon", &settings.skyHorizonColor.x);
         ImGui::ColorEdit3("Ground", &settings.groundColor.x);
@@ -113,6 +116,9 @@ void Application::buildImGui() {
         ImGui::Combo("Emissive light", &settings.emissiveSampling,
                      "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
         ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
+        ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
+        ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
+                            "instead of slowly converging sparkles (fireflies)");
         ImGui::Checkbox("Accumulate", &settings.accumulate);
         if (settings.accumulate) {
             ImGui::SameLine();

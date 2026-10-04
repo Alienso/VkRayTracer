@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <cstring>
@@ -164,6 +165,13 @@ static Material loadMaterial(const cgltf_material& gltfMaterial, TextureLoader& 
     if (gltfMaterial.has_ior) {
         material.ior = gltfMaterial.ior.ior;
     }
+    if (gltfMaterial.has_volume) {
+        // The thickness itself (for faking volume on rasterizers) isn't needed: we trace through the real mesh.
+        material.solid = gltfMaterial.volume.thickness_factor > 0.0f;
+        material.attenuationColor = glm::make_vec3(gltfMaterial.volume.attenuation_color);
+        float distance = gltfMaterial.volume.attenuation_distance;  // cgltf: FLT_MAX when not given
+        material.attenuationDistance = distance < 1e30f ? distance : 0.0f;
+    }
 
     material.emissiveColor = glm::make_vec3(gltfMaterial.emissive_factor);
     if (gltfMaterial.has_emissive_strength) {
@@ -293,6 +301,84 @@ static Mesh loadPrimitive(const cgltf_mesh& gltfMesh, const cgltf_primitive& pri
     return mesh;
 }
 
+// Texture coordinate -> texel index along one axis, following the texture's wrap mode
+static uint32_t wrapTexel(float coordinate, uint32_t size, TextureWrap wrap) {
+    float x = coordinate * static_cast<float>(size);
+    int texel = static_cast<int>(std::floor(x));
+    int n = static_cast<int>(size);
+    switch (wrap) {
+        case TextureWrap::ClampToEdge:
+            texel = std::clamp(texel, 0, n - 1);
+            break;
+        case TextureWrap::MirroredRepeat: {
+            int period = ((texel % (2 * n)) + 2 * n) % (2 * n);
+            texel = period < n ? period : 2 * n - 1 - period;
+            break;
+        }
+        default:
+            texel = ((texel % n) + n) % n;
+    }
+    return static_cast<uint32_t>(texel);
+}
+
+static float srgbToLinear(uint8_t value) {
+    float c = value / 255.0f;
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+// For light sampling: the average emissive texture color over every triangle, while the pixels are still on
+// the CPU (they are dropped after the upload to the GPU). Samples a regular grid of points inside the triangle's
+// UV area: about one per texel it covers, between 1 and 256 per triangle.
+static void computeEmissiveTextureAverages(Model& model) {
+    for (Mesh& mesh : model.meshes) {
+        const Material& material = model.materials[mesh.materialIndex];
+        if (material.emissiveTexture < 0) {
+            continue;
+        }
+        const TextureData& texture = model.textures[material.emissiveTexture];
+        if (texture.pixels.empty()) {
+            continue;
+        }
+        float toLinear[256];
+        for (int i = 0; i < 256; i++) {
+            toLinear[i] = texture.srgb ? srgbToLinear(static_cast<uint8_t>(i)) : i / 255.0f;
+        }
+
+        mesh.emissiveTextureAverage.resize(mesh.indices.size() / 3);
+        for (size_t t = 0; t < mesh.emissiveTextureAverage.size(); t++) {
+            glm::vec2 uv0 = mesh.vertices[mesh.indices[3 * t]].uv;
+            glm::vec2 uv1 = mesh.vertices[mesh.indices[3 * t + 1]].uv;
+            glm::vec2 uv2 = mesh.vertices[mesh.indices[3 * t + 2]].uv;
+            glm::vec2 e1 = uv1 - uv0, e2 = uv2 - uv0;
+            float texels = 0.5f * std::abs(e1.x * e2.y - e1.y * e2.x) * texture.width * texture.height;
+            // k x k grid of small triangles = k^2 sample points (their centers)
+            int k = std::clamp(static_cast<int>(std::ceil(std::sqrt(texels))), 1, 16);
+
+            glm::vec3 sum(0.0f);
+            int count = 0;
+            for (int i = 0; i < k; i++) {
+                for (int j = 0; i + j < k; j++) {
+                    // the "upright" small triangle at (i, j), and the upside-down one next to it
+                    for (int flip = 0; flip < 2; flip++) {
+                        if (flip == 1 && i + j == k - 1) {
+                            continue;
+                        }
+                        float a = (i + (flip ? 2.0f : 1.0f) / 3.0f) / k;
+                        float b = (j + (flip ? 2.0f : 1.0f) / 3.0f) / k;
+                        glm::vec2 uv = uv0 + e1 * a + e2 * b;
+                        uint32_t x = wrapTexel(uv.x, texture.width, texture.wrapU);
+                        uint32_t y = wrapTexel(uv.y, texture.height, texture.wrapV);
+                        const uint8_t* pixel = &texture.pixels[(static_cast<size_t>(y) * texture.width + x) * 4];
+                        sum += glm::vec3(toLinear[pixel[0]], toLinear[pixel[1]], toLinear[pixel[2]]);
+                        count++;
+                    }
+                }
+            }
+            mesh.emissiveTextureAverage[t] = sum / static_cast<float>(count);
+        }
+    }
+}
+
 static void addNodeInstances(const cgltf_data* data, const cgltf_node* node, const glm::mat4& parentTransform,
                              const std::vector<std::vector<uint32_t>>& meshesOfGltfMesh, Model& model) {
     float local[16];
@@ -372,6 +458,7 @@ Model loadGltfModel(const std::string& path) {
     if (defaultMaterialUsed) {
         model.materials.emplace_back();
     }
+    computeEmissiveTextureAverages(model);
 
     // 3: instances, by walking the node tree of the default scene (or all root nodes if there is none)
     const cgltf_scene* scene = data->scene ? data->scene : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);

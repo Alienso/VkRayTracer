@@ -48,6 +48,7 @@ struct SceneUniforms {
     uint32_t debugView;
     uint32_t emissiveTriangleCount;  // entries in the light list
     uint32_t emissiveSampling;       // EmissiveSampling
+    uint32_t blurCaustics;           // 1 = path regularization, see tracePath in the shader
 };
 
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
@@ -60,6 +61,7 @@ struct MeshInfo {
     uint32_t indexCount;
     uint32_t hasNormals;
     uint32_t hasTangents;
+    float unitScale;  // file units per mesh unit (the glTF node's scale), for absorption distances
 };
 
 // Must match Material in shaders/raytrace.comp (scalar layout). Material (ModelLoader.h) packed for the GPU:
@@ -79,6 +81,8 @@ struct GpuMaterial {
     int32_t emissiveTexture;
     int32_t normalTexture;
     float normalScale;
+    uint32_t solid;          // 1 = closed volume that refracts, 0 = thin
+    glm::vec3 absorption;    // per unit of distance inside a solid (Beer's law), 0 = clear
 };
 
 // A texture on the GPU. Samplers are shared between textures with the same settings.
@@ -129,7 +133,9 @@ struct SceneObject {
 };
 
 // Values edited through ImGui
-enum class Environment : int { Sky = 0, Black = 1 };
+// White: uniform radiance 1 from every direction ("white furnace"). A white material that neither creates nor
+// loses energy then looks exactly as bright as the background; anything darker shows where energy is lost.
+enum class Environment : int { Sky = 0, Black = 1, White = 2 };
 
 // How light from glowing (emissive) surfaces is found. All three converge to the same image; they differ in noise.
 enum class EmissiveSampling : int {
@@ -177,7 +183,8 @@ struct RenderSettings {
     float skyIntensity = 0.6f;
 
     int samplesPerPixel = 1;
-    int maxBounces = 4;
+    int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
+    bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool accumulate = true;
 
     float exposure = 0.6f;
@@ -251,6 +258,10 @@ private:
     VkDeviceMemory materialBufferMemory;
     bool materialBufferCreated = false;
     bool materialsDirty = false;
+    // How much light the GGX reflection reflects in total, per view angle and roughness (see Materials.cpp)
+    static constexpr uint32_t specularAlbedoSize = 32;
+    VkBuffer specularAlbedoBuffer;
+    VkDeviceMemory specularAlbedoMemory;
 
     // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
     // It has room for tlasCapacity instances and is only recreated when more are needed.
@@ -271,6 +282,7 @@ private:
 
     // Light list for sampling emissive surfaces. Rebuilt on the CPU when instances or materials change.
     std::vector<EmissiveTriangle> emissiveTriangles;
+    size_t sampledEmissiveTriangles = 0;      // of those, how many light sampling can pick (probability > 0)
     std::vector<int32_t> instanceFirstLight;  // per TLAS instance: index of its first triangle in the list, or -1
     StreamedBuffer emissiveTriangleBuffer;
     StreamedBuffer instanceLightBuffer;
@@ -389,6 +401,8 @@ private:
     void createMaterialBuffer();
     void destroyMaterialBuffer();
     void recordMaterialUpdate(VkCommandBuffer commandBuffer);
+    void createSpecularAlbedoTable();
+    void destroySpecularAlbedoTable();
     void createRayTracingImages();
     void destroyRayTracingImages();
     void createRayTracingDescriptors();

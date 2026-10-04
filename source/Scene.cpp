@@ -7,6 +7,7 @@
 
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -20,6 +21,12 @@ static const char* modelsDirectory = "models";  // copied next to the executable
 static const char* defaultModel = "DamagedHelmet.glb";
 static const float modelSize = 2.0f;  // loaded models are scaled so their largest side is this long
 static const float objectSpacing = 2.4f;  // new objects are lined up along X this far apart
+
+// Can a ray pass through parts of this material? Then the shader has to look at every hit on it:
+// for holes (alpha), and so shadow rays can pass through glass, tinted.
+static bool needsHitTest(const Material& material) {
+    return material.alphaMode != AlphaMode::Opaque || material.transmission > 0.0f;
+}
 
 glm::mat4 SceneObject::transform() const {
     // Read right to left: scale first, then rotate, then move into place.
@@ -248,6 +255,12 @@ void Application::updateScene() {
             instance.mask = 0xFF;
             instance.instanceShaderBindingTableRecordOffset = 0;
             instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+            // Cut-out (alpha) materials are "not opaque": every ray asks the shader whether a hit on them counts.
+            // Everything else stays on the fast path where the hardware decides alone. Read every frame, so
+            // switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
+            const Material& material = sceneMaterials[meshInfos[part.meshIndex].materialIndex].material;
+            instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                                                     : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
             instance.accelerationStructureReference = blases[part.meshIndex].address;
             frameInstances.push_back(instance);
             frameInstanceTransforms.push_back(world);
@@ -297,9 +310,23 @@ void Application::updateScene() {
 void Application::uploadSceneGeometry() {
     std::vector<SceneVertex> vertices;
     std::vector<uint32_t> indices;
+    // glTF gives distances inside a material (absorption) in the file's world units, after the node transforms;
+    // the shader measures them in mesh units. The node's scale converts. A mesh used by several nodes takes the
+    // first one's scale.
+    std::vector<float> nodeScales(sceneMeshes.size(), 0.0f);
+    for (const SceneModel& model : sceneModels) {
+        for (const MeshInstance& part : model.parts) {
+            if (nodeScales[part.meshIndex] == 0.0f) {
+                nodeScales[part.meshIndex] = std::cbrt(std::abs(glm::determinant(glm::mat3(part.transform))));
+            }
+        }
+    }
+
     meshInfos.clear();
-    for (const Mesh& mesh : sceneMeshes) {
+    for (size_t m = 0; m < sceneMeshes.size(); m++) {
+        const Mesh& mesh = sceneMeshes[m];
         MeshInfo info{};
+        info.unitScale = nodeScales[m] > 0.0f ? nodeScales[m] : 1.0f;
         info.materialIndex = mesh.materialIndex;
         info.vertexOffset = static_cast<uint32_t>(vertices.size());
         info.indexOffset = static_cast<uint32_t>(indices.size());
@@ -452,7 +479,7 @@ void Application::buildSceneUi() {
     ImGui::Text("%zu models, %zu meshes, %zu instances", sceneModels.size(), meshInfos.size(), frameInstances.size());
     ImGui::Text("%zu materials, %zu textures (%.1f MB)", sceneMaterials.size(), gpuTextures.size(),
                 textureMemorySize / (1024.0 * 1024.0));
-    ImGui::Text("%zu emissive triangles", emissiveTriangles.size());
+    ImGui::Text("%zu emissive triangles (%zu bright enough to sample)", emissiveTriangles.size(), sampledEmissiveTriangles);
     ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
                 blasSizeBeforeCompaction / (1024.0 * 1024.0), blasSizeAfterCompaction / (1024.0 * 1024.0));
 }
@@ -462,7 +489,7 @@ void Application::buildMaterialUi(const SceneModel& model) {
     if (!ImGui::TreeNode("materials", "Materials (%u, shared by all %s objects)", model.materialCount, model.name.c_str())) {
         return;
     }
-    static const char* alphaModeNames[] = {"opaque", "mask (cutout)", "blend"};
+    static const char* alphaModeNames[] = {"Opaque", "Mask (cutout)", "Blend (see-through)"};
 
     for (uint32_t i = 0; i < model.materialCount; i++) {
         uint32_t index = model.firstMaterial + i;
@@ -495,8 +522,26 @@ void Application::buildMaterialUi(const SceneModel& model) {
                 changed |= ImGui::SliderFloat("Normal map strength", &m.normalScale, 0.0f, 2.0f);
                 textureToggle("texture##normal", m.normalTexture, sceneMaterial.useNormalTexture);
             }
-            ImGui::TextDisabled("alpha: %s, cutoff %.2f (used in Phase 6)", alphaModeNames[static_cast<int>(m.alphaMode)], m.alphaCutoff);
-            ImGui::TextDisabled("metallic/roughness/transmission/IOR take effect in Phase 6");
+            // Alpha = base color alpha (constant * texture). Mask: holes where it is below the cutoff.
+            // Blend: each ray passes through with chance 1 - alpha, which averages to see-through.
+            int alphaMode = static_cast<int>(m.alphaMode);
+            if (ImGui::Combo("Alpha mode", &alphaMode, alphaModeNames, IM_ARRAYSIZE(alphaModeNames))) {
+                m.alphaMode = static_cast<AlphaMode>(alphaMode);
+                changed = true;
+            }
+            if (m.alphaMode == AlphaMode::Mask) {
+                changed |= ImGui::SliderFloat("Alpha cutoff", &m.alphaCutoff, 0.0f, 1.0f);
+            }
+            if (m.transmission > 0.0f) {
+                changed |= ImGui::Checkbox("Solid (refracts)", &m.solid);
+                ImGui::SameLine();
+                ImGui::TextDisabled(m.solid ? "closed glass volume" : "thin, like a window pane");
+                if (m.solid) {
+                    changed |= ImGui::ColorEdit3("Attenuation color", &m.attenuationColor.x, ImGuiColorEditFlags_Float);
+                    changed |= ImGui::DragFloat("Attenuation distance", &m.attenuationDistance, 0.01f, 0.0f, 100.0f, "%.3f");
+                    ImGui::TextDisabled("color after this distance inside (model units), 0 = clear");
+                }
+            }
             if (changed) {
                 materialsDirty = true;  // copied to the GPU in this frame's command buffer
             }

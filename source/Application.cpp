@@ -45,6 +45,7 @@ void Application::initVulkan() {
     createSyncObjects();
 
     createUniformBuffer();
+    createSpecularAlbedoTable();
     findAvailableModels();
     createDefaultScene();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
