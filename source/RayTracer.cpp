@@ -363,8 +363,9 @@ void Application::destroyRayTracingImages() {
 }
 
 void Application::createRayTracingDescriptors() {
-    // 0: TLAS, 1: color output, 2: depth output, 3: scene uniforms, 4: vertices, 5: indices, 6: accumulation, 7: mesh infos
-    std::vector<VkDescriptorSetLayoutBinding> bindings(8);
+    // 0: TLAS, 1: color output, 2: depth output, 3: scene uniforms, 4: vertices, 5: indices, 6: accumulation,
+    // 7: mesh infos, 8: all textures, 9: materials
+    std::vector<VkDescriptorSetLayoutBinding> bindings(10);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -373,11 +374,23 @@ void Application::createRayTracingDescriptors() {
     bindings[5] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[6] = {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[9] = {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+
+    // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
+    // That's allowed as long as the shader never reads the empty ones.
+    std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
+    bindingFlags[8] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
+    bindingFlagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+    bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+    bindingFlagsInfo.pBindingFlags = bindingFlags.data();
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
+    layoutInfo.pNext = &bindingFlagsInfo;
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &rtDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create ray tracing descriptor set layout!");
     }
@@ -386,7 +399,8 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -423,8 +437,13 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorBufferInfo indexInfo{indexBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo accumulationInfo{VK_NULL_HANDLE, accumulationImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo meshInfo{meshInfoBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo materialInfo{materialBuffer, 0, VK_WHOLE_SIZE};
+    std::vector<VkDescriptorImageInfo> textureInfos;
+    for (const GpuTexture& texture : gpuTextures) {
+        textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    }
 
-    std::vector<VkWriteDescriptorSet> writes(8);
+    std::vector<VkWriteDescriptorSet> writes(10);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -447,6 +466,14 @@ void Application::updateRayTracingDescriptorSet() {
     writes[6].pImageInfo = &accumulationInfo;
     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[7].pBufferInfo = &meshInfo;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[8].descriptorCount = static_cast<uint32_t>(textureInfos.size());
+    writes[8].pImageInfo = textureInfos.data();
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[9].pBufferInfo = &materialInfo;
+    if (textureInfos.empty()) {
+        writes.erase(writes.begin() + 8);  // nothing to write yet; a write with 0 descriptors isn't allowed
+    }
 
     vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -530,6 +557,9 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     // so it has to happen before the uniforms are built.
     if (tlasDirty) {
         recordTopLevelBuild(commandBuffer);
+    }
+    if (materialsDirty) {
+        recordMaterialUpdate(commandBuffer);
     }
 
     // 0: upload this frame's uniforms. vkCmdUpdateBuffer copies the data into the command buffer
@@ -642,6 +672,8 @@ void Application::cleanupRayTracing() {
 
     destroyTopLevelAccelerationStructure();
     destroySceneGeometry();
+    destroyMaterialBuffer();
+    destroyTextures();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);
     vkFreeMemory(device, uniformBufferMemory, nullptr);

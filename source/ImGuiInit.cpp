@@ -102,7 +102,9 @@ void Application::buildImGui() {
     if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
-        ImGui::Combo("Debug view", &settings.debugView, "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0");
+        ImGui::Combo("Debug view", &settings.debugView,
+                     "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"
+                     "Base color\0Metallic\0Roughness\0Transmission\0Emissive\0Tangents\0");
         ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
         ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
         ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");

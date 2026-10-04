@@ -12,6 +12,7 @@
 #include <vector>
 #include <functional>
 #include <string>
+#include <map>
 #include "Camera.h"
 #include "ModelLoader.h"
 
@@ -50,21 +51,64 @@ struct SceneUniforms {
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
 // TLAS instance's custom index. Tells the shader where the mesh's data lives in the shared buffers.
 struct MeshInfo {
-    glm::vec4 baseColor;
+    uint32_t materialIndex;  // into the material buffer
     uint32_t vertexOffset;  // first vertex in the vertex buffer
     uint32_t indexOffset;   // first index in the index buffer
     uint32_t vertexCount;
     uint32_t indexCount;
     uint32_t hasNormals;
+    uint32_t hasTangents;
 };
 
-enum class DebugView : int { None = 0, Normals = 1, TexCoords = 2, MeshIndex = 3 };
+// Must match Material in shaders/raytrace.comp (scalar layout). Material (ModelLoader.h) packed for the GPU:
+// emission premultiplied by its strength, disabled textures set to -1.
+struct GpuMaterial {
+    glm::vec4 baseColor;
+    glm::vec3 emissive;
+    float metallic;
+    float roughness;
+    float transmission;
+    float ior;
+    float alphaCutoff;
+    uint32_t alphaMode;
+    int32_t baseColorTexture;
+    int32_t metallicRoughnessTexture;
+    int32_t transmissionTexture;
+    int32_t emissiveTexture;
+    int32_t normalTexture;
+    float normalScale;
+};
+
+// A texture on the GPU. Samplers are shared between textures with the same settings.
+struct GpuTexture {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+};
+
+// Material in the scene, with UI switches to ignore its textures and look at the constants alone.
+struct SceneMaterial {
+    Material material;
+    bool useBaseColorTexture = true;
+    bool useMetallicRoughnessTexture = true;
+    bool useTransmissionTexture = true;
+    bool useEmissiveTexture = true;
+    bool useNormalTexture = true;
+};
+
+enum class DebugView : int {
+    None = 0, Normals, TexCoords, MeshIndex, MaterialIndex,
+    BaseColor, Metallic, Roughness, Transmission, Emissive, Tangents
+};
 
 // A model file, loaded once. Any number of objects can show it.
 struct SceneModel {
     std::string name;                 // file name, or "Floor" for the built-in floor
     std::vector<MeshInstance> parts;  // meshIndex into Application::sceneMeshes, transform from the file's node tree
     glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0
+    uint32_t firstMaterial = 0;       // the model's materials are sceneMaterials[firstMaterial .. + materialCount)
+    uint32_t materialCount = 0;
 };
 
 // Something placed in the world: a model plus a transform edited in ImGui.
@@ -106,6 +150,8 @@ struct RenderSettings {
 
 class Application {
 public:
+    static constexpr uint32_t maxTextures = 1024;  // size of the texture descriptor array
+
     void run();
     void setFramebufferResized(bool b){
         this->framebufferResized = b;
@@ -138,6 +184,8 @@ private:
 
     // Scene content (CPU side). Models are loaded once and stay loaded; objects place them in the world.
     std::vector<Mesh> sceneMeshes;    // every mesh of every loaded model
+    std::vector<SceneMaterial> sceneMaterials;  // every material of every loaded model; [0] is the floor's
+    std::vector<TextureData> sceneTextures;     // pixels are freed once uploaded to the GPU
     std::vector<SceneModel> sceneModels;
     std::vector<SceneObject> sceneObjects;
     int selectedObject = -1;
@@ -156,6 +204,16 @@ private:
     std::vector<AccelerationStructure> blases;  // one per mesh
     VkDeviceSize blasSizeBeforeCompaction = 0;
     VkDeviceSize blasSizeAfterCompaction = 0;
+
+    // Textures (one bindless array in the shader) and materials. Textures are only ever added;
+    // materials are re-uploaded inside the frame when edited in the UI.
+    std::vector<GpuTexture> gpuTextures;
+    std::map<uint32_t, VkSampler> samplers;  // key: filter and wrap modes, see getSampler
+    VkDeviceSize textureMemorySize = 0;
+    VkBuffer materialBuffer;
+    VkDeviceMemory materialBufferMemory;
+    bool materialBufferCreated = false;
+    bool materialsDirty = false;
 
     // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
     // It has room for tlasCapacity instances and is only recreated when more are needed.
@@ -265,6 +323,16 @@ private:
     void uploadSceneGeometry();
     void destroySceneGeometry();
     void buildSceneUi();
+    void buildMaterialUi(const SceneModel& model);
+
+    // Materials.cpp
+    VkSampler getSampler(const TextureData& texture);
+    void uploadNewTextures();
+    void destroyTextures();
+    std::vector<GpuMaterial> packMaterials() const;
+    void createMaterialBuffer();
+    void destroyMaterialBuffer();
+    void recordMaterialUpdate(VkCommandBuffer commandBuffer);
     void createRayTracingImages();
     void destroyRayTracingImages();
     void createRayTracingDescriptors();

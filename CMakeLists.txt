@@ -37,7 +37,7 @@ add_executable(vulkanDemo main.cpp
         source/RayTracer.cpp
         source/Camera.cpp source/Camera.h
         source/ModelLoader.cpp source/ModelLoader.h
-        source/Scene.cpp
+        source/Scene.cpp source/Materials.cpp
         include/cgltf/cgltf.h)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)

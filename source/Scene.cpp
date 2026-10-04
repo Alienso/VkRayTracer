@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <glm/gtc/matrix_transform.hpp>
 #include "../include/imgui/imgui.h"
 #include "Application.h"
@@ -59,17 +60,24 @@ static Mesh createFloorMesh() {
             {{-half, 0.0f,  half}, up, {0.0f, 1.0f}},
     };
     floor.indices = {0, 1, 2, 0, 2, 3};
-    floor.baseColor = {0.75f, 0.75f, 0.75f, 1.0f};
+    floor.materialIndex = 0;
     floor.hasNormals = true;
     return floor;
 }
 
 void Application::createDefaultScene() {
-    // Model 0 is the built-in floor. It always stays loaded, so there is always at least one mesh.
+    // Model 0 is the built-in floor. It always stays loaded, so there is always at least one mesh and material.
+    Material floorMaterial;
+    floorMaterial.name = "Floor";
+    floorMaterial.baseColor = {0.75f, 0.75f, 0.75f, 1.0f};
+    sceneMaterials.push_back({floorMaterial});
     sceneMeshes.push_back(createFloorMesh());
+
     SceneModel floorModel;
     floorModel.name = "Floor";
     floorModel.parts.push_back({0, glm::mat4(1.0f)});
+    floorModel.firstMaterial = 0;
+    floorModel.materialCount = 1;
     sceneModels.push_back(floorModel);
 
     SceneObject floorObject;
@@ -104,10 +112,32 @@ int Application::findOrLoadModel(const std::string& fileName) {
     sceneModel.name = fileName;
     sceneModel.fit = glm::scale(glm::mat4(1.0f), glm::vec3(scale)) * glm::translate(glm::mat4(1.0f), -bottomCenter);
 
+    // The model's indices are relative to its own lists; shift them to where its data lands in the scene's lists.
     uint32_t firstMesh = static_cast<uint32_t>(sceneMeshes.size());
+    uint32_t firstMaterial = static_cast<uint32_t>(sceneMaterials.size());
+    int firstTexture = static_cast<int>(sceneTextures.size());
+    if (sceneTextures.size() + model.textures.size() > maxTextures) {
+        throw std::runtime_error("too many textures (limit " + std::to_string(maxTextures) + ")");
+    }
+
     for (Mesh& mesh : model.meshes) {
+        mesh.materialIndex += firstMaterial;
         sceneMeshes.push_back(std::move(mesh));
     }
+    for (Material& material : model.materials) {
+        for (int* texture : {&material.baseColorTexture, &material.metallicRoughnessTexture,
+                             &material.transmissionTexture, &material.emissiveTexture, &material.normalTexture}) {
+            if (*texture >= 0) {
+                *texture += firstTexture;
+            }
+        }
+        sceneMaterials.push_back({material});
+    }
+    for (TextureData& texture : model.textures) {
+        sceneTextures.push_back(std::move(texture));
+    }
+    sceneModel.firstMaterial = firstMaterial;
+    sceneModel.materialCount = static_cast<uint32_t>(model.materials.size());
     for (const MeshInstance& instance : model.instances) {
         sceneModel.parts.push_back({firstMesh + instance.meshIndex, instance.transform});
     }
@@ -157,6 +187,11 @@ void Application::updateScene() {
         if (geometryUploaded) {
             destroySceneGeometry();
         }
+        if (materialBufferCreated) {
+            destroyMaterialBuffer();
+        }
+        uploadNewTextures();
+        createMaterialBuffer();
         uploadSceneGeometry();
         createBottomLevelAccelerationStructures();
         geometryUploaded = true;
@@ -222,12 +257,13 @@ void Application::uploadSceneGeometry() {
     meshInfos.clear();
     for (const Mesh& mesh : sceneMeshes) {
         MeshInfo info{};
-        info.baseColor = mesh.baseColor;
+        info.materialIndex = mesh.materialIndex;
         info.vertexOffset = static_cast<uint32_t>(vertices.size());
         info.indexOffset = static_cast<uint32_t>(indices.size());
         info.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
         info.indexCount = static_cast<uint32_t>(mesh.indices.size());
         info.hasNormals = mesh.hasNormals ? 1 : 0;
+        info.hasTangents = mesh.hasTangents ? 1 : 0;
         meshInfos.push_back(info);
 
         vertices.insert(vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
@@ -336,6 +372,8 @@ void Application::buildSceneUi() {
             object.scale = glm::vec3(object.scale.x);
         }
 
+        buildMaterialUi(model);
+
         if (ImGui::Button("Reset transform")) {
             object.rotation = glm::vec3(0.0f);
             object.scale = glm::vec3(1.0f);
@@ -357,6 +395,58 @@ void Application::buildSceneUi() {
     }
 
     ImGui::Text("%zu models, %zu meshes, %zu instances", sceneModels.size(), meshInfos.size(), frameInstances.size());
+    ImGui::Text("%zu materials, %zu textures (%.1f MB)", sceneMaterials.size(), gpuTextures.size(),
+                textureMemorySize / (1024.0 * 1024.0));
     ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
                 blasSizeBeforeCompaction / (1024.0 * 1024.0), blasSizeAfterCompaction / (1024.0 * 1024.0));
+}
+
+// Materials belong to the model, so editing one changes every object that shows that model.
+void Application::buildMaterialUi(const SceneModel& model) {
+    if (!ImGui::TreeNode("materials", "Materials (%u, shared by all %s objects)", model.materialCount, model.name.c_str())) {
+        return;
+    }
+    static const char* alphaModeNames[] = {"opaque", "mask (cutout)", "blend"};
+
+    for (uint32_t i = 0; i < model.materialCount; i++) {
+        uint32_t index = model.firstMaterial + i;
+        SceneMaterial& sceneMaterial = sceneMaterials[index];
+        Material& m = sceneMaterial.material;
+
+        ImGui::PushID(static_cast<int>(index));
+        if (ImGui::TreeNode("material", "%s  (#%u)", m.name.c_str(), index)) {
+            bool changed = false;
+            // A checkbox per texture: off = look at the constant alone. The constant is multiplied with the texture.
+            auto textureToggle = [&](const char* id, int texture, bool& use) {
+                if (texture >= 0) {
+                    ImGui::SameLine();
+                    changed |= ImGui::Checkbox(id, &use);
+                }
+            };
+
+            changed |= ImGui::ColorEdit4("Base color", &m.baseColor.x, ImGuiColorEditFlags_Float);
+            textureToggle("texture##baseColor", m.baseColorTexture, sceneMaterial.useBaseColorTexture);
+            changed |= ImGui::SliderFloat("Metallic", &m.metallic, 0.0f, 1.0f);
+            textureToggle("texture##metallicRoughness", m.metallicRoughnessTexture, sceneMaterial.useMetallicRoughnessTexture);
+            changed |= ImGui::SliderFloat("Roughness", &m.roughness, 0.0f, 1.0f);
+            changed |= ImGui::SliderFloat("Transmission", &m.transmission, 0.0f, 1.0f);
+            textureToggle("texture##transmission", m.transmissionTexture, sceneMaterial.useTransmissionTexture);
+            changed |= ImGui::SliderFloat("IOR", &m.ior, 1.0f, 3.0f);
+            changed |= ImGui::ColorEdit3("Emissive", &m.emissiveColor.x, ImGuiColorEditFlags_Float);
+            textureToggle("texture##emissive", m.emissiveTexture, sceneMaterial.useEmissiveTexture);
+            changed |= ImGui::DragFloat("Emissive strength", &m.emissiveStrength, 0.05f, 0.0f, 1000.0f);
+            if (m.normalTexture >= 0) {
+                changed |= ImGui::SliderFloat("Normal map strength", &m.normalScale, 0.0f, 2.0f);
+                textureToggle("texture##normal", m.normalTexture, sceneMaterial.useNormalTexture);
+            }
+            ImGui::TextDisabled("alpha: %s, cutoff %.2f (used in Phase 6)", alphaModeNames[static_cast<int>(m.alphaMode)], m.alphaCutoff);
+            ImGui::TextDisabled("metallic/roughness/transmission/IOR take effect in Phase 6");
+            if (changed) {
+                materialsDirty = true;  // copied to the GPU in this frame's command buffer
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    ImGui::TreePop();
 }

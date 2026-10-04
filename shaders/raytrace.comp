@@ -1,6 +1,7 @@
 #version 460
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 // One thread per pixel, in 8x8 tiles.
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -32,7 +33,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint accumulate;        // 0 = show only this frame
     float exposure;         // brightness multiplier applied before tone mapping
     uint toneMapping;       // 0 = clamp, 1 = ACES filmic curve
-    uint debugView;         // 0 = path traced, 1 = normals, 2 = texture coordinates, 3 = mesh index
+    uint debugView;         // 0 = path traced, otherwise one property of the first hit, see DebugView in Application.h
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -40,22 +41,47 @@ struct Vertex {
     vec3 position;
     vec3 normal;
     vec2 uv;
+    vec4 tangent;   // xyz: direction in which U grows, w: +-1 bitangent sign
 };
 
 // Must match MeshInfo in Application.h. All meshes share the vertex and index buffers;
 // this says where one mesh's part starts. Indices are relative to the mesh's first vertex.
 struct MeshInfo {
-    vec4 baseColor;
+    uint materialIndex;
     uint vertexOffset;
     uint indexOffset;
     uint vertexCount;
     uint indexCount;
     uint hasNormals;
+    uint hasTangents;
 };
 
 layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
 layout(binding = 5, scalar) readonly buffer Indices { uint indices[]; };
 layout(binding = 7, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
+
+// Must match GpuMaterial in Application.h. Each value is a constant, multiplied by its texture if the index is >= 0.
+struct Material {
+    vec4 baseColor;         // linear RGB + alpha
+    vec3 emissive;          // light given off, already multiplied by the strength
+    float metallic;
+    float roughness;
+    float transmission;
+    float ior;
+    float alphaCutoff;
+    uint alphaMode;         // 0 opaque, 1 mask, 2 blend
+    int baseColorTexture;
+    int metallicRoughnessTexture;  // G: roughness, B: metallic
+    int transmissionTexture;       // R: transmission
+    int emissiveTexture;
+    int normalTexture;             // RGB: direction in tangent space (X along U, Y along "up" in the image, Z out)
+    float normalScale;
+};
+layout(binding = 9, scalar) readonly buffer Materials { Material materials[]; };
+
+// All textures of all models in one array. Neighboring pixels can hit different materials, so the
+// index differs between the threads of a warp: nonuniformEXT tells the compiler to handle that.
+layout(binding = 8) uniform sampler2D textures[];
 
 const float PI = 3.14159265359;
 
@@ -107,10 +133,56 @@ struct Hit {
     vec3 position;          // world space
     vec3 normal;            // world space, facing the ray. Smooth (interpolated) if the mesh has normals: use for lighting.
     vec3 geometricNormal;   // world space, facing the ray. The triangle's real plane: use to offset new rays.
+    vec3 tangent;           // world space, only for the debug view
     vec2 uv;
-    vec3 albedo;
     uint meshIndex;
+    uint materialIndex;
+
+    // Material at this point (constants * textures)
+    vec3 albedo;            // base color
+    float alpha;
+    float metallic;
+    float roughness;
+    float transmission;
+    float ior;
+    vec3 emissive;
 };
+
+// A compute shader has no screen-space derivatives to choose a mip level, so always read the full-resolution
+// level. Distant textures would alias, but the random pixel offsets + accumulation average that out.
+vec4 sampleTexture(int index, vec2 uv) {
+    return textureLod(textures[nonuniformEXT(index)], uv, 0.0);
+}
+
+void evaluateMaterial(inout Hit hit) {
+    Material material = materials[hit.materialIndex];
+
+    vec4 baseColor = material.baseColor;
+    if (material.baseColorTexture >= 0) {
+        baseColor *= sampleTexture(material.baseColorTexture, hit.uv);
+    }
+    hit.albedo = baseColor.rgb;
+    hit.alpha = baseColor.a;
+
+    hit.metallic = material.metallic;
+    hit.roughness = material.roughness;
+    if (material.metallicRoughnessTexture >= 0) {
+        vec4 metallicRoughness = sampleTexture(material.metallicRoughnessTexture, hit.uv);
+        hit.roughness *= metallicRoughness.g;
+        hit.metallic *= metallicRoughness.b;
+    }
+
+    hit.transmission = material.transmission;
+    if (material.transmissionTexture >= 0) {
+        hit.transmission *= sampleTexture(material.transmissionTexture, hit.uv).r;
+    }
+    hit.ior = material.ior;
+
+    hit.emissive = material.emissive;
+    if (material.emissiveTexture >= 0) {
+        hit.emissive *= sampleTexture(material.emissiveTexture, hit.uv).rgb;
+    }
+}
 
 Hit traceClosest(vec3 origin, vec3 direction) {
     rayQueryEXT rayQuery;
@@ -140,7 +212,8 @@ Hit traceClosest(vec3 origin, vec3 direction) {
     hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
     hit.position = origin + direction * hit.t;
     hit.uv = v0.uv * weights.x + v1.uv * weights.y + v2.uv * weights.z;
-    hit.albedo = mesh.baseColor.rgb;
+    hit.materialIndex = mesh.materialIndex;
+    evaluateMaterial(hit);
 
     // Normals are transformed with the inverse transpose of the object's matrix;
     // n * M == transpose(M) * n, and M (world -> object) is already the inverse.
@@ -152,9 +225,31 @@ Hit traceClosest(vec3 origin, vec3 direction) {
 
     // Smooth normal: the per-vertex normals from the file, blended across the triangle. Makes a coarse
     // mesh look round. Without them, fall back to the flat one.
+    hit.tangent = vec3(0.0);
     if (mesh.hasNormals != 0) {
         vec3 smoothNormal = v0.normal * weights.x + v1.normal * weights.y + v2.normal * weights.z;
         hit.normal = normalize(smoothNormal * worldToObject);
+
+        // Normal map: a texture of small surface directions (bumps, scratches, seams) that don't exist in the
+        // geometry. They are stored relative to the surface: X along the tangent, Y along the bitangent, Z along
+        // the normal. Tangents are directions ON the surface, so they transform like positions, not like normals.
+        Material material = materials[mesh.materialIndex];
+        if (mesh.hasTangents != 0) {
+            vec4 tangent = v0.tangent * weights.x + v1.tangent * weights.y + v2.tangent * weights.z;
+            mat3 objectToWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true));
+            vec3 t = objectToWorld * tangent.xyz;
+            t = normalize(t - hit.normal * dot(hit.normal, t));  // interpolation bends it slightly off the surface
+            hit.tangent = t;
+
+            if (material.normalTexture >= 0) {
+                // A mirrored instance (negative scale) flips the bitangent as well
+                float sign = (tangent.w < 0.0 ? -1.0 : 1.0) * (determinant(objectToWorld) < 0.0 ? -1.0 : 1.0);
+                vec3 b = cross(hit.normal, t) * sign;
+                vec3 mapped = sampleTexture(material.normalTexture, hit.uv).rgb * 2.0 - 1.0;  // [0,1] -> [-1,1]
+                mapped.xy *= material.normalScale;
+                hit.normal = normalize(t * mapped.x + b * mapped.y + hit.normal * mapped.z);
+            }
+        }
         // The vertex normals define which side is "outside"; the winding order may disagree.
         if (dot(hit.geometricNormal, hit.normal) < 0.0) {
             hit.geometricNormal = -hit.geometricNormal;
@@ -225,6 +320,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
             primaryHitDistance = hit.t;
         }
 
+        // Light given off by the surface itself. Nothing aims shadow rays at glowing surfaces, so their light
+        // reaches other surfaces only when a bounce ray happens to hit them: correct, but noisy for small ones.
+        radiance += throughput * hit.emissive;
+
         // Start new rays slightly above the surface so they don't hit the surface they start on.
         // Uses the real triangle plane: the smooth normal can point a bit into the surface.
         vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
@@ -274,21 +373,33 @@ vec3 cameraRayDirection(vec2 pixelPosition, ivec2 size) {
                      - ndc.y * scene.tanHalfFov * scene.cameraUp.xyz);
 }
 
-// Shows one property of the first surface hit, to check that the mesh data arrives correctly.
+// A stable, distinct color per number
+vec3 randomColor(uint value) {
+    uint h = pcgHash(value + 1u);
+    return vec3(h & 0xFFu, (h >> 8) & 0xFFu, (h >> 16) & 0xFFu) / 255.0;
+}
+
+// Shows one property of the first surface hit, to check that the mesh and material data arrive correctly.
 vec3 debugColor(vec3 direction, out float depth) {
     Hit hit = traceClosest(scene.cameraPosition.xyz, direction);
     depth = hit.found ? hit.t : 0.0;
     if (!hit.found) {
         return vec3(0.0);
     }
-    if (scene.debugView == 1) {
-        return hit.normal * 0.5 + 0.5;  // x -> red, y -> green, z -> blue
+    switch (scene.debugView) {
+        case 1: return hit.normal * 0.5 + 0.5;  // x -> red, y -> green, z -> blue
+        case 2: return vec3(fract(hit.uv), 0.0);
+        case 3: return randomColor(hit.meshIndex);
+        case 4: return randomColor(hit.materialIndex);
+        // linear values; the blit to the sRGB swapchain makes them look right
+        case 5: return hit.albedo;
+        case 6: return vec3(hit.metallic);
+        case 7: return vec3(hit.roughness);
+        case 8: return vec3(hit.transmission);
+        case 9: return hit.emissive;
+        case 10: return hit.tangent * 0.5 + 0.5;
     }
-    if (scene.debugView == 2) {
-        return vec3(fract(hit.uv), 0.0);
-    }
-    uint h = pcgHash(hit.meshIndex + 1u);
-    return vec3(h & 0xFFu, (h >> 8) & 0xFFu, (h >> 16) & 0xFFu) / 255.0;
+    return vec3(1.0, 0.0, 1.0);
 }
 
 void main() {
