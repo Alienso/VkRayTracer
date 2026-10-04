@@ -364,8 +364,8 @@ void Application::destroyRayTracingImages() {
 
 void Application::createRayTracingDescriptors() {
     // 0: TLAS, 1: color output, 2: depth output, 3: scene uniforms, 4: vertices, 5: indices, 6: accumulation,
-    // 7: mesh infos, 8: all textures, 9: materials
-    std::vector<VkDescriptorSetLayoutBinding> bindings(10);
+    // 7: mesh infos, 8: all textures, 9: materials, 10: emissive triangles, 11: first light per instance
+    std::vector<VkDescriptorSetLayoutBinding> bindings(12);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -376,6 +376,8 @@ void Application::createRayTracingDescriptors() {
     bindings[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[9] = {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[10] = {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[11] = {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -399,7 +401,7 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -438,12 +440,14 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorImageInfo accumulationInfo{VK_NULL_HANDLE, accumulationImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo meshInfo{meshInfoBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo materialInfo{materialBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo emissiveTriangleInfo{emissiveTriangleBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo instanceLightInfo{instanceLightBuffer.buffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(10);
+    std::vector<VkWriteDescriptorSet> writes(12);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -471,6 +475,10 @@ void Application::updateRayTracingDescriptorSet() {
     writes[8].pImageInfo = textureInfos.data();
     writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[9].pBufferInfo = &materialInfo;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[10].pBufferInfo = &emissiveTriangleInfo;
+    writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[11].pBufferInfo = &instanceLightInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 8);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -521,13 +529,18 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.tanHalfFov = std::tan(glm::radians(camera.fov) * 0.5f);
     uniforms.aspectRatio = (float) swapChainExtent.width / (float) swapChainExtent.height;
     uniforms.sunDirection = glm::vec4(towardsSun, std::cos(glm::radians(settings.sunAngularRadius)));
-    uniforms.sunColor = glm::vec4(settings.sunColor * settings.sunIntensity, 0.0f);
-    uniforms.skyZenithColor = glm::vec4(settings.skyZenithColor * settings.skyIntensity, 0.0f);
-    uniforms.skyHorizonColor = glm::vec4(settings.skyHorizonColor * settings.skyIntensity, 0.0f);
-    uniforms.groundColor = glm::vec4(settings.groundColor * settings.skyIntensity, 0.0f);
+    // Sun off = sun color 0 (the shader then skips its shadow rays). Black environment = all sky colors 0.
+    float sun = settings.sunEnabled ? settings.sunIntensity : 0.0f;
+    float sky = settings.environment == static_cast<int>(Environment::Sky) ? settings.skyIntensity : 0.0f;
+    uniforms.sunColor = glm::vec4(settings.sunColor * sun, 0.0f);
+    uniforms.skyZenithColor = glm::vec4(settings.skyZenithColor * sky, 0.0f);
+    uniforms.skyHorizonColor = glm::vec4(settings.skyHorizonColor * sky, 0.0f);
+    uniforms.groundColor = glm::vec4(settings.groundColor * sky, 0.0f);
     uniforms.samplesPerPixel = static_cast<uint32_t>(std::max(settings.samplesPerPixel, 1));
     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
+    uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
+    uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
     uniforms.accumulate = settings.accumulate ? 1 : 0;
 
     // Anything that changes the image (camera moved, slider dragged, ...) restarts accumulation.
@@ -560,6 +573,9 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     }
     if (materialsDirty) {
         recordMaterialUpdate(commandBuffer);
+    }
+    if (lightsUploadPending) {
+        recordLightUpload(commandBuffer);
     }
 
     // 0: upload this frame's uniforms. vkCmdUpdateBuffer copies the data into the command buffer
@@ -674,6 +690,7 @@ void Application::cleanupRayTracing() {
     destroySceneGeometry();
     destroyMaterialBuffer();
     destroyTextures();
+    destroyLightBuffers();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);
     vkFreeMemory(device, uniformBufferMemory, nullptr);

@@ -48,6 +48,7 @@ void Application::initVulkan() {
     findAvailableModels();
     createDefaultScene();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
+    createLightBuffers();
     updateScene();  // uploads the geometry, builds the BLASes and collects the instances
     createRayTracingImages();
     createRayTracingDescriptors();

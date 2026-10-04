@@ -46,6 +46,8 @@ struct SceneUniforms {
     float exposure;
     uint32_t toneMapping;
     uint32_t debugView;
+    uint32_t emissiveTriangleCount;  // entries in the light list
+    uint32_t emissiveSampling;       // EmissiveSampling
 };
 
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
@@ -120,13 +122,46 @@ struct SceneObject {
     glm::vec3 rotation = glm::vec3(0.0f);  // degrees around X, Y, Z; applied in the order Y (yaw), X (pitch), Z (roll)
     glm::vec3 scale = glm::vec3(1.0f);
     bool uniformScale = true;  // UI only: edit all three scale axes together
+    std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
 
     glm::mat4 transform() const;           // translate * rotate * scale
     glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors (DLSS, Phase 7)
 };
 
 // Values edited through ImGui
+enum class Environment : int { Sky = 0, Black = 1 };
+
+// How light from glowing (emissive) surfaces is found. All three converge to the same image; they differ in noise.
+enum class EmissiveSampling : int {
+    BouncesOnly = 0,   // only when a bounce ray happens to hit a glowing surface (what we had before)
+    LightSampling = 1, // only by aiming shadow rays at random points on glowing triangles
+    Mis = 2            // both, weighted by multiple importance sampling
+};
+
+// Must match EmissiveTriangle in shaders/raytrace.comp (scalar layout). One per triangle of every visible
+// instance with an emissive material, in world space. Shadow rays are aimed at random points on these.
+struct EmissiveTriangle {
+    glm::vec3 p0, p1, p2;
+    glm::vec2 uv0, uv1, uv2;  // to look up the emissive texture at the sampled point
+    uint32_t materialIndex;
+    float probability;  // chance of picking this triangle: proportional to area * brightness
+    float cdf;          // sum of the probabilities up to and including this one (for picking with a binary search)
+    float area;
+};
+
+// A device-local buffer the CPU refills from time to time. The CPU writes into a staging buffer of the
+// current frame in flight (the other frame may still be copying from its own), then the GPU copies it over.
+struct StreamedBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::vector<VkBuffer> staging;
+    std::vector<VkDeviceMemory> stagingMemory;
+    std::vector<void*> stagingMapped;
+    VkDeviceSize capacity = 0;
+};
+
 struct RenderSettings {
+    bool sunEnabled = true;
     float sunAzimuth = 35.0f;    // degrees around the Y axis
     float sunElevation = 50.0f;  // degrees above the horizon
     float sunAngularRadius = 2.0f;  // degrees; the real sun is ~0.27, bigger = softer shadows
@@ -134,6 +169,8 @@ struct RenderSettings {
     float sunIntensity = 1.0f;
     bool shadowsEnabled = true;
 
+    int environment = static_cast<int>(Environment::Sky);  // what rays see when they leave the scene
+    int emissiveSampling = static_cast<int>(EmissiveSampling::Mis);
     glm::vec3 skyZenithColor = {0.08f, 0.36f, 0.72f};
     glm::vec3 skyHorizonColor = {1.0f, 1.0f, 1.0f};
     glm::vec3 groundColor = {0.35f, 0.3f, 0.35f};
@@ -228,7 +265,16 @@ private:
     std::vector<void*> instanceBuffersMapped;
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, from the objects
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
+    std::vector<glm::mat4> frameInstanceTransforms;  // world transform of each of frameInstances
+    std::vector<uint32_t> frameInstanceMeshes;       // mesh of each of frameInstances
     bool tlasDirty = true;
+
+    // Light list for sampling emissive surfaces. Rebuilt on the CPU when instances or materials change.
+    std::vector<EmissiveTriangle> emissiveTriangles;
+    std::vector<int32_t> instanceFirstLight;  // per TLAS instance: index of its first triangle in the list, or -1
+    StreamedBuffer emissiveTriangleBuffer;
+    StreamedBuffer instanceLightBuffer;
+    bool lightsUploadPending = false;
 
     // Models found in the models/ folder next to the executable
     std::vector<std::string> availableModels;
@@ -324,6 +370,16 @@ private:
     void destroySceneGeometry();
     void buildSceneUi();
     void buildMaterialUi(const SceneModel& model);
+
+    // Lights.cpp
+    void createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity);
+    void destroyStreamedBuffer(StreamedBuffer& streamed);
+    bool ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize size);
+    void recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size);
+    void createLightBuffers();
+    void destroyLightBuffers();
+    void buildLightList();
+    void recordLightUpload(VkCommandBuffer commandBuffer);
 
     // Materials.cpp
     VkSampler getSampler(const TextureData& texture);

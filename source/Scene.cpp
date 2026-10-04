@@ -14,6 +14,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include "../include/imgui/imgui.h"
 #include "Application.h"
+#include "BuiltInModels.h"
 
 static const char* modelsDirectory = "models";  // copied next to the executable from resource/models
 static const char* defaultModel = "DamagedHelmet.glb";
@@ -30,17 +31,20 @@ glm::mat4 SceneObject::transform() const {
 }
 
 void Application::findAvailableModels() {
-    availableModels.clear();
+    // Built-in test scenes first, then the files
+    availableModels = builtInModelNames();
+    std::vector<std::string> files;
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(modelsDirectory, error)) {
         std::string extension = entry.path().extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
         if (entry.is_regular_file() && (extension == ".glb" || extension == ".gltf")) {
-            availableModels.push_back(entry.path().filename().string());
+            files.push_back(entry.path().filename().string());
         }
     }
-    std::sort(availableModels.begin(), availableModels.end());
-    if (availableModels.empty()) {
+    std::sort(files.begin(), files.end());
+    availableModels.insert(availableModels.end(), files.begin(), files.end());
+    if (files.empty()) {
         std::cerr << "no .glb/.gltf models found in '" << modelsDirectory << "'" << std::endl;
     }
     auto it = std::find(availableModels.begin(), availableModels.end(), defaultModel);
@@ -99,18 +103,22 @@ int Application::findOrLoadModel(const std::string& fileName) {
         }
     }
 
-    Model model = loadGltfModel(std::string(modelsDirectory) + "/" + fileName);
-
-    // Models come in any size and position (millimeters, centimeters, ...). Scale the largest side to
-    // modelSize and put the bottom center at the origin, so the object's position is where it stands.
-    glm::vec3 extent = model.boundsMax - model.boundsMin;
-    float scale = modelSize / std::max(std::max(extent.x, extent.y), std::max(extent.z, 1e-6f));
-    glm::vec3 bottomCenter = {(model.boundsMin.x + model.boundsMax.x) * 0.5f, model.boundsMin.y,
-                              (model.boundsMin.z + model.boundsMax.z) * 0.5f};
-
     SceneModel sceneModel;
     sceneModel.name = fileName;
-    sceneModel.fit = glm::scale(glm::mat4(1.0f), glm::vec3(scale)) * glm::translate(glm::mat4(1.0f), -bottomCenter);
+    Model model;
+    if (isBuiltInModel(fileName)) {
+        model = createBuiltInModel(fileName);  // already in world units: no fitting
+    } else {
+        model = loadGltfModel(std::string(modelsDirectory) + "/" + fileName);
+
+        // Models come in any size and position (millimeters, centimeters, ...). Scale the largest side to
+        // modelSize and put the bottom center at the origin, so the object's position is where it stands.
+        glm::vec3 extent = model.boundsMax - model.boundsMin;
+        float scale = modelSize / std::max(std::max(extent.x, extent.y), std::max(extent.z, 1e-6f));
+        glm::vec3 bottomCenter = {(model.boundsMin.x + model.boundsMax.x) * 0.5f, model.boundsMin.y,
+                                  (model.boundsMin.z + model.boundsMax.z) * 0.5f};
+        sceneModel.fit = glm::scale(glm::mat4(1.0f), glm::vec3(scale)) * glm::translate(glm::mat4(1.0f), -bottomCenter);
+    }
 
     // The model's indices are relative to its own lists; shift them to where its data lands in the scene's lists.
     uint32_t firstMesh = static_cast<uint32_t>(sceneMeshes.size());
@@ -139,7 +147,9 @@ int Application::findOrLoadModel(const std::string& fileName) {
     sceneModel.firstMaterial = firstMaterial;
     sceneModel.materialCount = static_cast<uint32_t>(model.materials.size());
     for (const MeshInstance& instance : model.instances) {
-        sceneModel.parts.push_back({firstMesh + instance.meshIndex, instance.transform});
+        MeshInstance part = instance;
+        part.meshIndex += firstMesh;
+        sceneModel.parts.push_back(part);
     }
     sceneModels.push_back(sceneModel);
     geometryDirty = true;  // uploaded in updateScene, before the next frame is recorded
@@ -152,11 +162,20 @@ void Application::addObject(const std::string& fileName) {
         object.modelIndex = static_cast<uint32_t>(findOrLoadModel(fileName));
         object.name = fileName.substr(0, fileName.find_last_of('.'));
 
+        const SceneModel& model = sceneModels[object.modelIndex];
+        for (const MeshInstance& part : model.parts) {
+            object.hiddenParts.push_back(part.hiddenByDefault);
+        }
+
         // Line objects up: 0, +1, -1, +2, -2, ... spacings from the center, so they don't overlap.
-        int existing = static_cast<int>(std::count_if(sceneObjects.begin(), sceneObjects.end(),
-                                                      [](const SceneObject& o) { return o.modelIndex != 0; }));
-        int slot = (existing + 1) / 2 * (existing % 2 == 1 ? 1 : -1);
-        object.position.x = slot * objectSpacing;
+        // Built-in rooms go to the center instead, around whatever already stands there.
+        if (!isBuiltInModel(fileName)) {
+            int existing = static_cast<int>(std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SceneObject& o) {
+                return o.modelIndex != 0 && !isBuiltInModel(o.name);
+            }));
+            int slot = (existing + 1) / 2 * (existing % 2 == 1 ? 1 : -1);
+            object.position.x = slot * objectSpacing;
+        }
 
         sceneObjects.push_back(object);
         selectedObject = static_cast<int>(sceneObjects.size() - 1);
@@ -204,6 +223,8 @@ void Application::updateScene() {
 
     // 2: objects -> TLAS instances. An object becomes one instance per part of its model.
     frameInstances.clear();
+    frameInstanceTransforms.clear();
+    frameInstanceMeshes.clear();
     primitiveCount = 0;
     for (SceneObject& object : sceneObjects) {
         glm::mat4 objectTransform = object.transform();
@@ -215,15 +236,22 @@ void Application::updateScene() {
         }
 
         const SceneModel& model = sceneModels[object.modelIndex];
-        for (const MeshInstance& part : model.parts) {
+        for (size_t p = 0; p < model.parts.size(); p++) {
+            const MeshInstance& part = model.parts[p];
+            if (p < object.hiddenParts.size() && object.hiddenParts[p]) {
+                continue;
+            }
+            glm::mat4 world = objectTransform * model.fit * part.transform;
             VkAccelerationStructureInstanceKHR instance{};  // zeroed, so memcmp below compares only real data
-            instance.transform = toVkTransform(objectTransform * model.fit * part.transform);
+            instance.transform = toVkTransform(world);
             instance.instanceCustomIndex = part.meshIndex;  // 24 bits for us; the shader uses it to find the mesh
             instance.mask = 0xFF;
             instance.instanceShaderBindingTableRecordOffset = 0;
             instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             instance.accelerationStructureReference = blases[part.meshIndex].address;
             frameInstances.push_back(instance);
+            frameInstanceTransforms.push_back(world);
+            frameInstanceMeshes.push_back(part.meshIndex);
             primitiveCount += meshInfos[part.meshIndex].indexCount / 3;
         }
     }
@@ -246,6 +274,21 @@ void Application::updateScene() {
         std::memcmp(frameInstances.data(), builtInstances.data(),
                     frameInstances.size() * sizeof(VkAccelerationStructureInstanceKHR)) != 0) {
         tlasDirty = true;
+    }
+
+    // 5: glowing triangles moved, appeared, or a material's emission changed -> new light list.
+    if (tlasDirty || materialsDirty) {
+        buildLightList();  // uploaded in this frame's command buffer
+        VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
+        VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();
+        if (trianglesSize > emissiveTriangleBuffer.capacity || offsetsSize > instanceLightBuffer.capacity) {
+            vkDeviceWaitIdle(device);  // the buffers are replaced, no frame may use them
+            ensureStreamedCapacity(emissiveTriangleBuffer, trianglesSize);
+            ensureStreamedCapacity(instanceLightBuffer, offsetsSize);
+            if (rtDescriptorSet != VK_NULL_HANDLE) {
+                updateRayTracingDescriptorSet();
+            }
+        }
     }
 }
 
@@ -372,6 +415,18 @@ void Application::buildSceneUi() {
             object.scale = glm::vec3(object.scale.x);
         }
 
+        if (model.parts.size() > 1 && ImGui::TreeNode("parts", "Parts (%zu)", model.parts.size())) {
+            object.hiddenParts.resize(model.parts.size(), false);
+            for (size_t p = 0; p < model.parts.size(); p++) {
+                ImGui::PushID(static_cast<int>(p));
+                bool visible = !object.hiddenParts[p];
+                if (ImGui::Checkbox(sceneMeshes[model.parts[p].meshIndex].name.c_str(), &visible)) {
+                    object.hiddenParts[p] = !visible;
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
         buildMaterialUi(model);
 
         if (ImGui::Button("Reset transform")) {
@@ -397,6 +452,7 @@ void Application::buildSceneUi() {
     ImGui::Text("%zu models, %zu meshes, %zu instances", sceneModels.size(), meshInfos.size(), frameInstances.size());
     ImGui::Text("%zu materials, %zu textures (%.1f MB)", sceneMaterials.size(), gpuTextures.size(),
                 textureMemorySize / (1024.0 * 1024.0));
+    ImGui::Text("%zu emissive triangles", emissiveTriangles.size());
     ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
                 blasSizeBeforeCompaction / (1024.0 * 1024.0), blasSizeAfterCompaction / (1024.0 * 1024.0));
 }

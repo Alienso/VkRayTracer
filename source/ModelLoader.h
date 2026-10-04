@@ -74,6 +74,7 @@ struct Mesh {
 struct MeshInstance {
     uint32_t meshIndex;
     glm::mat4 transform;
+    bool hiddenByDefault = false;  // new objects start with this part switched off (e.g. the Cornell box's front wall)
 };
 
 struct Model {

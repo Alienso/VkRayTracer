@@ -34,6 +34,8 @@ layout(binding = 3) uniform SceneUniforms {
     float exposure;         // brightness multiplier applied before tone mapping
     uint toneMapping;       // 0 = clamp, 1 = ACES filmic curve
     uint debugView;         // 0 = path traced, otherwise one property of the first hit, see DebugView in Application.h
+    uint emissiveTriangleCount;
+    uint emissiveSampling;  // 0 = bounces only, 1 = light sampling only, 2 = both with MIS
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -78,6 +80,23 @@ struct Material {
     float normalScale;
 };
 layout(binding = 9, scalar) readonly buffer Materials { Material materials[]; };
+
+// Must match EmissiveTriangle in Application.h. Every triangle of every glowing instance, in world space.
+struct EmissiveTriangle {
+    vec3 p0, p1, p2;
+    vec2 uv0, uv1, uv2;
+    uint materialIndex;
+    float probability;      // chance that light sampling picks this triangle
+    float cdf;              // running sum of the probabilities, for the binary search
+    float area;
+};
+layout(binding = 10, scalar) readonly buffer EmissiveTriangles { EmissiveTriangle emissiveTriangles[]; };
+// Per TLAS instance: where its triangles start in emissiveTriangles, or -1 if it doesn't glow.
+layout(binding = 11, scalar) readonly buffer InstanceFirstLight { int instanceFirstLight[]; };
+
+const uint EMISSIVE_BOUNCES_ONLY = 0;
+const uint EMISSIVE_LIGHT_SAMPLING = 1;
+const uint EMISSIVE_MIS = 2;
 
 // All textures of all models in one array. Neighboring pixels can hit different materials, so the
 // index differs between the threads of a warp: nonuniformEXT tells the compiler to handle that.
@@ -137,6 +156,7 @@ struct Hit {
     vec2 uv;
     uint meshIndex;
     uint materialIndex;
+    int lightIndex;         // this triangle in emissiveTriangles, -1 if it doesn't glow
 
     // Material at this point (constants * textures)
     vec3 albedo;            // base color
@@ -201,7 +221,10 @@ Hit traceClosest(vec3 origin, vec3 direction) {
     // Everything else we look up in our own buffers. The custom index was set to the mesh index in the TLAS.
     hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
     MeshInfo mesh = meshInfos[hit.meshIndex];
-    uint firstIndex = mesh.indexOffset + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true)) * 3;
+    int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
+    int firstLight = instanceFirstLight[rayQueryGetIntersectionInstanceIdEXT(rayQuery, true)];
+    hit.lightIndex = firstLight >= 0 ? firstLight + primitive : -1;
     Vertex v0 = vertices[mesh.vertexOffset + indices[firstIndex + 0]];
     Vertex v1 = vertices[mesh.vertexOffset + indices[firstIndex + 1]];
     Vertex v2 = vertices[mesh.vertexOffset + indices[firstIndex + 2]];
@@ -267,10 +290,10 @@ Hit traceClosest(vec3 origin, vec3 direction) {
 }
 
 // Is anything in the way? Stops at the first hit, which is all a shadow needs.
-bool isOccluded(vec3 origin, vec3 direction) {
+bool isOccluded(vec3 origin, vec3 direction, float maxDistance) {
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
-                          origin, 0.001, direction, 1000.0);
+                          origin, 0.001, direction, maxDistance);
     while (rayQueryProceedEXT(rayQuery)) { }
     return rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -282,6 +305,99 @@ vec3 environmentLight(vec3 direction) {
     vec3 sky = mix(scene.skyHorizonColor.rgb, scene.skyZenithColor.rgb, skyT);
     float groundToSky = smoothstep(-0.01, 0.0, direction.y);
     return mix(scene.groundColor.rgb, sky, groundToSky);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Light sampling for glowing surfaces, and multiple importance sampling (MIS)
+//
+// There are two ways to find the light a glowing triangle sends to a surface point:
+//  a) bounce sampling: the bounce ray happens to hit it. Good for big lights, bad for small ones (rarely hit).
+//  b) light sampling: pick a random point on a random glowing triangle and send a shadow ray there.
+//     Good for small lights, bad for big ones close by (points near the edge get picked at grazing angles).
+// Both are correct on their own. MIS uses both and weights each sample by how likely its own method was to
+// produce it compared to the other one, so each method mostly contributes where it is strong, and the
+// light is still counted exactly once in total.
+//
+// A "pdf" (probability density) below is: how likely is a method to pick this exact direction. Comparing them
+// needs the same unit for both, so both are expressed per solid angle (per unit of direction).
+
+// Power heuristic: the usual MIS weight. Gives the sample almost entirely to the method that was much more
+// likely to produce it.
+float misWeight(float pdfThis, float pdfOther) {
+    float a = pdfThis * pdfThis;
+    float b = pdfOther * pdfOther;
+    return a + b > 0.0 ? a / (a + b) : 0.0;
+}
+
+// pdf (per solid angle) of light sampling choosing the point `distance` away on triangle `light`, seen at
+// `cosLight` (angle between the triangle's normal and the direction towards the surface point).
+// Per area it is probability / area; a small patch far away or seen edge-on covers a small solid angle,
+// hence distance^2 / cos to convert.
+float lightPdf(int lightIndex, float distance, float cosLight) {
+    EmissiveTriangle light = emissiveTriangles[lightIndex];
+    return light.probability / max(light.area, 1e-12) * distance * distance / max(cosLight, 1e-6);
+}
+
+vec3 emissionAt(uint materialIndex, vec2 uv) {
+    Material material = materials[materialIndex];
+    vec3 emission = material.emissive;
+    if (material.emissiveTexture >= 0) {
+        emission *= sampleTexture(material.emissiveTexture, uv).rgb;
+    }
+    return emission;
+}
+
+// Light sampling at a matte surface point: returns the light from one randomly picked point on the glowing
+// triangles, already multiplied by the surface's response (albedo / PI * cos) and its MIS weight.
+vec3 sampleEmissiveLight(Hit hit, vec3 surfacePoint, inout uint seed) {
+    // 1: pick a triangle: binary search for the first one whose running sum exceeds a random number.
+    //    Triangles with a bigger share of the total light cover a bigger stretch of [0, 1], so get picked more.
+    float pick = randomFloat(seed);
+    uint low = 0, high = scene.emissiveTriangleCount - 1;
+    while (low < high) {
+        uint middle = (low + high) / 2;
+        if (emissiveTriangles[middle].cdf < pick) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    EmissiveTriangle light = emissiveTriangles[low];
+
+    // 2: a uniformly random point on it (the square root keeps points from bunching up in one corner)
+    float r1 = sqrt(randomFloat(seed));
+    float r2 = randomFloat(seed);
+    vec3 weights = vec3(1.0 - r1, r1 * (1.0 - r2), r1 * r2);
+    vec3 lightPoint = light.p0 * weights.x + light.p1 * weights.y + light.p2 * weights.z;
+    vec2 lightUv = light.uv0 * weights.x + light.uv1 * weights.y + light.uv2 * weights.z;
+
+    vec3 toLight = lightPoint - surfacePoint;
+    float distance = length(toLight);
+    vec3 direction = toLight / distance;
+    float cosSurface = dot(hit.normal, direction);
+    vec3 lightNormal = normalize(cross(light.p1 - light.p0, light.p2 - light.p0));
+    float cosLight = abs(dot(lightNormal, direction));  // glowing triangles shine from both sides, like everything we hit
+    if (cosSurface <= 0.0 || cosLight <= 1e-6 || dot(hit.geometricNormal, direction) <= 0.0) {
+        return vec3(0.0);  // the light is behind the surface, or seen exactly edge-on
+    }
+
+    vec3 emission = emissionAt(light.materialIndex, lightUv);
+    if (all(equal(emission, vec3(0.0)))) {
+        return vec3(0.0);  // a dark spot of an emissive texture: no need for a shadow ray
+    }
+    // Stop just short of the light itself, it would count as a blocker otherwise.
+    if (isOccluded(surfacePoint, direction, distance * 0.999)) {
+        return vec3(0.0);
+    }
+
+    float pdfLight = lightPdf(int(low), distance, cosLight);
+    float weight = 1.0;
+    if (scene.emissiveSampling == EMISSIVE_MIS) {
+        float pdfBounce = cosSurface / PI;  // how likely the cosine-weighted bounce would have picked this direction
+        weight = misWeight(pdfLight, pdfBounce);
+    }
+    // Monte Carlo: (what arrives * how the surface reflects it) / how likely we were to pick this sample
+    return emission * (hit.albedo / PI) * cosSurface / pdfLight * weight;
 }
 
 // Squeezes unbounded brightness into [0, 1] with a film-like S-curve instead of clipping it.
@@ -301,8 +417,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
     vec3 radiance = vec3(0.0);    // light collected along this path
     vec3 throughput = vec3(1.0);  // fraction of light found further along that still reaches the camera
     primaryHitDistance = 0.0;
+    float bouncePdf = 0.0;        // pdf of the bounce direction that led to the current hit (for MIS)
+    bool sampleLights = scene.emissiveTriangleCount > 0 && scene.emissiveSampling != EMISSIVE_BOUNCES_ONLY;
 
-    for (uint bounce = 0; bounce < scene.maxBounces; bounce++) {
+    // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
+    // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
+    // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
+    // by bouncing would be one bounce short, and the methods wouldn't agree.
+    for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
         Hit hit = traceClosest(origin, direction);
 
         if (!hit.found) {
@@ -320,9 +442,24 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
             primaryHitDistance = hit.t;
         }
 
-        // Light given off by the surface itself. Nothing aims shadow rays at glowing surfaces, so their light
-        // reaches other surfaces only when a bounce ray happens to hit them: correct, but noisy for small ones.
-        radiance += throughput * hit.emissive;
+        // Light given off by the surface itself. Seen directly by the camera it always counts. Found by a bounce
+        // ray, it is the "bounce sampling" half: with light sampling on, it shares the job (MIS) or leaves it
+        // entirely to light sampling.
+        if (any(greaterThan(hit.emissive, vec3(0.0)))) {
+            float weight = 1.0;
+            if (bounce > 0 && sampleLights && hit.lightIndex >= 0) {
+                if (scene.emissiveSampling == EMISSIVE_LIGHT_SAMPLING) {
+                    weight = 0.0;
+                } else {
+                    float cosLight = abs(dot(hit.geometricNormal, direction));
+                    weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, hit.t, cosLight));
+                }
+            }
+            radiance += throughput * hit.emissive * weight;
+        }
+        if (bounce == scene.maxBounces) {
+            break;  // the final ray: only what it sees counts
+        }
 
         // Start new rays slightly above the surface so they don't hit the surface they start on.
         // Uses the real triangle plane: the smooth normal can point a bit into the surface.
@@ -332,11 +469,19 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
         // part of the disc, so averaged over many samples the shadow edge becomes soft (penumbra).
         // A matte surface reflects albedo / PI of the light hitting it; the sun delivers PI * sunColor,
         // so the PIs cancel and sunColor is simply "how bright a white surface facing the sun looks".
-        vec3 towardsSun = randomDirectionInCone(sunDirection, sunCosRadius, seed);
-        float cosTheta = dot(hit.normal, towardsSun);
-        bool sunAboveTriangle = dot(hit.geometricNormal, towardsSun) > 0.0;
-        if (cosTheta > 0.0 && sunAboveTriangle && (scene.shadowsEnabled == 0 || !isOccluded(surfacePoint, towardsSun))) {
-            radiance += throughput * hit.albedo * scene.sunColor.rgb * cosTheta;
+        // (skipped entirely when the sun is switched off: its color is then 0)
+        if (any(greaterThan(scene.sunColor.rgb, vec3(0.0)))) {
+            vec3 towardsSun = randomDirectionInCone(sunDirection, sunCosRadius, seed);
+            float cosTheta = dot(hit.normal, towardsSun);
+            bool sunAboveTriangle = dot(hit.geometricNormal, towardsSun) > 0.0;
+            if (cosTheta > 0.0 && sunAboveTriangle && (scene.shadowsEnabled == 0 || !isOccluded(surfacePoint, towardsSun, 1000.0))) {
+                radiance += throughput * hit.albedo * scene.sunColor.rgb * cosTheta;
+            }
+        }
+
+        // Direct light from glowing surfaces: the same idea, aimed at a random point on a random glowing triangle.
+        if (sampleLights) {
+            radiance += throughput * sampleEmissiveLight(hit, surfacePoint, seed);
         }
 
         // Indirect light: continue the path in a random direction. normal + random unit vector gives
@@ -350,6 +495,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
         if (belowTriangle < 0.0) {
             direction -= 2.0 * belowTriangle * hit.geometricNormal;
         }
+        bouncePdf = max(dot(hit.normal, direction), 1e-6) / PI;  // cosine-weighted: cos / PI per solid angle
         origin = surfacePoint;
 
         // Russian roulette: after a few bounces, randomly stop paths that carry little light and

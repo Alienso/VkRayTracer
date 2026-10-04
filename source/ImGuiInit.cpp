@@ -84,6 +84,7 @@ void Application::buildImGui() {
 
     // ImGui needs unique IDs per widget; "##sun"/"##sky" suffixes are hidden from the labels.
     if (ImGui::CollapsingHeader("Sun", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Enabled##sun", &settings.sunEnabled);
         ImGui::SliderFloat("Azimuth", &settings.sunAzimuth, -180.0f, 180.0f);
         ImGui::SliderFloat("Elevation", &settings.sunElevation, -10.0f, 90.0f);
         ImGui::SliderFloat("Size (degrees)", &settings.sunAngularRadius, 0.0f, 15.0f, "%.2f");
@@ -93,6 +94,7 @@ void Application::buildImGui() {
     }
 
     if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Combo("Environment", &settings.environment, "Sky gradient\0Black (only emissive surfaces light the scene)\0");
         ImGui::ColorEdit3("Zenith", &settings.skyZenithColor.x);
         ImGui::ColorEdit3("Horizon", &settings.skyHorizonColor.x);
         ImGui::ColorEdit3("Ground", &settings.groundColor.x);
@@ -108,6 +110,9 @@ void Application::buildImGui() {
         ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
         ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
         ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
+        ImGui::Combo("Emissive light", &settings.emissiveSampling,
+                     "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
+        ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
         ImGui::Checkbox("Accumulate", &settings.accumulate);
         if (settings.accumulate) {
             ImGui::SameLine();
