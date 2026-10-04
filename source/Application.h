@@ -60,6 +60,27 @@ struct MeshInfo {
 
 enum class DebugView : int { None = 0, Normals = 1, TexCoords = 2, MeshIndex = 3 };
 
+// A model file, loaded once. Any number of objects can show it.
+struct SceneModel {
+    std::string name;                 // file name, or "Floor" for the built-in floor
+    std::vector<MeshInstance> parts;  // meshIndex into Application::sceneMeshes, transform from the file's node tree
+    glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0
+};
+
+// Something placed in the world: a model plus a transform edited in ImGui.
+struct SceneObject {
+    std::string name;
+    uint32_t modelIndex = 0;
+    bool visible = true;
+    glm::vec3 position = glm::vec3(0.0f);
+    glm::vec3 rotation = glm::vec3(0.0f);  // degrees around X, Y, Z; applied in the order Y (yaw), X (pitch), Z (roll)
+    glm::vec3 scale = glm::vec3(1.0f);
+    bool uniformScale = true;  // UI only: edit all three scale axes together
+
+    glm::mat4 transform() const;           // translate * rotate * scale
+    glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors (DLSS, Phase 7)
+};
+
 // Values edited through ImGui
 struct RenderSettings {
     float sunAzimuth = 35.0f;    // degrees around the Y axis
@@ -115,28 +136,45 @@ private:
     uint32_t currentFrame = 0;
     bool framebufferResized = false;
 
-    // Scene geometry: every mesh's vertices/indices packed into one shared buffer each,
-    // one BLAS per mesh, one TLAS over all instances. Rebuilt when another model is loaded.
-    bool sceneLoaded = false;
+    // Scene content (CPU side). Models are loaded once and stay loaded; objects place them in the world.
+    std::vector<Mesh> sceneMeshes;    // every mesh of every loaded model
+    std::vector<SceneModel> sceneModels;
+    std::vector<SceneObject> sceneObjects;
+    int selectedObject = -1;
+    bool geometryDirty = false;       // a model was loaded: re-upload meshes and rebuild BLASes before the next frame
+
+    // Geometry (GPU side): every mesh's vertices/indices packed into one shared buffer each, one BLAS per mesh.
+    // Only rebuilt when a new model is loaded.
+    bool geometryUploaded = false;
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
     VkBuffer meshInfoBuffer;
     VkDeviceMemory meshInfoBufferMemory;
-    VkBuffer instanceBuffer;
-    VkDeviceMemory instanceBufferMemory;
     std::vector<MeshInfo> meshInfos;
-    std::vector<MeshInstance> sceneInstances;
     std::vector<AccelerationStructure> blases;  // one per mesh
-    AccelerationStructure tlas;
     VkDeviceSize blasSizeBeforeCompaction = 0;
     VkDeviceSize blasSizeAfterCompaction = 0;
 
+    // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
+    // It has room for tlasCapacity instances and is only recreated when more are needed.
+    AccelerationStructure tlas;
+    uint32_t tlasCapacity = 0;
+    VkBuffer tlasScratchBuffer;
+    VkDeviceMemory tlasScratchMemory;
+    VkDeviceAddress tlasScratchAddress = 0;
+    // The CPU writes instances while the previous frame may still be building from its buffer, hence one per frame in flight.
+    std::vector<VkBuffer> instanceBuffers;
+    std::vector<VkDeviceMemory> instanceBufferMemories;
+    std::vector<void*> instanceBuffersMapped;
+    std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, from the objects
+    std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
+    bool tlasDirty = true;
+
     // Models found in the models/ folder next to the executable
     std::vector<std::string> availableModels;
-    int loadedModel = -1;
-    int requestedModel = -1;  // set by the UI, loaded at the start of the next frame
+    int modelToAdd = 0;  // UI: index into availableModels
     std::string loadError;
 
     // Ray tracing output, recreated with the swapchain
@@ -210,15 +248,23 @@ private:
 
     // RayTracer.cpp
     void createUniformBuffer();
-    void findAvailableModels();
-    void loadScene(int modelIndex);
-    void uploadSceneGeometry(const std::vector<Mesh>& meshes);
-    void destroySceneGeometry();
     AccelerationStructure createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size);
     VkDeviceAddress createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory);
     void destroyAccelerationStructure(AccelerationStructure& as);
     void createBottomLevelAccelerationStructures();
-    void createTopLevelAccelerationStructure();
+    void createTopLevelAccelerationStructure(uint32_t capacity);
+    void destroyTopLevelAccelerationStructure();
+    void recordTopLevelBuild(VkCommandBuffer commandBuffer);
+
+    // Scene.cpp
+    void findAvailableModels();
+    void createDefaultScene();
+    int findOrLoadModel(const std::string& fileName);
+    void addObject(const std::string& fileName);
+    void updateScene();
+    void uploadSceneGeometry();
+    void destroySceneGeometry();
+    void buildSceneUi();
     void createRayTracingImages();
     void destroyRayTracingImages();
     void createRayTracingDescriptors();

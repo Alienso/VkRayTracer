@@ -8,9 +8,6 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
-#include <filesystem>
-#include <iostream>
-#include <glm/gtc/matrix_transform.hpp>
 #include "Application.h"
 #include "Configuration.h"
 #include "VulkanExtensions.h"
@@ -21,10 +18,6 @@ static const VkFormat rtColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
 static const VkFormat rtDepthFormat = VK_FORMAT_R32_SFLOAT;
 static const VkFormat accumulationFormat = VK_FORMAT_R32G32B32A32_SFLOAT;  // float, so tiny 1/n contributions don't round away
 
-static const char* modelsDirectory = "models";  // copied next to the executable from resource/models
-static const char* defaultModel = "DamagedHelmet.glb";
-static const float modelSize = 2.0f;  // loaded models are scaled so their largest side is this long
-
 void Application::createUniformBuffer() {
     createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, uniformBuffer, uniformBufferMemory);
@@ -32,156 +25,6 @@ void Application::createUniformBuffer() {
     camera.position = {0.0f, 1.6f, 4.0f};
     camera.fov = Configuration::fov;
     camera.lookAt({0.0f, 0.9f, 0.0f});
-}
-
-void Application::findAvailableModels() {
-    availableModels.clear();
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(modelsDirectory, error)) {
-        std::string extension = entry.path().extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
-        if (entry.is_regular_file() && (extension == ".glb" || extension == ".gltf")) {
-            availableModels.push_back(entry.path().filename().string());
-        }
-    }
-    std::sort(availableModels.begin(), availableModels.end());
-    if (availableModels.empty()) {
-        std::cerr << "no .glb/.gltf models found in '" << modelsDirectory << "', showing only the floor" << std::endl;
-    }
-
-    auto it = std::find(availableModels.begin(), availableModels.end(), defaultModel);
-    loadedModel = it != availableModels.end() ? static_cast<int>(it - availableModels.begin())
-                                              : (availableModels.empty() ? -1 : 0);
-}
-
-// A large floor quad, always part of the scene so models have something to stand on and cast shadows onto.
-static Mesh createFloorMesh() {
-    Mesh floor;
-    floor.name = "floor";
-    const float half = 6.0f;
-    glm::vec3 up = {0.0f, 1.0f, 0.0f};
-    floor.vertices = {
-            {{-half, 0.0f, -half}, up, {0.0f, 0.0f}},
-            {{ half, 0.0f, -half}, up, {1.0f, 0.0f}},
-            {{ half, 0.0f,  half}, up, {1.0f, 1.0f}},
-            {{-half, 0.0f,  half}, up, {0.0f, 1.0f}},
-    };
-    floor.indices = {0, 1, 2, 0, 2, 3};
-    floor.baseColor = {0.75f, 0.75f, 0.75f, 1.0f};
-    floor.hasNormals = true;
-    return floor;
-}
-
-// Builds the CPU side of the scene (floor + model), then replaces the GPU side.
-// modelIndex = -1 loads only the floor.
-void Application::loadScene(int modelIndex) {
-    std::vector<Mesh> meshes = {createFloorMesh()};
-    std::vector<MeshInstance> instances = {{0, glm::mat4(1.0f)}};
-
-    if (modelIndex >= 0 && modelIndex < static_cast<int>(availableModels.size())) {
-        std::string path = std::string(modelsDirectory) + "/" + availableModels[modelIndex];
-        try {
-            // Load before touching the current scene, so a broken file leaves it intact.
-            Model model = loadGltfModel(path);
-
-            // Models come in any size and position (millimeters, centimeters, ...). Scale the largest side to
-            // modelSize and stand the model on the floor in the middle. Phase 4 makes this editable.
-            glm::vec3 extent = model.boundsMax - model.boundsMin;
-            float scale = modelSize / std::max(std::max(extent.x, extent.y), std::max(extent.z, 1e-6f));
-            glm::vec3 bottomCenter = {(model.boundsMin.x + model.boundsMax.x) * 0.5f, model.boundsMin.y,
-                                      (model.boundsMin.z + model.boundsMax.z) * 0.5f};
-            glm::mat4 placement = glm::scale(glm::mat4(1.0f), glm::vec3(scale)) * glm::translate(glm::mat4(1.0f), -bottomCenter);
-
-            uint32_t firstMesh = static_cast<uint32_t>(meshes.size());
-            for (Mesh& mesh : model.meshes) {
-                meshes.push_back(std::move(mesh));
-            }
-            for (const MeshInstance& instance : model.instances) {
-                instances.push_back({firstMesh + instance.meshIndex, placement * instance.transform});
-            }
-            loadedModel = modelIndex;
-            loadError.clear();
-        } catch (const std::exception& e) {
-            loadError = e.what();
-            std::cerr << loadError << std::endl;
-            if (sceneLoaded) {
-                return;  // keep showing the previous scene
-            }
-            loadedModel = -1;
-        }
-    } else {
-        loadedModel = -1;
-    }
-
-    // The GPU may still be tracing against the old buffers.
-    vkDeviceWaitIdle(device);
-    if (sceneLoaded) {
-        destroySceneGeometry();
-    }
-
-    sceneInstances = instances;
-    uploadSceneGeometry(meshes);
-    createBottomLevelAccelerationStructures();
-    createTopLevelAccelerationStructure();
-    sceneLoaded = true;
-
-    primitiveCount = 0;
-    for (const MeshInstance& instance : sceneInstances) {
-        primitiveCount += meshInfos[instance.meshIndex].indexCount / 3;
-    }
-
-    if (rtDescriptorSet != VK_NULL_HANDLE) {
-        updateRayTracingDescriptorSet();  // new TLAS and buffers
-    }
-    resetAccumulation = true;
-}
-
-// Packs all meshes into one vertex buffer and one index buffer. Indices stay relative to their mesh;
-// MeshInfo remembers where each mesh starts.
-void Application::uploadSceneGeometry(const std::vector<Mesh>& meshes) {
-    std::vector<SceneVertex> vertices;
-    std::vector<uint32_t> indices;
-    meshInfos.clear();
-    for (const Mesh& mesh : meshes) {
-        MeshInfo info{};
-        info.baseColor = mesh.baseColor;
-        info.vertexOffset = static_cast<uint32_t>(vertices.size());
-        info.indexOffset = static_cast<uint32_t>(indices.size());
-        info.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
-        info.indexCount = static_cast<uint32_t>(mesh.indices.size());
-        info.hasNormals = mesh.hasNormals ? 1 : 0;
-        meshInfos.push_back(info);
-
-        vertices.insert(vertices.end(), mesh.vertices.begin(), mesh.vertices.end());
-        indices.insert(indices.end(), mesh.indices.begin(), mesh.indices.end());
-    }
-
-    // Acceleration structure builds read their inputs through device addresses, the shader reads them as storage buffers.
-    VkBufferUsageFlags usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    createDeviceLocalBuffer(vertices.data(), sizeof(vertices[0]) * vertices.size(), usage, vertexBuffer, vertexBufferMemory);
-    createDeviceLocalBuffer(indices.data(), sizeof(indices[0]) * indices.size(), usage, indexBuffer, indexBufferMemory);
-    createDeviceLocalBuffer(meshInfos.data(), sizeof(meshInfos[0]) * meshInfos.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            meshInfoBuffer, meshInfoBufferMemory);
-}
-
-void Application::destroySceneGeometry() {
-    destroyAccelerationStructure(tlas);
-    for (AccelerationStructure& blas : blases) {
-        destroyAccelerationStructure(blas);
-    }
-    blases.clear();
-
-    vkDestroyBuffer(device, instanceBuffer, nullptr);
-    vkFreeMemory(device, instanceBufferMemory, nullptr);
-    vkDestroyBuffer(device, meshInfoBuffer, nullptr);
-    vkFreeMemory(device, meshInfoBufferMemory, nullptr);
-    vkDestroyBuffer(device, indexBuffer, nullptr);
-    vkFreeMemory(device, indexBufferMemory, nullptr);
-    vkDestroyBuffer(device, vertexBuffer, nullptr);
-    vkFreeMemory(device, vertexBufferMemory, nullptr);
-    sceneLoaded = false;
 }
 
 // An empty acceleration structure of the given size, living inside a buffer we own. Filled by a build or a copy.
@@ -360,68 +203,111 @@ void Application::createBottomLevelAccelerationStructures() {
 }
 
 // Top level: placed copies (instances) of bottom level structures, each with a transform.
-void Application::createTopLevelAccelerationStructure() {
-    std::vector<VkAccelerationStructureInstanceKHR> instances(sceneInstances.size());
-    for (size_t i = 0; i < sceneInstances.size(); i++) {
-        const MeshInstance& sceneInstance = sceneInstances[i];
-        VkAccelerationStructureInstanceKHR& instance = instances[i];
-
-        // Vulkan wants a 3x4 row-major matrix (the last row of an affine matrix is always 0 0 0 1).
-        // glm is column-major: m[column][row].
-        const glm::mat4& m = sceneInstance.transform;
-        for (int row = 0; row < 3; row++) {
-            for (int column = 0; column < 4; column++) {
-                instance.transform.matrix[row][column] = m[column][row];
-            }
-        }
-        instance.instanceCustomIndex = sceneInstance.meshIndex;  // 24 bits for us; the shader uses it to find the mesh
-        instance.mask = 0xFF;
-        instance.instanceShaderBindingTableRecordOffset = 0;
-        instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        instance.accelerationStructureReference = blases[sceneInstance.meshIndex].address;
-    }
-
-    createDeviceLocalBuffer(instances.data(), sizeof(instances[0]) * instances.size(),
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                            instanceBuffer, instanceBufferMemory);
-
-    VkAccelerationStructureGeometryKHR geometry{};
+// Both describing calls (size query and build) must use the same geometry type and flags.
+static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructureGeometryKHR& geometry,
+                             VkAccelerationStructureBuildGeometryInfoKHR& buildInfo) {
+    geometry = {};
     geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
     geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     geometry.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
     geometry.geometry.instances.arrayOfPointers = VK_FALSE;
-    geometry.geometry.instances.data.deviceAddress = getBufferDeviceAddress(instanceBuffer);
+    geometry.geometry.instances.data.deviceAddress = instanceData;
 
-    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo = {};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
     buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &geometry;
+}
 
-    uint32_t instanceCount = static_cast<uint32_t>(instances.size());
+// Creates an (unbuilt) TLAS with room for `capacity` instances, plus everything needed to rebuild it each frame.
+void Application::createTopLevelAccelerationStructure(uint32_t capacity) {
+    tlasCapacity = capacity;
+
+    // Instance buffers stay mapped: the CPU writes the instances right before the build is recorded.
+    instanceBuffers.resize(Configuration::maxFramesInFlight);
+    instanceBufferMemories.resize(Configuration::maxFramesInFlight);
+    instanceBuffersMapped.resize(Configuration::maxFramesInFlight);
+    VkDeviceSize instanceBufferSize = sizeof(VkAccelerationStructureInstanceKHR) * capacity;
+    for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
+        createBuffer(instanceBufferSize,
+                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     instanceBuffers[i], instanceBufferMemories[i]);
+        vkMapMemory(device, instanceBufferMemories[i], 0, instanceBufferSize, 0, &instanceBuffersMapped[i]);
+    }
+
+    // Sizes for the worst case (full capacity). Builds with fewer instances fit as well.
+    VkAccelerationStructureGeometryKHR geometry;
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
+    describeTopLevel(0, geometry, buildInfo);  // addresses are ignored when only asking for sizes
     VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
     sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
     vkext::vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                   &buildInfo, &instanceCount, &sizeInfo);
+                                                   &buildInfo, &capacity, &sizeInfo);
 
     tlas = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizeInfo.accelerationStructureSize);
+    tlasScratchAddress = createScratchBuffer(sizeInfo.buildScratchSize, tlasScratchBuffer, tlasScratchMemory);
+    tlasDirty = true;  // nothing built yet
+}
 
-    VkBuffer scratchBuffer;
-    VkDeviceMemory scratchMemory;
+void Application::destroyTopLevelAccelerationStructure() {
+    destroyAccelerationStructure(tlas);
+    vkDestroyBuffer(device, tlasScratchBuffer, nullptr);
+    vkFreeMemory(device, tlasScratchMemory, nullptr);
+    for (size_t i = 0; i < instanceBuffers.size(); i++) {
+        vkUnmapMemory(device, instanceBufferMemories[i]);
+        vkDestroyBuffer(device, instanceBuffers[i], nullptr);
+        vkFreeMemory(device, instanceBufferMemories[i], nullptr);
+    }
+    instanceBuffers.clear();
+    instanceBufferMemories.clear();
+    instanceBuffersMapped.clear();
+    tlasCapacity = 0;
+}
+
+// Rebuilds the TLAS from frameInstances, on the GPU, before this frame's ray tracing.
+// Rebuilding from scratch every time something moves is fine: a TLAS over a few hundred instances
+// builds in microseconds. (Big scenes would use an "update" (refit) instead.)
+void Application::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
+    uint32_t instanceCount = static_cast<uint32_t>(frameInstances.size());
+    std::memcpy(instanceBuffersMapped[currentFrame], frameInstances.data(),
+                sizeof(VkAccelerationStructureInstanceKHR) * instanceCount);
+
+    VkAccelerationStructureGeometryKHR geometry;
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
+    describeTopLevel(getBufferDeviceAddress(instanceBuffers[currentFrame]), geometry, buildInfo);
     buildInfo.dstAccelerationStructure = tlas.handle;
-    buildInfo.scratchData.deviceAddress = createScratchBuffer(sizeInfo.buildScratchSize, scratchBuffer, scratchMemory);
+    buildInfo.scratchData.deviceAddress = tlasScratchAddress;
+
+    // The previous frame may still be tracing rays through the TLAS (compute shader) or building it
+    // (scratch memory). Both must finish before we overwrite them.
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
     rangeInfo.primitiveCount = instanceCount;
     const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
-    immediateSubmit([&](VkCommandBuffer cmd) {
-        vkext::vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &pRangeInfo);
-    });
+    vkext::vkCmdBuildAccelerationStructuresKHR(commandBuffer, 1, &buildInfo, &pRangeInfo);
 
-    vkDestroyBuffer(device, scratchBuffer, nullptr);
-    vkFreeMemory(device, scratchMemory, nullptr);
+    // This frame's rays must wait for the finished TLAS.
+    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    builtInstances = frameInstances;
+    tlasDirty = false;
+    resetAccumulation = true;  // the scene changed, the accumulated image is outdated
 }
 
 void Application::createRayTracingImages() {
@@ -640,6 +526,12 @@ SceneUniforms Application::buildSceneUniforms() {
 void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
     VkImageSubresourceRange colorRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
+    // Objects moved (or the scene changed): rebuild the TLAS first. Sets resetAccumulation,
+    // so it has to happen before the uniforms are built.
+    if (tlasDirty) {
+        recordTopLevelBuild(commandBuffer);
+    }
+
     // 0: upload this frame's uniforms. vkCmdUpdateBuffer copies the data into the command buffer
     //    itself, so a single uniform buffer is enough even with several frames in flight.
     //    It must not overwrite the buffer while the previous frame's shader still reads it.
@@ -748,6 +640,7 @@ void Application::cleanupRayTracing() {
     vkDestroyDescriptorPool(device, rtDescriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(device, rtDescriptorSetLayout, nullptr);
 
+    destroyTopLevelAccelerationStructure();
     destroySceneGeometry();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);

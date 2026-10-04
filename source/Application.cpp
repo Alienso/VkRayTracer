@@ -46,7 +46,9 @@ void Application::initVulkan() {
 
     createUniformBuffer();
     findAvailableModels();
-    loadScene(loadedModel);  // findAvailableModels picks the default model
+    createDefaultScene();
+    createTopLevelAccelerationStructure(16);  // grows when more instances are needed
+    updateScene();  // uploads the geometry, builds the BLASes and collects the instances
     createRayTracingImages();
     createRayTracingDescriptors();
     createRayTracingPipeline();
@@ -63,16 +65,11 @@ void Application::mainLoop() {
         float deltaTime = static_cast<float>(now - lastTime);
         lastTime = now;
 
-        // Picked in the UI last frame. Loading waits for the GPU, so do it before anything is recorded.
-        if (requestedModel >= 0) {
-            loadScene(requestedModel);
-            requestedModel = -1;
-        }
-
         buildImGui();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
         camera.update(window, deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        updateScene();  // apply object/model changes made in the UI
 
         drawFrame();
     }

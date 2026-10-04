@@ -70,34 +70,7 @@ void Application::buildImGui() {
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
     ImGui::Text("%u triangles", primitiveCount);
 
-    if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const char* preview = loadedModel >= 0 ? availableModels[loadedModel].c_str() : "(floor only)";
-        if (ImGui::BeginCombo("Model", preview)) {
-            if (ImGui::Selectable("(floor only)", loadedModel < 0) && loadedModel >= 0) {
-                requestedModel = static_cast<int>(availableModels.size());  // out of range = no model
-            }
-            for (int i = 0; i < static_cast<int>(availableModels.size()); i++) {
-                if (ImGui::Selectable(availableModels[i].c_str(), i == loadedModel) && i != loadedModel) {
-                    requestedModel = i;  // loaded at the start of the next frame
-                }
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Rescan")) {
-            std::string current = loadedModel >= 0 ? availableModels[loadedModel] : "";
-            findAvailableModels();
-            auto it = std::find(availableModels.begin(), availableModels.end(), current);
-            loadedModel = it != availableModels.end() ? static_cast<int>(it - availableModels.begin()) : -1;
-        }
-        ImGui::TextDisabled("put .glb/.gltf files into resource/models");
-        if (!loadError.empty()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", loadError.c_str());
-        }
-        ImGui::Text("%zu meshes, %zu instances", meshInfos.size(), sceneInstances.size());
-        ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
-                    blasSizeBeforeCompaction / (1024.0 * 1024.0), blasSizeAfterCompaction / (1024.0 * 1024.0));
-    }
+    buildSceneUi();
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
