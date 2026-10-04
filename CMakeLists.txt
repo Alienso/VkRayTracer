@@ -32,9 +32,12 @@ add_executable(vulkanDemo main.cpp
         include/stb_image.cpp include/stb_image.h
         source/Application.cpp source/Application.h
         source/Configuration.cpp source/Configuration.h
-        source/VulkanInitHelper.cpp source/ImGuiInit.cpp source/Vertex.cpp source/Vertex.h
+        source/VulkanInitHelper.cpp source/ImGuiInit.cpp
         source/VulkanExtensions.cpp source/VulkanExtensions.h
-        source/RayTracer.cpp)
+        source/RayTracer.cpp
+        source/Camera.cpp source/Camera.h
+        source/ModelLoader.cpp source/ModelLoader.h
+        include/cgltf/cgltf.h)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
 

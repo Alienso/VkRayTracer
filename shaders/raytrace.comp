@@ -1,23 +1,295 @@
 #version 460
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
 
 // One thread per pixel, in 8x8 tiles.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 layout(binding = 1, rgba8) uniform writeonly image2D outColor;
-layout(binding = 2, r32f) uniform writeonly image2D outDepth;  // hit distance along the ray, 0 = miss
+layout(binding = 2, r32f) uniform writeonly image2D outDepth;     // hit distance along the ray, 0 = miss
+layout(binding = 6, rgba32f) uniform image2D accumulationImage;  // running average over frames
 
-// Must match RayTracingPushConstants in Application.h
-layout(push_constant) uniform PushConstants {
+// Must match SceneUniforms in Application.h
+layout(binding = 3) uniform SceneUniforms {
     vec4 cameraPosition;
     vec4 cameraForward;
     vec4 cameraRight;
     vec4 cameraUp;
-    vec2 jitter;        // sub-pixel offset in pixels, (0,0) until DLSS
-    float tanHalfFov;   // tan(verticalFov / 2)
-    float aspectRatio;  // width / height
-} pc;
+    vec2 jitter;            // sub-pixel offset in pixels, (0,0) until DLSS
+    float tanHalfFov;       // tan(verticalFov / 2)
+    float aspectRatio;      // width / height
+    vec4 sunDirection;      // xyz: normalized direction TOWARDS the sun, w: cos(angular radius of the sun disc)
+    vec4 sunColor;          // rgb: color * intensity (light arriving at a surface facing the sun)
+    vec4 skyZenithColor;    // rgb, already multiplied by the sky intensity
+    vec4 skyHorizonColor;
+    vec4 groundColor;       // environment below the horizon
+    uint samplesPerPixel;
+    uint maxBounces;        // number of surfaces a path may hit
+    uint frameIndex;        // changes every frame, seeds the random numbers
+    uint shadowsEnabled;
+    uint accumulatedFrames; // frames already averaged into accumulationImage (0 = start over)
+    uint accumulate;        // 0 = show only this frame
+    float exposure;         // brightness multiplier applied before tone mapping
+    uint toneMapping;       // 0 = clamp, 1 = ACES filmic curve
+    uint debugView;         // 0 = path traced, 1 = normals, 2 = texture coordinates, 3 = mesh index
+} scene;
+
+// Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
+struct Vertex {
+    vec3 position;
+    vec3 normal;
+    vec2 uv;
+};
+
+// Must match MeshInfo in Application.h. All meshes share the vertex and index buffers;
+// this says where one mesh's part starts. Indices are relative to the mesh's first vertex.
+struct MeshInfo {
+    vec4 baseColor;
+    uint vertexOffset;
+    uint indexOffset;
+    uint vertexCount;
+    uint indexCount;
+    uint hasNormals;
+};
+
+layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
+layout(binding = 5, scalar) readonly buffer Indices { uint indices[]; };
+layout(binding = 7, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
+
+const float PI = 3.14159265359;
+
+// ---------------------------------------------------------------------------------------------
+// Random numbers (PCG hash)
+
+uint pcgHash(uint value) {
+    uint state = value * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randomFloat(inout uint seed) {
+    seed = pcgHash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+// Uniformly distributed direction on the unit sphere.
+vec3 randomUnitVector(inout uint seed) {
+    float z = randomFloat(seed) * 2.0 - 1.0;
+    float phi = randomFloat(seed) * 2.0 * PI;
+    float r = sqrt(max(1.0 - z * z, 0.0));
+    return vec3(r * cos(phi), r * sin(phi), z);
+}
+
+// Any two vectors perpendicular to n (and to each other).
+void buildBasis(vec3 n, out vec3 tangent, out vec3 bitangent) {
+    vec3 helper = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    tangent = normalize(cross(helper, n));
+    bitangent = cross(n, tangent);
+}
+
+// Uniformly distributed direction inside a cone around `axis`. cosMaxAngle = 1 gives `axis` itself.
+vec3 randomDirectionInCone(vec3 axis, float cosMaxAngle, inout uint seed) {
+    float cosTheta = mix(1.0, cosMaxAngle, randomFloat(seed));
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = randomFloat(seed) * 2.0 * PI;
+    vec3 tangent, bitangent;
+    buildBasis(axis, tangent, bitangent);
+    return normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + axis * cosTheta);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tracing
+
+struct Hit {
+    bool found;
+    float t;                // distance along the ray
+    vec3 position;          // world space
+    vec3 normal;            // world space, facing the ray. Smooth (interpolated) if the mesh has normals: use for lighting.
+    vec3 geometricNormal;   // world space, facing the ray. The triangle's real plane: use to offset new rays.
+    vec2 uv;
+    vec3 albedo;
+    uint meshIndex;
+};
+
+Hit traceClosest(vec3 origin, vec3 direction) {
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.001, direction, 1000.0);
+    while (rayQueryProceedEXT(rayQuery)) {
+        // Only needed for non-opaque geometry (alpha cutouts, Phase 6).
+    }
+
+    Hit hit;
+    hit.found = rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+    if (!hit.found) {
+        return hit;
+    }
+
+    // The ray query only tells us WHICH instance and triangle was hit and WHERE on it (barycentrics).
+    // Everything else we look up in our own buffers. The custom index was set to the mesh index in the TLAS.
+    hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+    MeshInfo mesh = meshInfos[hit.meshIndex];
+    uint firstIndex = mesh.indexOffset + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true)) * 3;
+    Vertex v0 = vertices[mesh.vertexOffset + indices[firstIndex + 0]];
+    Vertex v1 = vertices[mesh.vertexOffset + indices[firstIndex + 1]];
+    Vertex v2 = vertices[mesh.vertexOffset + indices[firstIndex + 2]];
+
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+
+    hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+    hit.position = origin + direction * hit.t;
+    hit.uv = v0.uv * weights.x + v1.uv * weights.y + v2.uv * weights.z;
+    hit.albedo = mesh.baseColor.rgb;
+
+    // Normals are transformed with the inverse transpose of the object's matrix;
+    // n * M == transpose(M) * n, and M (world -> object) is already the inverse.
+    mat3 worldToObject = mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true));
+
+    // Flat normal from the triangle's edges
+    vec3 objectNormal = cross(v1.position - v0.position, v2.position - v0.position);
+    hit.geometricNormal = normalize(objectNormal * worldToObject);
+
+    // Smooth normal: the per-vertex normals from the file, blended across the triangle. Makes a coarse
+    // mesh look round. Without them, fall back to the flat one.
+    if (mesh.hasNormals != 0) {
+        vec3 smoothNormal = v0.normal * weights.x + v1.normal * weights.y + v2.normal * weights.z;
+        hit.normal = normalize(smoothNormal * worldToObject);
+        // The vertex normals define which side is "outside"; the winding order may disagree.
+        if (dot(hit.geometricNormal, hit.normal) < 0.0) {
+            hit.geometricNormal = -hit.geometricNormal;
+        }
+    } else {
+        hit.normal = hit.geometricNormal;
+    }
+
+    // Triangles are double-sided: if we hit the back, flip both normals towards the ray.
+    if (dot(hit.geometricNormal, direction) > 0.0) {
+        hit.geometricNormal = -hit.geometricNormal;
+        hit.normal = -hit.normal;
+    }
+    return hit;
+}
+
+// Is anything in the way? Stops at the first hit, which is all a shadow needs.
+bool isOccluded(vec3 origin, vec3 direction) {
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+                          origin, 0.001, direction, 1000.0);
+    while (rayQueryProceedEXT(rayQuery)) { }
+    return rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Light coming from the environment in a direction: a sky gradient above the horizon, ground below.
+// The sun is NOT part of it, it is handled separately with shadow rays (see main).
+vec3 environmentLight(vec3 direction) {
+    float skyT = pow(smoothstep(0.0, 0.4, direction.y), 0.35);
+    vec3 sky = mix(scene.skyHorizonColor.rgb, scene.skyZenithColor.rgb, skyT);
+    float groundToSky = smoothstep(-0.01, 0.0, direction.y);
+    return mix(scene.groundColor.rgb, sky, groundToSky);
+}
+
+// Squeezes unbounded brightness into [0, 1] with a film-like S-curve instead of clipping it.
+// (Krzysztof Narkowicz's fit of the ACES curve)
+vec3 toneMapACES(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+
+// Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
+vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHitDistance) {
+    vec3 sunDirection = scene.sunDirection.xyz;
+    float sunCosRadius = scene.sunDirection.w;
+
+    vec3 radiance = vec3(0.0);    // light collected along this path
+    vec3 throughput = vec3(1.0);  // fraction of light found further along that still reaches the camera
+    primaryHitDistance = 0.0;
+
+    for (uint bounce = 0; bounce < scene.maxBounces; bounce++) {
+        Hit hit = traceClosest(origin, direction);
+
+        if (!hit.found) {
+            radiance += throughput * environmentLight(direction);
+            // Looking straight at the sun shows its disc. Bounced rays skip this: the sun's light was
+            // already added through the shadow rays below, counting it here as well would double it.
+            // The sun's total light (PI * sunColor, see below) is spread over the disc's solid angle.
+            if (bounce == 0 && dot(direction, sunDirection) >= sunCosRadius) {
+                float discSolidAngle = 2.0 * PI * (1.0 - sunCosRadius);
+                radiance += PI * scene.sunColor.rgb / max(discSolidAngle, 1e-4);
+            }
+            break;
+        }
+        if (bounce == 0) {
+            primaryHitDistance = hit.t;
+        }
+
+        // Start new rays slightly above the surface so they don't hit the surface they start on.
+        // Uses the real triangle plane: the smooth normal can point a bit into the surface.
+        vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+
+        // Direct sunlight: aim at a random point on the sun's disc. Points near a shadow edge see only
+        // part of the disc, so averaged over many samples the shadow edge becomes soft (penumbra).
+        // A matte surface reflects albedo / PI of the light hitting it; the sun delivers PI * sunColor,
+        // so the PIs cancel and sunColor is simply "how bright a white surface facing the sun looks".
+        vec3 towardsSun = randomDirectionInCone(sunDirection, sunCosRadius, seed);
+        float cosTheta = dot(hit.normal, towardsSun);
+        bool sunAboveTriangle = dot(hit.geometricNormal, towardsSun) > 0.0;
+        if (cosTheta > 0.0 && sunAboveTriangle && (scene.shadowsEnabled == 0 || !isOccluded(surfacePoint, towardsSun))) {
+            radiance += throughput * hit.albedo * scene.sunColor.rgb * cosTheta;
+        }
+
+        // Indirect light: continue the path in a random direction. normal + random unit vector gives
+        // directions weighted by cos(angle to normal), which is exactly how a matte surface scatters light,
+        // so the only thing left to account for is the surface color.
+        throughput *= hit.albedo;
+        vec3 newDirection = hit.normal + randomUnitVector(seed);
+        direction = dot(newDirection, newDirection) > 1e-6 ? normalize(newDirection) : hit.normal;
+        // Around the smooth normal, a direction can still point into the actual triangle. Mirror it back out.
+        float belowTriangle = dot(direction, hit.geometricNormal);
+        if (belowTriangle < 0.0) {
+            direction -= 2.0 * belowTriangle * hit.geometricNormal;
+        }
+        origin = surfacePoint;
+
+        // Russian roulette: after a few bounces, randomly stop paths that carry little light and
+        // boost the survivors by the same factor, so on average the result stays the same.
+        if (bounce >= 2) {
+            float survive = max(throughput.r, max(throughput.g, throughput.b));
+            if (randomFloat(seed) >= survive) {
+                break;
+            }
+            throughput /= survive;
+        }
+    }
+    return radiance;
+}
+
+vec3 cameraRayDirection(vec2 pixelPosition, ivec2 size) {
+    vec2 uv = (pixelPosition + scene.jitter) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;  // [-1, 1]; image y goes down, camera up goes up, hence the minus below
+    return normalize(scene.cameraForward.xyz
+                     + ndc.x * scene.tanHalfFov * scene.aspectRatio * scene.cameraRight.xyz
+                     - ndc.y * scene.tanHalfFov * scene.cameraUp.xyz);
+}
+
+// Shows one property of the first surface hit, to check that the mesh data arrives correctly.
+vec3 debugColor(vec3 direction, out float depth) {
+    Hit hit = traceClosest(scene.cameraPosition.xyz, direction);
+    depth = hit.found ? hit.t : 0.0;
+    if (!hit.found) {
+        return vec3(0.0);
+    }
+    if (scene.debugView == 1) {
+        return hit.normal * 0.5 + 0.5;  // x -> red, y -> green, z -> blue
+    }
+    if (scene.debugView == 2) {
+        return vec3(fract(hit.uv), 0.0);
+    }
+    uint h = pcgHash(hit.meshIndex + 1u);
+    return vec3(h & 0xFFu, (h >> 8) & 0xFFu, (h >> 16) & 0xFFu) / 255.0;
+}
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -26,31 +298,47 @@ void main() {
         return;  // the last tiles can stick out past the image edge
     }
 
-    // Pixel -> [-1, 1] on both axes. Image y goes down, camera up goes up, hence the minus.
-    vec2 uv = (vec2(pixel) + 0.5 + pc.jitter) / vec2(size);
-    vec2 ndc = uv * 2.0 - 1.0;
-    vec3 direction = normalize(pc.cameraForward.xyz
-                             + ndc.x * pc.tanHalfFov * pc.aspectRatio * pc.cameraRight.xyz
-                             - ndc.y * pc.tanHalfFov * pc.cameraUp.xyz);
-
-    rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsOpaqueEXT, 0xFF,
-                          pc.cameraPosition.xyz, 0.001, direction, 1000.0);
-    while (rayQueryProceedEXT(rayQuery)) {
-        // Only needed for non-opaque geometry (alpha cutouts, Phase 6).
+    if (scene.debugView != 0) {
+        float depth;
+        vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), depth);
+        imageStore(outColor, pixel, vec4(color, 1.0));
+        imageStore(outDepth, pixel, vec4(depth));
+        return;
     }
 
-    vec3 color;
+    uint seed = pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(scene.frameIndex)));
+
+    // Spread samples randomly over the pixel (anti-aliasing). A single sample without accumulation
+    // goes through the pixel center, otherwise edges would flicker from frame to frame.
+    bool randomOffset = scene.samplesPerPixel > 1 || scene.accumulate != 0;
+
+    vec3 color = vec3(0.0);
     float depth = 0.0;
-    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-        // Barycentrics give the weights of vertex 1 and 2; vertex 0 gets the rest.
-        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-        color = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-        depth = rayQueryGetIntersectionTEXT(rayQuery, true);
-    } else {
-        color = mix(vec3(0.10, 0.12, 0.18), vec3(0.02, 0.02, 0.04), uv.y);  // dark background gradient
-    }
 
-    imageStore(outColor, pixel, vec4(color, 1.0));
+    for (uint s = 0; s < scene.samplesPerPixel; s++) {
+        vec2 offset = randomOffset ? vec2(randomFloat(seed), randomFloat(seed)) - 0.5 : vec2(0.0);
+        vec3 direction = cameraRayDirection(vec2(pixel) + 0.5 + offset, size);
+
+        float hitDistance;
+        color += tracePath(scene.cameraPosition.xyz, direction, seed, hitDistance);
+        if (s == 0) {
+            depth = hitDistance;
+        }
+    }
+    color /= float(scene.samplesPerPixel);
+
+    // Running average: the n-th frame gets weight 1/(n+1), so every frame counts equally.
+    if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {
+        vec3 previous = imageLoad(accumulationImage, pixel).rgb;
+        color = mix(previous, color, 1.0 / float(scene.accumulatedFrames + 1));
+    }
+    imageStore(accumulationImage, pixel, vec4(color, 1.0));  // stays linear and unbounded
+
+    // Only what is displayed gets exposure and tone mapping, so changing them does not restart accumulation.
+    vec3 displayColor = color * scene.exposure;
+    if (scene.toneMapping != 0) {
+        displayColor = toneMapACES(displayColor);
+    }
+    imageStore(outColor, pixel, vec4(displayColor, 1.0));  // values above 1 are clamped when stored as 8 bit
     imageStore(outDepth, pixel, vec4(depth));
 }

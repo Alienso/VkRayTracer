@@ -44,9 +44,9 @@ void Application::initVulkan() {
     createCommandBuffers();
     createSyncObjects();
 
-    createSceneGeometry();
-    createBottomLevelAccelerationStructure();
-    createTopLevelAccelerationStructure();
+    createUniformBuffer();
+    findAvailableModels();
+    loadScene(loadedModel);  // findAvailableModels picks the default model
     createRayTracingImages();
     createRayTracingDescriptors();
     createRayTracingPipeline();
@@ -55,9 +55,25 @@ void Application::initVulkan() {
 }
 
 void Application::mainLoop() {
+    double lastTime = glfwGetTime();
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        double now = glfwGetTime();
+        float deltaTime = static_cast<float>(now - lastTime);
+        lastTime = now;
+
+        // Picked in the UI last frame. Loading waits for the GPU, so do it before anything is recorded.
+        if (requestedModel >= 0) {
+            loadScene(requestedModel);
+            requestedModel = -1;
+        }
+
         buildImGui();
+        // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
+        ImGuiIO& io = ImGui::GetIO();
+        camera.update(window, deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+
         drawFrame();
     }
 

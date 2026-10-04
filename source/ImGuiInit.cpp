@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <stdexcept>
+#include <algorithm>
 #include "../include/imgui/imgui.h"
 #include "../include/imgui/backends/imgui_impl_vulkan.h"
 #include "../include/imgui/backends/imgui_impl_glfw.h"
@@ -63,9 +64,87 @@ void Application::buildImGui() {
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::Begin("Stats");
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("GPU: %s", physicalDeviceProperties.deviceName);
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+    ImGui::Text("%u triangles", primitiveCount);
+
+    if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* preview = loadedModel >= 0 ? availableModels[loadedModel].c_str() : "(floor only)";
+        if (ImGui::BeginCombo("Model", preview)) {
+            if (ImGui::Selectable("(floor only)", loadedModel < 0) && loadedModel >= 0) {
+                requestedModel = static_cast<int>(availableModels.size());  // out of range = no model
+            }
+            for (int i = 0; i < static_cast<int>(availableModels.size()); i++) {
+                if (ImGui::Selectable(availableModels[i].c_str(), i == loadedModel) && i != loadedModel) {
+                    requestedModel = i;  // loaded at the start of the next frame
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Rescan")) {
+            std::string current = loadedModel >= 0 ? availableModels[loadedModel] : "";
+            findAvailableModels();
+            auto it = std::find(availableModels.begin(), availableModels.end(), current);
+            loadedModel = it != availableModels.end() ? static_cast<int>(it - availableModels.begin()) : -1;
+        }
+        ImGui::TextDisabled("put .glb/.gltf files into resource/models");
+        if (!loadError.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", loadError.c_str());
+        }
+        ImGui::Text("%zu meshes, %zu instances", meshInfos.size(), sceneInstances.size());
+        ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
+                    blasSizeBeforeCompaction / (1024.0 * 1024.0), blasSizeAfterCompaction / (1024.0 * 1024.0));
+    }
+
+    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
+        ImGui::TextDisabled("hold right mouse button to look around");
+        ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
+        ImGui::DragFloat("Yaw", &camera.yaw, 0.5f);
+        ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
+        ImGui::SliderFloat("Field of view", &camera.fov, 20.0f, 120.0f);
+        ImGui::SliderFloat("Move speed", &camera.moveSpeed, 0.1f, 20.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+    }
+
+    // ImGui needs unique IDs per widget; "##sun"/"##sky" suffixes are hidden from the labels.
+    if (ImGui::CollapsingHeader("Sun", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Azimuth", &settings.sunAzimuth, -180.0f, 180.0f);
+        ImGui::SliderFloat("Elevation", &settings.sunElevation, -10.0f, 90.0f);
+        ImGui::SliderFloat("Size (degrees)", &settings.sunAngularRadius, 0.0f, 15.0f, "%.2f");
+        ImGui::ColorEdit3("Color##sun", &settings.sunColor.x);
+        ImGui::SliderFloat("Intensity##sun", &settings.sunIntensity, 0.0f, 5.0f);
+        ImGui::Checkbox("Shadows", &settings.shadowsEnabled);
+    }
+
+    if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::ColorEdit3("Zenith", &settings.skyZenithColor.x);
+        ImGui::ColorEdit3("Horizon", &settings.skyHorizonColor.x);
+        ImGui::ColorEdit3("Ground", &settings.groundColor.x);
+        ImGui::SliderFloat("Intensity##sky", &settings.skyIntensity, 0.0f, 3.0f);
+    }
+
+    if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
+        ImGui::Combo("Debug view", &settings.debugView, "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0");
+        ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
+        ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
+        ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
+        ImGui::Checkbox("Accumulate", &settings.accumulate);
+        if (settings.accumulate) {
+            ImGui::SameLine();
+            ImGui::Text("%u frames (%u samples/pixel)", accumulatedFrames, accumulatedFrames * settings.samplesPerPixel);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Restart")) {
+                resetAccumulation = true;
+            }
+        }
+    }
+
+    ImGui::Separator();
     ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
     ImGui::End();
 
