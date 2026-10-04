@@ -354,6 +354,16 @@ private:
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
 
+    // DLSS Ray Reconstruction via Streamline (Dlss.cpp)
+    void* streamlineModule = nullptr;  // HMODULE of sl.interposer.dll
+    bool streamlineInitialized = false;
+    bool dlssSupported = false;
+    std::string dlssStatus = "not checked";
+    std::vector<std::string> streamlineInstanceExtensions;  // what Streamline asks for
+    std::vector<std::string> streamlineDeviceExtensions;
+    std::vector<std::string> streamlineFeatures12;  // Vulkan 1.2 / 1.3 feature names it needs enabled
+    std::vector<std::string> streamlineFeatures13;
+
     // Automatic exposure (Exposure.cpp): histogram + adapted exposure on the GPU, read back for the UI
     VkBuffer exposureBuffer;
     VkDeviceMemory exposureMemory;
@@ -464,6 +474,13 @@ private:
     void recordMaterialUpdate(VkCommandBuffer commandBuffer);
     void createSpecularAlbedoTable();
     void destroySpecularAlbedoTable();
+    // Dlss.cpp
+    void initStreamline();
+    void addStreamlineDeviceRequirements(std::vector<const char*>& extensions, VkPhysicalDeviceVulkan12Features& features12,
+                                         VkPhysicalDeviceVulkan13Features& features13);
+    void connectStreamline(uint32_t graphicsQueueFamily);
+    void shutdownStreamline();
+
     // Exposure.cpp
     void createExposureResources();
     void updateExposureDescriptorSet();

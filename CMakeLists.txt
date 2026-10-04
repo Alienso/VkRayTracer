@@ -41,6 +41,7 @@ add_executable(vulkanDemo main.cpp
         source/BuiltInModels.cpp source/BuiltInModels.h
         source/Lights.cpp
         source/Exposure.cpp
+        source/Dlss.cpp
         include/cgltf/cgltf.h)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
@@ -52,6 +53,28 @@ target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
 add_custom_command(TARGET vulkanDemo PRE_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${PROJECT_SOURCE_DIR}/resource $<TARGET_FILE_DIR:vulkanDemo>)
+
+# NVIDIA Streamline (DLSS Ray Reconstruction): loaded at runtime from next to the executable.
+# lib/streamline is not in git (download_streamline.ps1 fetches it); without it the app runs without DLSS.
+set(STREAMLINE_DLLS
+        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.interposer.dll
+        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.common.dll
+        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.dlss_d.dll
+        ${PROJECT_SOURCE_DIR}/lib/streamline/nvngx_dlssd.dll
+        ${PROJECT_SOURCE_DIR}/lib/streamline/NvLowLatencyVk.dll)
+set(STREAMLINE_FOUND TRUE)
+foreach (dll ${STREAMLINE_DLLS})
+    if (NOT EXISTS ${dll})
+        set(STREAMLINE_FOUND FALSE)
+    endif ()
+endforeach ()
+if (STREAMLINE_FOUND)
+    add_custom_command(TARGET vulkanDemo PRE_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${STREAMLINE_DLLS} $<TARGET_FILE_DIR:vulkanDemo>)
+else ()
+    message(WARNING "Streamline DLLs missing in lib/streamline: DLSS will be unavailable. "
+            "Run: powershell -ExecutionPolicy Bypass -File download_streamline.ps1")
+endif ()
 
 
 #==============================================================================

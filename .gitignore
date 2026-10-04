@@ -3,3 +3,5 @@ resource/words.txt
 runTool.c
 # 3D models: downloaded from the Khronos glTF sample repo, too big to keep in git
 resource/models/
+# NVIDIA Streamline / DLSS DLLs (~50 MB, a new 48 MB DLL with every DLSS update): fetched by download_streamline.ps1
+lib/streamline/

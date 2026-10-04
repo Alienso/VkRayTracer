@@ -64,6 +64,12 @@ void Application::createInstance(){
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
     auto extensions = getRequiredExtensions();
+    // DLSS: what Streamline asked for (all core since Vulkan 1.1, but it checks the list)
+    for (const std::string& name : streamlineInstanceExtensions) {
+        if (std::none_of(extensions.begin(), extensions.end(), [&](const char* e) { return name == e; })) {
+            extensions.push_back(name.c_str());
+        }
+    }
     VkInstanceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
@@ -144,7 +150,7 @@ void Application::createLogicalDevice(){
     }
 
     // Features are enabled through a pNext chain:
-    // features2 -> vulkan12Features -> accelerationStructureFeatures -> rayQueryFeatures
+    // features2 -> vulkan13Features -> vulkan12Features -> accelerationStructureFeatures -> rayQueryFeatures
     VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rayQueryFeatures.rayQuery = VK_TRUE;
@@ -164,9 +170,17 @@ void Application::createLogicalDevice(){
     vulkan12Features.scalarBlockLayout = VK_TRUE;
     vulkan12Features.pNext = &accelerationStructureFeatures;
 
+    VkPhysicalDeviceVulkan13Features vulkan13Features{};
+    vulkan13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vulkan13Features.pNext = &vulkan12Features;
+
+    // DLSS: extensions and features Streamline needs (VK_NVX_binary_import etc.), merged with ours
+    std::vector<const char*> extensions = Configuration::deviceExtensions;
+    addStreamlineDeviceRequirements(extensions, vulkan12Features, vulkan13Features);
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &vulkan12Features;
+    features2.pNext = &vulkan13Features;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -174,8 +188,8 @@ void Application::createLogicalDevice(){
     createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
     createInfo.pQueueCreateInfos = queueCreateInfos.data();
     createInfo.pEnabledFeatures = nullptr;  // must be null when VkPhysicalDeviceFeatures2 is chained
-    createInfo.enabledExtensionCount = static_cast<uint32_t>(Configuration::deviceExtensions.size());
-    createInfo.ppEnabledExtensionNames = Configuration::deviceExtensions.data();
+    createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    createInfo.ppEnabledExtensionNames = extensions.data();
 
     // Device layers are deprecated (ignored since Vulkan 1.0); validation is enabled on the instance only.
     createInfo.enabledLayerCount = 0;
@@ -185,6 +199,7 @@ void Application::createLogicalDevice(){
     }
 
     vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
+    connectStreamline(indices.graphicsFamily.value());  // DLSS: tell Streamline about the device
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
 
     vkext::load(device);

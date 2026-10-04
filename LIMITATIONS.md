@@ -138,3 +138,26 @@ accumulating, the measurement comes from the averaged image, so early noisy fram
 differently from the converged result.
 - Where: shaders/exposure.comp, source/Exposure.cpp.
 - Fix (if it matters): meter before tracing from a cheap low-resolution pass; a smarter metering mode.
+
+## DLSS / Streamline (Phase 7)
+
+### The NVIDIA driver applies its vsync setting once Streamline is loaded
+As soon as `slInit` runs, the NVIDIA driver treats the program as a DLSS game and applies its own "Vertical
+sync" setting to our window, even with the MAILBOX present mode. With the default setting, the frame rate is
+capped at the monitor's refresh rate (120 FPS here, 819 without Streamline). The NVIDIA overlay ("Alt+Z")
+appears at the same moment. Not the cause: the present mode (IMMEDIATE is affected the same way once vsync is
+forced), DXGI or a D3D12 device in the process (tested without Streamline: no cap), the DLSS plugin or model
+(also capped with no features requested), and the "Vulkan/OpenGL present method" setting.
+- Workaround: NVIDIA Control Panel > Manage 3D settings > Program Settings > add `vulkanDemo.exe` >
+  Vertical sync = Off.
+- Where: `initStreamline` (source/Dlss.cpp).
+
+### Streamline costs about 0.28 ms per frame even when unused
+With Streamline loaded (vsync off), the helmet scene takes 1.57 ms per frame instead of 1.29 ms, although no
+Streamline function is called per frame yet. Likely the driver's handling of "DLSS games" (its overlay and
+telemetry DLLs get loaded into the process); not investigated further. Small next to the DLSS evaluation itself.
+- Fix: make Streamline optional at startup (it must be decided before the Vulkan instance is created).
+- Where: `initStreamline` (source/Dlss.cpp).
+
+### Startup takes about 3 seconds longer
+`slInit` queries NGX (the driver's DLSS runtime) for its requirements, which is slow.

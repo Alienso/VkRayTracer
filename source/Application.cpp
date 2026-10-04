@@ -31,6 +31,7 @@ void Application::initWindow() {
 }
 
 void Application::initVulkan() {
+    initStreamline();  // DLSS: must come before the instance exists
     createInstance();
     setupDebugMessenger();
     createSurface();
@@ -97,6 +98,7 @@ void Application::cleanup() {
     }
 
     vkDestroyCommandPool(device, commandPool, nullptr);
+    shutdownStreamline();
     vkDestroyDevice(device, nullptr);
 
     if (Configuration::enableValidationLayers) {
