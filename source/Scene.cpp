@@ -42,11 +42,12 @@ void Application::findAvailableModels() {
     availableModels = builtInModelNames();
     std::vector<std::string> files;
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(modelsDirectory, error)) {
+    // Subfolders too: a .gltf usually comes with its .bin and images, so it gets a folder of its own.
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(modelsDirectory, error)) {
         std::string extension = entry.path().extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
         if (entry.is_regular_file() && (extension == ".glb" || extension == ".gltf")) {
-            files.push_back(entry.path().filename().string());
+            files.push_back(entry.path().lexically_relative(modelsDirectory).generic_string());  // "Sponza/Sponza.gltf"
         }
     }
     std::sort(files.begin(), files.end());
@@ -167,7 +168,8 @@ void Application::addObject(const std::string& fileName) {
     try {
         SceneObject object;
         object.modelIndex = static_cast<uint32_t>(findOrLoadModel(fileName));
-        object.name = fileName.substr(0, fileName.find_last_of('.'));
+        object.name = std::filesystem::path(fileName).stem().string();
+        object.originalSize = addAtOriginalSize && !isBuiltInModel(fileName);
 
         const SceneModel& model = sceneModels[object.modelIndex];
         for (const MeshInstance& part : model.parts) {
@@ -175,8 +177,15 @@ void Application::addObject(const std::string& fileName) {
         }
 
         // Line objects up: 0, +1, -1, +2, -2, ... spacings from the center, so they don't overlap.
-        // Built-in rooms go to the center instead, around whatever already stands there.
-        if (!isBuiltInModel(fileName)) {
+        // Built-in rooms and original-size scenes go to the center instead, around whatever already stands there.
+        if (object.originalSize) {
+            // A whole scene brings its own ground; the built-in floor would cut through it.
+            for (SceneObject& other : sceneObjects) {
+                if (other.modelIndex == 0) {
+                    other.visible = false;
+                }
+            }
+        } else if (!isBuiltInModel(fileName)) {
             int existing = static_cast<int>(std::count_if(sceneObjects.begin(), sceneObjects.end(), [](const SceneObject& o) {
                 return o.modelIndex != 0 && !isBuiltInModel(o.name);
             }));
@@ -248,7 +257,7 @@ void Application::updateScene() {
             if (p < object.hiddenParts.size() && object.hiddenParts[p]) {
                 continue;
             }
-            glm::mat4 world = objectTransform * model.fit * part.transform;
+            glm::mat4 world = objectTransform * (object.originalSize ? glm::mat4(1.0f) : model.fit) * part.transform;
             VkAccelerationStructureInstanceKHR instance{};  // zeroed, so memcmp below compares only real data
             instance.transform = toVkTransform(world);
             instance.instanceCustomIndex = part.meshIndex;  // 24 bits for us; the shader uses it to find the mesh
@@ -393,7 +402,15 @@ void Application::buildSceneUi() {
             modelToAdd = static_cast<int>(it - availableModels.begin());
         }
     }
-    ImGui::TextDisabled("put .glb/.gltf files into resource/models");
+    ImGui::Checkbox("Original size", &addAtOriginalSize);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Off: new models are scaled to %.0f units and stood on the floor.\n"
+                          "On: they keep the file's own size and position (glTF uses meters),\n"
+                          "for whole scenes like Sponza. The built-in floor is then hidden.", modelSize);
+    }
+    ImGui::TextDisabled("put .glb/.gltf files (or folders) into resource/models");
     if (!loadError.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", loadError.c_str());
     }
@@ -440,6 +457,11 @@ void Application::buildSceneUi() {
         ImGui::SameLine();
         if (ImGui::Checkbox("Uniform", &object.uniformScale) && object.uniformScale) {
             object.scale = glm::vec3(object.scale.x);
+        }
+        if (object.modelIndex != 0 && !isBuiltInModel(model.name)) {
+            ImGui::Checkbox("Original size", &object.originalSize);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(file units, not fitted to %.0f)", modelSize);
         }
 
         if (model.parts.size() > 1 && ImGui::TreeNode("parts", "Parts (%zu)", model.parts.size())) {

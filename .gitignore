@@ -1,3 +1,5 @@
 .idea
 resource/words.txt
 runTool.c
+# 3D models: downloaded from the Khronos glTF sample repo, too big to keep in git
+resource/models/

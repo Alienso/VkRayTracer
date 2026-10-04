@@ -112,7 +112,7 @@ enum class DebugView : int {
 struct SceneModel {
     std::string name;                 // file name, or "Floor" for the built-in floor
     std::vector<MeshInstance> parts;  // meshIndex into Application::sceneMeshes, transform from the file's node tree
-    glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0
+    glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0 (unless originalSize)
     uint32_t firstMaterial = 0;       // the model's materials are sceneMaterials[firstMaterial .. + materialCount)
     uint32_t materialCount = 0;
 };
@@ -126,6 +126,7 @@ struct SceneObject {
     glm::vec3 rotation = glm::vec3(0.0f);  // degrees around X, Y, Z; applied in the order Y (yaw), X (pitch), Z (roll)
     glm::vec3 scale = glm::vec3(1.0f);
     bool uniformScale = true;  // UI only: edit all three scale axes together
+    bool originalSize = false;  // skip the model's fit: keep the file's own size and position (glTF: meters)
     std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
 
     glm::mat4 transform() const;           // translate * rotate * scale
@@ -291,6 +292,7 @@ private:
     // Models found in the models/ folder next to the executable
     std::vector<std::string> availableModels;
     int modelToAdd = 0;  // UI: index into availableModels
+    bool addAtOriginalSize = false;  // UI: new objects keep the file's size (whole scenes like Sponza)
     std::string loadError;
 
     // Ray tracing output, recreated with the swapchain
