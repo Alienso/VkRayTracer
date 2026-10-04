@@ -24,7 +24,7 @@ find_program(glslc_executable NAMES glslc HINTS Vulkan::glslc)
 
 add_executable(vulkanDemo main.cpp
         include/imgui/imgui.cpp include/imgui/imgui.h
-        include/imgui/imgui_draw.cpp
+        include/imgui/imgui_draw.cpp include/imgui/imgui_demo.cpp
         include/imgui/imgui_tables.cpp include/imgui/imgui_widgets.cpp
         include/imgui/backends/imgui_impl_glfw.h include/imgui/backends/imgui_impl_glfw.cpp
         include/imgui/backends/imgui_impl_vulkan.h include/imgui/backends/imgui_impl_vulkan.cpp
@@ -32,7 +32,9 @@ add_executable(vulkanDemo main.cpp
         include/stb_image.cpp include/stb_image.h
         source/Application.cpp source/Application.h
         source/Configuration.cpp source/Configuration.h
-        source/VulkanInitHelper.cpp source/ImGuiInit.cpp source/Vertex.cpp source/Vertex.h)
+        source/VulkanInitHelper.cpp source/ImGuiInit.cpp source/Vertex.cpp source/Vertex.h
+        source/VulkanExtensions.cpp source/VulkanExtensions.h
+        source/RayTracer.cpp)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
 
@@ -76,6 +78,7 @@ foreach(source IN LISTS SHADERS)
     add_custom_command(
             COMMAND
             ${glslc_executable}
+            --target-env=vulkan1.3  # needed for GL_EXT_ray_query
             #      -MD -MF ${SHADER_BINARY_DIR}/${FILENAME}.d
             -o ${SHADER_BINARY_DIR}/${FILENAME}.spv
             ${source}

@@ -3,6 +3,7 @@
 //
 
 #include <functional>
+#include <stdexcept>
 #include "../include/imgui/imgui.h"
 #include "../include/imgui/backends/imgui_impl_vulkan.h"
 #include "../include/imgui/backends/imgui_impl_glfw.h"
@@ -12,36 +13,28 @@
 
 void Application::initImGui(){
     // 1: create descriptor pool for IMGUI
-    //  the size of the pool is very oversize, but it's copied from imgui demo
-    //  itself.
-    VkDescriptorPoolSize pool_sizes[] = { { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
-                                          { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 } };
+    //  ImGui itself only needs a combined image sampler for its font texture,
+    //  the extra room is for textures we may show in the UI later.
+    VkDescriptorPoolSize pool_sizes[] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 } };
 
     VkDescriptorPoolCreateInfo pool_info = {};
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool_info.maxSets = 1000;
+    pool_info.maxSets = 100;
     pool_info.poolSizeCount = (uint32_t)std::size(pool_sizes);
     pool_info.pPoolSizes = pool_sizes;
 
-    vkCreateDescriptorPool(device, &pool_info, nullptr, &imGuiPool);
+    if (vkCreateDescriptorPool(device, &pool_info, nullptr, &imGuiPool) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create imGui descriptor pool!");
+    }
 
     // 2: initialize imgui library
 
     // this initializes the core structures of imgui
     ImGui::CreateContext();
 
-    // this initializes imgui for SDL
-    ImGui_ImplGlfw_InitForVulkan(window, true); //?
+    // this initializes imgui for GLFW (true = install input callbacks, chaining any existing ones)
+    ImGui_ImplGlfw_InitForVulkan(window, true);
 
     // this initializes imgui for Vulkan
     ImGui_ImplVulkan_InitInfo init_info = {};
@@ -50,98 +43,75 @@ void Application::initImGui(){
     init_info.Device = device;
     init_info.Queue = graphicsQueue;
     init_info.DescriptorPool = imGuiPool;
-    init_info.MinImageCount = 3;
-    init_info.ImageCount = 3;
-    /*init_info.UseDynamicRendering = true;
-    init_info.ColorAttachmentFormat = _swapchainImageFormat;*/
-
+    init_info.MinImageCount = static_cast<uint32_t>(swapChainImages.size());
+    init_info.ImageCount = static_cast<uint32_t>(swapChainImages.size());
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
-    ImGui_ImplVulkan_Init(&init_info, renderPass); //?
+    // ImGui creates its pipeline against our render pass, subpass 0
+    if (!ImGui_ImplVulkan_Init(&init_info, renderPass)) {
+        throw std::runtime_error("failed to initialize imGui Vulkan backend!");
+    }
 
-    // execute a gpu command to upload imgui font textures
-    Application::immediateSubmit([&](VkCommandBuffer cmd) { ImGui_ImplVulkan_CreateFontsTexture(cmd); });
-    //ImGui_ImplVulkan_CreateFontsTexture(imGuiCommandBuffer);
-
-    // clear font textures from cpu data
-    //ImGui_ImplVulkan_DestroyFontUploadObjects();
-
-    // add the destroy the imgui created structures
-    /*_mainDeletionQueue.push_function([=]() {
-        vkDestroyDescriptorPool(device, imguiPool, nullptr);
-        ImGui_ImplVulkan_Shutdown();
-    });*/
+    // execute a gpu command to upload imgui font textures, then free the staging buffer
+    immediateSubmit([&](VkCommandBuffer cmd) { ImGui_ImplVulkan_CreateFontsTexture(cmd); });
+    ImGui_ImplVulkan_DestroyFontUploadObjects();
 }
 
-VkCommandBufferBeginInfo command_buffer_begin_info(VkCommandBufferUsageFlags flags){
-    VkCommandBufferBeginInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    info.pNext = nullptr;
+// Builds this frame's UI. Must be called once per frame before drawFrame().
+void Application::buildImGui() {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
 
-    info.pInheritanceInfo = nullptr;
-    info.flags = flags;
-    return info;
+    ImGui::Begin("Stats");
+    ImGui::Text("GPU: %s", physicalDeviceProperties.deviceName);
+    ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+    ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
+    ImGui::End();
+
+    if (showImGuiDemo) {
+        ImGui::ShowDemoWindow(&showImGuiDemo);
+    }
+
+    ImGui::Render();
 }
 
-/*VkCommandBuffer command_buffer_submit_info(VkCommandBuffer cmd){
-    //VkCommandBuffer info{};
-    info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    info.pNext = nullptr;
-    info.commandBuffer = cmd;
-    info.deviceMask = 0;
-
-    return info;
-}*/
-
-
-VkSubmitInfo submit_info(VkCommandBuffer* cmd, VkSemaphoreSubmitInfo* signalSemaphoreInfo,
-                                  VkSemaphoreSubmitInfo* waitSemaphoreInfo){
-    VkSubmitInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    info.pNext = nullptr;
-
-    info.waitSemaphoreCount = waitSemaphoreInfo == nullptr ? 0 : 1;
-    info.pWaitSemaphores = nullptr;
-
-    info.signalSemaphoreCount = signalSemaphoreInfo == nullptr ? 0 : 1;
-    info.pSignalSemaphores = nullptr;
-
-    info.commandBufferCount = 1;
-    info.pCommandBuffers = cmd;
-
-    return info;
-}
-
-
+// Records commands with `function`, submits them and waits until the GPU is done.
+// Only meant for one-off setup work (uploads), not for per-frame rendering.
 void Application::immediateSubmit(std::function<void(VkCommandBuffer cmd)>&& function)
 {
-    (vkResetFences(device, 1, &imGuiFence));
-    (vkResetCommandBuffer(imGuiCommandBuffer, 0));
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = commandPool;
+    allocInfo.commandBufferCount = 1;
 
-    VkCommandBuffer cmd = imGuiCommandBuffer;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
 
-    VkCommandBufferBeginInfo cmdBeginInfo = command_buffer_begin_info(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    (vkBeginCommandBuffer(cmd, &cmdBeginInfo));
-
+    vkBeginCommandBuffer(cmd, &beginInfo);
     function(cmd);
+    vkEndCommandBuffer(cmd);
 
-    (vkEndCommandBuffer(cmd));
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
 
-    VkCommandBuffer cmdinfo = imGuiCommandBuffer;//command_buffer_submit_info(cmd);
-    VkSubmitInfo submit = submit_info(&cmdinfo, nullptr, nullptr);
+    vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphicsQueue);
 
-    // submit command buffer to the queue and execute it.
-    //  _renderFence will now block until the graphic commands finish execution
-    (vkQueueSubmit(graphicsQueue, 1, &submit, imGuiFence));
-
-    (vkWaitForFences(device, 1, &imGuiFence, true, 9999999999));
+    vkFreeCommandBuffers(device, commandPool, 1, &cmd);
 }
 
 
 void Application::cleanupImGui(){
-    vkDestroyFence(device, imGuiFence, nullptr);
-    vkDestroyDescriptorPool(device, imGuiPool, nullptr);
     ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    vkDestroyDescriptorPool(device, imGuiPool, nullptr);
 }
-

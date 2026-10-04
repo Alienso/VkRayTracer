@@ -15,7 +15,10 @@ const std::vector<const char*> Configuration::validationLayers = {
         "VK_LAYER_KHRONOS_validation"
 };
 const std::vector<const char*> Configuration::deviceExtensions = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME  // required by VK_KHR_acceleration_structure
 };
 
 const bool Configuration::enableValidationLayers = true;
