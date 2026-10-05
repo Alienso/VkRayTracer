@@ -16,10 +16,11 @@ $raw = "https://raw.githubusercontent.com/$repo/main/Models"
 $glbModels = @(
     "DamagedHelmet", "Duck", "Lantern",                   # Phase 3: loading, textures, normal maps
     "MetalRoughSpheres", "TransmissionTest",              # Phase 5/6: metal/roughness, glass
-    "AlphaBlendModeTest", "DragonAttenuation"             # Phase 6: alpha, solid glass with absorption
+    "AlphaBlendModeTest", "DragonAttenuation",            # Phase 6: alpha, solid glass with absorption
+    "TextureTransformMultiTest"                           # KHR_texture_transform on every texture slot
 )
 # Multi-file models (.gltf + .bin + images), each in a folder of its own
-$folderModels = @("Sponza")
+$folderModels = @("Sponza", "TextureTransformTest")  # TextureTransformTest: KHR_texture_transform, base color
 
 New-Item -ItemType Directory -Force $Destination | Out-Null
 

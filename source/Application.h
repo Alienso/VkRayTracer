@@ -165,6 +165,11 @@ struct GpuMaterial {
     float normalScale;
     uint32_t solid;          // 1 = closed volume that refracts, 0 = thin
     glm::vec3 absorption;    // per unit of distance inside a solid (Beer's law), 0 = clear
+    glm::mat3x2 baseColorUvTransform;  // KHR_texture_transform per texture, see Material
+    glm::mat3x2 metallicRoughnessUvTransform;
+    glm::mat3x2 transmissionUvTransform;
+    glm::mat3x2 emissiveUvTransform;
+    glm::mat3x2 normalUvTransform;
 };
 
 // A texture on the GPU. Samplers are shared between textures with the same settings.

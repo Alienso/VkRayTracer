@@ -144,6 +144,11 @@ std::vector<GpuMaterial> Application::packMaterials() const {
         gpu.emissiveTexture = sceneMaterial.useEmissiveTexture ? m.emissiveTexture : -1;
         gpu.normalTexture = sceneMaterial.useNormalTexture ? m.normalTexture : -1;
         gpu.normalScale = m.normalScale;
+        gpu.baseColorUvTransform = m.baseColorUvTransform;
+        gpu.metallicRoughnessUvTransform = m.metallicRoughnessUvTransform;
+        gpu.transmissionUvTransform = m.transmissionUvTransform;
+        gpu.emissiveUvTransform = m.emissiveUvTransform;
+        gpu.normalUvTransform = m.normalUvTransform;
         gpu.solid = m.solid ? 1 : 0;
         // Beer's law: after distance d, exp(-absorption * d) of the light is left. glTF gives the color left
         // after attenuationDistance, so absorption = -ln(color) / distance per channel.

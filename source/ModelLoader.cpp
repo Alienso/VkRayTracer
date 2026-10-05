@@ -90,6 +90,20 @@ static TextureData decodeImage(const cgltf_image* image, const std::string& dire
     return texture;
 }
 
+// KHR_texture_transform as a 2x3 matrix: translation * rotation * scale. Identity if the slot has none.
+// The rotation's sign follows Khronos' sample renderer and test models (TextureTransformTest); the GLSL snippet in
+// the extension's README has it the other way round.
+static glm::mat3x2 uvTransform(const cgltf_texture_view& view) {
+    if (!view.texture || !view.has_transform) {
+        return glm::mat3x2(1.0f);
+    }
+    const cgltf_texture_transform& t = view.transform;
+    float c = std::cos(t.rotation), s = std::sin(t.rotation);
+    return glm::mat3x2(glm::vec2(c, -s) * t.scale[0],
+                       glm::vec2(s, c) * t.scale[1],
+                       glm::vec2(t.offset[0], t.offset[1]));
+}
+
 // Loads the texture a material slot points at (once per texture and color space). Returns -1 if there is none.
 class TextureLoader {
 public:
@@ -105,7 +119,9 @@ public:
                       << ": image format not supported (KTX2/WebP?), using the constant only" << std::endl;
             return -1;
         }
-        if (view.texcoord != 0) {
+        // The transform may pick a different UV set than the slot itself
+        int texcoord = view.has_transform && view.transform.has_texcoord ? view.transform.texcoord : view.texcoord;
+        if (texcoord != 0) {
             std::cerr << model.name << ": " << materialName << " " << slot
                       << " uses a second UV set, which isn't supported; using the first one" << std::endl;
         }
@@ -152,15 +168,19 @@ static Material loadMaterial(const cgltf_material& gltfMaterial, TextureLoader& 
         material.roughness = pbr.roughness_factor;
         material.baseColorTexture = textures.load(pbr.base_color_texture, true, "base color", material.name);
         material.metallicRoughnessTexture = textures.load(pbr.metallic_roughness_texture, false, "metallic/roughness", material.name);
+        material.baseColorUvTransform = uvTransform(pbr.base_color_texture);
+        material.metallicRoughnessUvTransform = uvTransform(pbr.metallic_roughness_texture);
     } else if (gltfMaterial.has_pbr_specular_glossiness) {
         // The old specular/glossiness workflow: at least keep the color.
         material.baseColor = glm::make_vec4(gltfMaterial.pbr_specular_glossiness.diffuse_factor);
         material.baseColorTexture = textures.load(gltfMaterial.pbr_specular_glossiness.diffuse_texture, true, "diffuse", material.name);
+        material.baseColorUvTransform = uvTransform(gltfMaterial.pbr_specular_glossiness.diffuse_texture);
     }
 
     if (gltfMaterial.has_transmission) {
         material.transmission = gltfMaterial.transmission.transmission_factor;
         material.transmissionTexture = textures.load(gltfMaterial.transmission.transmission_texture, false, "transmission", material.name);
+        material.transmissionUvTransform = uvTransform(gltfMaterial.transmission.transmission_texture);
     }
     if (gltfMaterial.has_ior) {
         material.ior = gltfMaterial.ior.ior;
@@ -178,9 +198,11 @@ static Material loadMaterial(const cgltf_material& gltfMaterial, TextureLoader& 
         material.emissiveStrength = gltfMaterial.emissive_strength.emissive_strength;
     }
     material.emissiveTexture = textures.load(gltfMaterial.emissive_texture, true, "emissive", material.name);
+    material.emissiveUvTransform = uvTransform(gltfMaterial.emissive_texture);
 
     material.normalTexture = textures.load(gltfMaterial.normal_texture, false, "normal", material.name);
     material.normalScale = gltfMaterial.normal_texture.scale;
+    material.normalUvTransform = uvTransform(gltfMaterial.normal_texture);
 
     switch (gltfMaterial.alpha_mode) {
         case cgltf_alpha_mode_mask: material.alphaMode = AlphaMode::Mask; break;
@@ -345,10 +367,11 @@ static void computeEmissiveTextureAverages(Model& model) {
         }
 
         mesh.emissiveTextureAverage.resize(mesh.indices.size() / 3);
+        const glm::mat3x2& transform = material.emissiveUvTransform;  // affine: the triangle stays a triangle
         for (size_t t = 0; t < mesh.emissiveTextureAverage.size(); t++) {
-            glm::vec2 uv0 = mesh.vertices[mesh.indices[3 * t]].uv;
-            glm::vec2 uv1 = mesh.vertices[mesh.indices[3 * t + 1]].uv;
-            glm::vec2 uv2 = mesh.vertices[mesh.indices[3 * t + 2]].uv;
+            glm::vec2 uv0 = transform * glm::vec3(mesh.vertices[mesh.indices[3 * t]].uv, 1.0f);
+            glm::vec2 uv1 = transform * glm::vec3(mesh.vertices[mesh.indices[3 * t + 1]].uv, 1.0f);
+            glm::vec2 uv2 = transform * glm::vec3(mesh.vertices[mesh.indices[3 * t + 2]].uv, 1.0f);
             glm::vec2 e1 = uv1 - uv0, e2 = uv2 - uv0;
             float texels = 0.5f * std::abs(e1.x * e2.y - e1.y * e2.x) * texture.width * texture.height;
             // k x k grid of small triangles = k^2 sample points (their centers)

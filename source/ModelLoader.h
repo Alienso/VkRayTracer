@@ -6,6 +6,7 @@
 #define VULKANDEMO_MODELLOADER_H
 
 #include <glm/glm.hpp>
+#include <glm/mat3x2.hpp>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -60,6 +61,14 @@ struct Material {
     int emissiveTexture = -1;           // RGB: emitted color
     int normalTexture = -1;             // RGB: surface direction in tangent space, see the shader
     float normalScale = 1.0f;           // strength of the normal map's bumps
+
+    // KHR_texture_transform: where each texture is read, texture UV = transform * (mesh UV, 1). Lets a file tile,
+    // move or rotate a texture without changing the mesh. Identity when the file doesn't have one.
+    glm::mat3x2 baseColorUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 metallicRoughnessUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 transmissionUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 emissiveUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 normalUvTransform = glm::mat3x2(1.0f);
 };
 
 // One glTF "primitive": a list of triangles that share one material.
