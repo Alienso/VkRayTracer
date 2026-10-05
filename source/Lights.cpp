@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <glm/gtc/constants.hpp>
 #include "../include/imgui/imgui.h"
 #include "Application.h"
@@ -91,12 +92,14 @@ void Application::createLightBuffers() {
     createStreamedBuffer(emissiveTriangleBuffer, 1024 * sizeof(EmissiveTriangle));
     createStreamedBuffer(instanceLightBuffer, 256 * sizeof(int32_t));
     createStreamedBuffer(punctualLightBuffer, 64 * sizeof(GpuPunctualLight));
+    createStreamedBuffer(lightTreeBuffer, 2048 * sizeof(LightTreeNode));
 }
 
 void Application::destroyLightBuffers() {
     destroyStreamedBuffer(emissiveTriangleBuffer);
     destroyStreamedBuffer(instanceLightBuffer);
     destroyStreamedBuffer(punctualLightBuffer);
+    destroyStreamedBuffer(lightTreeBuffer);
 }
 
 static float luminance(glm::vec3 color) {
@@ -161,13 +164,91 @@ void Application::buildLightList() {
             triangle.cdf = static_cast<float>(sum);
         }
         emissiveTriangles.back().cdf = 1.0f;  // no rounding gap at the end
+        buildLightTree();
     } else {
         // Glowing materials, but all triangles have zero area or a black texture: nothing to sample.
         emissiveTriangles.clear();
         instanceFirstLight.assign(frameInstances.size(), -1);
         sampledEmissiveTriangles = 0;
+        lightTree.clear();
+        lightTreeDepth = 0;
     }
     lightsUploadPending = true;
+}
+
+// The light tree over the triangles that can be picked (probability > 0). Each node holds the box around its
+// triangles and their summed probability; the shader walks down from the root and at every node picks a child by
+// how much light it could send to the shading point (see pickFromLightTree). Built by splitting the triangles at
+// the median of their centers along the box's longest axis, down to one triangle per leaf, so the depth is
+// log2(triangles) rounded up, and the 32 bits of treeTrail are plenty.
+void Application::buildLightTree() {
+    lightTree.clear();
+    lightTreeDepth = 0;
+
+    std::vector<uint32_t> triangles;
+    for (uint32_t i = 0; i < emissiveTriangles.size(); i++) {
+        emissiveTriangles[i].treeTrail = 0;
+        if (emissiveTriangles[i].probability > 0.0f) {
+            triangles.push_back(i);
+        }
+    }
+    if (triangles.empty()) {
+        return;
+    }
+    lightTree.reserve(2 * triangles.size() - 1);
+
+    auto center = [&](uint32_t i) {
+        const EmissiveTriangle& t = emissiveTriangles[i];
+        return (t.p0 + t.p1 + t.p2) / 3.0f;
+    };
+
+    // Fills node `nodeIndex` with triangles[first, last). `trail` is the way down to it, `depth` its level.
+    auto build = [&](auto&& self, uint32_t nodeIndex, size_t first, size_t last, uint32_t trail, uint32_t depth) -> void {
+        LightTreeNode node{};
+        node.boundsMin = glm::vec3(std::numeric_limits<float>::max());
+        node.boundsMax = glm::vec3(-std::numeric_limits<float>::max());
+        glm::vec3 centerMin = node.boundsMin;
+        glm::vec3 centerMax = node.boundsMax;
+        double power = 0.0;
+        for (size_t i = first; i < last; i++) {
+            const EmissiveTriangle& t = emissiveTriangles[triangles[i]];
+            node.boundsMin = glm::min(node.boundsMin, glm::min(t.p0, glm::min(t.p1, t.p2)));
+            node.boundsMax = glm::max(node.boundsMax, glm::max(t.p0, glm::max(t.p1, t.p2)));
+            glm::vec3 c = center(triangles[i]);
+            centerMin = glm::min(centerMin, c);
+            centerMax = glm::max(centerMax, c);
+            power += t.probability;
+        }
+        node.power = static_cast<float>(power);
+        lightTreeDepth = std::max(lightTreeDepth, depth);
+
+        if (last - first == 1) {
+            node.child = -static_cast<int32_t>(triangles[first]) - 1;
+            emissiveTriangles[triangles[first]].treeTrail = trail;
+            lightTree[nodeIndex] = node;
+            return;
+        }
+
+        // Split along the axis where the centers spread most; nth_element puts the median in place.
+        glm::vec3 extent = centerMax - centerMin;
+        int axis = extent.x >= extent.y && extent.x >= extent.z ? 0 : (extent.y >= extent.z ? 1 : 2);
+        size_t middle = first + (last - first) / 2;
+        std::nth_element(triangles.begin() + static_cast<std::ptrdiff_t>(first),
+                         triangles.begin() + static_cast<std::ptrdiff_t>(middle),
+                         triangles.begin() + static_cast<std::ptrdiff_t>(last),
+                         [&](uint32_t a, uint32_t b) { return center(a)[axis] < center(b)[axis]; });
+
+        // The two children sit next to each other, so the node only needs the first one's index.
+        uint32_t left = static_cast<uint32_t>(lightTree.size());
+        lightTree.emplace_back();
+        lightTree.emplace_back();
+        node.child = static_cast<int32_t>(left);
+        lightTree[nodeIndex] = node;
+        self(self, left, first, middle, trail, depth + 1);
+        self(self, left + 1, middle, last, trail | (1u << depth), depth + 1);
+    };
+    lightTree.emplace_back();
+    build(build, 0, 0, triangles.size(), 0, 0);
 }
 
 void Application::recordLightUpload(VkCommandBuffer commandBuffer) {
@@ -175,6 +256,7 @@ void Application::recordLightUpload(VkCommandBuffer commandBuffer) {
                          sizeof(EmissiveTriangle) * emissiveTriangles.size());
     recordStreamedUpload(commandBuffer, instanceLightBuffer, instanceFirstLight.data(),
                          sizeof(int32_t) * instanceFirstLight.size());
+    recordStreamedUpload(commandBuffer, lightTreeBuffer, lightTree.data(), sizeof(LightTreeNode) * lightTree.size());
     lightsUploadPending = false;
 }
 

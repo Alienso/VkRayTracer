@@ -162,6 +162,14 @@ void Application::buildRenderingUi() {
     ImGui::Combo("Emissive light", &settings.emissiveSampling,
                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
     ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
+    ImGui::Combo("Light picking", &settings.lightPicking, "By power (whole scene)\0Light tree\0");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Which glowing triangle a shadow ray goes to. By power: the brighter and larger, the more\n"
+                          "often, wherever it is. Light tree: also by how near it is and whether the surface faces it,\n"
+                          "so in scenes with many small lights (Bistro at night) the nearby ones get the rays.");
+    }
+    ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", sampledEmissiveTriangles, lightTree.size(),
+                        lightTreeDepth);
     ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
     ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                         "instead of slowly converging sparkles (fireflies)");

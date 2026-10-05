@@ -101,10 +101,26 @@ uniformly, not by texture brightness. Built-in models have no emissive textures.
 - Where: `computeEmissiveTextureAverages` (source/ModelLoader.cpp), `buildLightList` (source/Lights.cpp).
 - Fix: a small minimum weight for every triangle, or importance-sample texels within the triangle.
 
-### Light list is rebuilt on the CPU
-Whenever an instance moves or a material changes, every emissive triangle is transformed on the CPU and
-uploaded. Fine for thousands of triangles, slow for scenes with many glowing meshes.
-- Fix: build it on the GPU, or keep it per mesh and transform in the shader.
+### Light list and light tree are rebuilt on the CPU
+Whenever an instance moves or a material changes, every emissive triangle is transformed on the CPU, the light
+tree is built again over all of them, and both are uploaded. Fine for thousands of triangles (Bistro Exterior
+has 20,600), slow for scenes with many glowing meshes or one moving every frame.
+- Fix: build it on the GPU, or keep it per mesh and transform in the shader; refit the tree's boxes instead of
+  rebuilding it when only positions change.
+
+### The light tree doesn't know what blocks the light
+The tree picks glowing triangles by a guess of how much light they could send to the point: power, distance, and
+whether the surface faces them. A lamp behind a wall looks just as good as one in plain view, so a room next to a
+bright street still sends many shadow rays at the street. Large lamps close to a surface still give some
+speckles, as a random point on them can be very close (that's the area sampling, not the tree). Emitters are
+treated as shining both ways, so there is no "which way does the light face" test in the tree. The median split
+is simple; a split by cost (SAH-like, as in BVHs) would group lights better. Measured at night in Bistro Exterior
+(2048-frame reference, 64 frames): street views 2.3x to 4.4x less noise, and up to 8x per unit of GPU time. Scenes
+with one or a few lights are unchanged (Cornell box), and so is Bistro Interior, lit mostly by its spots. Picking
+"By power" in Rendering brings back the old way, for comparison.
+- Where: `buildLightTree` (source/Lights.cpp), `lightTreeImportance` / `pickFromLightTree` /
+  `lightPickProbability` (shaders/raytrace.comp).
+- Fix: ReSTIR DI (reuse good samples between neighbouring pixels and frames, which takes visibility into account).
 
 ### Sun of size 0
 A sun with angular radius 0 can only be found by shadow rays: mirrors don't show it, and the camera sees a
@@ -113,7 +129,7 @@ disc clamped to a minimum size.
 ### Punctual lights: all of them, or one at random
 Lights from the files (KHR_lights_punctual) get a shadow ray each at every surface, up to 8 lights. With more,
 one is picked at random per surface (uniformly, not by how much it matters there), so scenes with many lamps get
-noisy, like the emissive triangles (see the light tree item in the roadmap). They have no size: sharp shadows,
+noisy. They are not in the light tree that glowing triangles have (a tree over both would fix this). They have no size: sharp shadows,
 and mirrors don't show them (no ray can hit a point). When an object is scaled (or fitted to 2 units), its lights'
 intensity is scaled by the square of that, so the model stays lit the same. A point light touching geometry (a bulb
 inside its lamp) makes those surfaces extremely bright a few centimeters away: speckles everywhere, as paths find

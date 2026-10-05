@@ -64,6 +64,7 @@ layout(binding = 3) uniform SceneUniforms {
     float cacheCellScale;   // cache cell size per unit of distance from the camera
     float cacheMinWeight;   // samples a cache entry needs before paths use it
     uint cacheUpdateTile;   // update pass: one path per cacheUpdateTile x cacheUpdateTile pixels
+    uint lightTree;         // 1 = light sampling picks glowing triangles by walking the light tree (binding 24)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -143,6 +144,7 @@ struct EmissiveTriangle {
     float probability;      // chance that light sampling picks this triangle
     float cdf;              // running sum of the probabilities, for the binary search
     float area;
+    uint treeTrail;         // its way down the light tree: bit d = 1 means "right child" at depth d
 };
 layout(binding = 9, scalar) readonly buffer EmissiveTriangles { EmissiveTriangle emissiveTriangles[]; };
 // Per TLAS instance: where its triangles start in emissiveTriangles, or -1 if it doesn't glow.
@@ -186,6 +188,16 @@ layout(binding = 23, scalar) readonly buffer PunctualLights { PunctualLight punc
 const uint LIGHT_DIRECTIONAL = 0;
 const uint LIGHT_POINT = 1;
 const uint LIGHT_SPOT = 2;
+
+// Must match LightTreeNode in Application.h. A binary tree over the glowing triangles that light sampling can pick,
+// node 0 is the root (see buildLightTree in Lights.cpp and pickFromLightTree below).
+struct LightTreeNode {
+    vec3 boundsMin;
+    float power;            // its triangles' summed probability (share of the scene's light)
+    vec3 boundsMax;
+    int child;              // >= 0: the first of its two children (the second follows); < 0: triangle -child-1
+};
+layout(binding = 24, scalar) readonly buffer LightTree { LightTreeNode lightTreeNodes[]; };
 
 const float PI = 3.14159265359;
 const float SKY_DISTANCE = 1e5;  // shadow rays towards the sun or the sky: anything closer blocks them
@@ -926,9 +938,102 @@ float misWeight(float pdfThis, float pdfOther) {
 // `cosLight` (angle between the triangle's normal and the direction towards the surface point).
 // Per area it is probability / area; a small patch far away or seen edge-on covers a small solid angle,
 // hence distance^2 / cos to convert.
-float lightPdf(int lightIndex, float distance, float cosLight) {
+// pickProbability: the chance that this triangle was picked (lightPickProbability).
+float lightPdf(int lightIndex, float pickProbability, float distance, float cosLight) {
     EmissiveTriangle light = emissiveTriangles[lightIndex];
-    return light.probability / max(light.area, 1e-12) * distance * distance / max(cosLight, 1e-6);
+    return pickProbability / max(light.area, 1e-12) * distance * distance / max(cosLight, 1e-6);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The light tree. Picking by power alone sends most shadow rays of a point under a street lamp to lamps a block
+// away. The tree groups nearby triangles; walking down from the root, each step goes into one of the two children
+// with a chance proportional to a rough guess of how much light it could send to the point (lightTreeImportance).
+// The chance of picking a triangle is the product of the chances along its way down. The guess only steers where
+// the samples go: every triangle that could light the point keeps a chance above 0, so the result stays correct.
+//
+// p, n: the shading point and its (shading) normal. twoSided: light from behind counts too (diffuse transmission).
+// These must be the same when sampling and when computing the pdf of a triangle a bounce ray hit (for MIS).
+
+// Power / distance^2, times the largest cosine any point of the node's bounding sphere could have with the normal.
+// The distance: the distance to the box's center underrates a long box (a string of lamps along the street) for a
+// point near one of its ends, where the light from the nearest lamp is strong: those rare samples come out very
+// bright (fireflies). Instead, distance^2 = (to the box's nearest point) * (to its farthest corner). Inside the box (or very
+// close) the nearest distance is clamped to a twentieth of its radius, the light can't grow without limit there.
+float lightTreeImportance(LightTreeNode node, vec3 p, vec3 n, bool twoSided) {
+    vec3 center = 0.5 * (node.boundsMin + node.boundsMax);
+    float radius2 = 0.25 * dot(node.boundsMax - node.boundsMin, node.boundsMax - node.boundsMin);
+    vec3 toCenter = center - p;
+    float distance2 = dot(toCenter, toCenter);
+    vec3 nearest = clamp(p, node.boundsMin, node.boundsMax);
+    vec3 farthest = mix(node.boundsMax, node.boundsMin, step(center, p));  // per axis, the side away from p
+    float nearestDistance = max(length(nearest - p), 0.05 * sqrt(radius2) + 1e-4);
+    float importance = node.power / (nearestDistance * length(farthest - p));
+    if (twoSided || distance2 <= radius2) {
+        return importance;  // every direction may bring light / the sphere surrounds the point
+    }
+    // The sphere is seen within an angle thetaU of its center's direction (at thetaI from the normal); the
+    // closest direction to the normal is at max(0, thetaI - thetaU). Nothing below the horizon reaches the point.
+    float cosI = dot(n, toCenter) * inversesqrt(distance2);
+    float sinU2 = radius2 / distance2;
+    float cosU = sqrt(1.0 - sinU2);
+    if (cosI >= cosU) {
+        return importance;  // the normal points into the sphere
+    }
+    float sinI = sqrt(max(1.0 - cosI * cosI, 0.0));
+    float cosBound = cosI * cosU + sinI * sqrt(sinU2);  // cos(thetaI - thetaU)
+    return importance * max(cosBound, 0.0);
+}
+
+// Chance of going into the left child of `node` (a node with children), -1 if neither child can light the point
+float lightTreeLeftChance(LightTreeNode node, vec3 p, vec3 n, bool twoSided) {
+    float left = lightTreeImportance(lightTreeNodes[node.child], p, n, twoSided);
+    float right = lightTreeImportance(lightTreeNodes[node.child + 1], p, n, twoSided);
+    return left + right > 0.0 ? left / (left + right) : -1.0;
+}
+
+// Walks down the tree with one random number (rescaled at every step to stay evenly distributed).
+// Returns the triangle, or -1 when nothing can light the point.
+int pickFromLightTree(vec3 p, vec3 n, bool twoSided, inout uint seed, out float probability) {
+    probability = 1.0;
+    float u = randomFloat(seed);
+    LightTreeNode node = lightTreeNodes[0];
+    while (node.child >= 0) {
+        float leftChance = lightTreeLeftChance(node, p, n, twoSided);
+        if (leftChance < 0.0) {
+            return -1;
+        }
+        if (u < leftChance) {
+            u /= leftChance;
+            probability *= leftChance;
+            node = lightTreeNodes[node.child];
+        } else {
+            u = (u - leftChance) / (1.0 - leftChance);
+            probability *= 1.0 - leftChance;
+            node = lightTreeNodes[node.child + 1];
+        }
+        u = min(u, 0.99999994);  // rounding could reach 1
+    }
+    return -node.child - 1;
+}
+
+// The chance that light sampling at p picks this triangle: its share of the light, or the way down the tree
+float lightPickProbability(int lightIndex, vec3 p, vec3 n, bool twoSided) {
+    EmissiveTriangle light = emissiveTriangles[lightIndex];
+    if (scene.lightTree == 0 || light.probability <= 0.0) {
+        return light.probability;  // probability 0: not in the tree, never picked
+    }
+    float probability = 1.0;
+    LightTreeNode node = lightTreeNodes[0];
+    for (uint depth = 0; node.child >= 0; depth++) {
+        float leftChance = lightTreeLeftChance(node, p, n, twoSided);
+        if (leftChance < 0.0) {
+            return 0.0;
+        }
+        bool right = (light.treeTrail & (1u << depth)) != 0u;
+        probability *= right ? 1.0 - leftChance : leftChance;
+        node = lightTreeNodes[node.child + (right ? 1 : 0)];
+    }
+    return -node.child - 1 == lightIndex ? probability : 0.0;
 }
 
 // Light sampling for the sky (see Environment.cpp): the sphere of directions in cells, rows from straight up to
@@ -997,23 +1102,35 @@ vec3 emissionAt(uint materialIndex, vec2 uv) {
 // triangles, already multiplied by the surface's response (BRDF * cos) and its MIS weight. v: local.
 // withBounceSampling: the surface's bounce ray may find the same lights (MIS); false when the path ends here.
 vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint, bool withBounceSampling, inout uint seed) {
-    // 1: pick a triangle: binary search for the first one whose running sum exceeds a random number.
-    //    Triangles with a bigger share of the total light cover a bigger stretch of [0, 1], so get picked more.
-    float pick = randomFloat(seed);
-    uint low = 0, high = scene.emissiveTriangleCount - 1;
-    while (low < high) {
-        uint middle = (low + high) / 2;
-        if (emissiveTriangles[middle].cdf < pick) {
-            low = middle + 1;
-        } else {
-            high = middle;
+    // 1: pick a triangle, with the light tree (by what it could send to this point), or by its share of all light:
+    //    binary search for the first one whose running sum exceeds a random number. Triangles with a bigger share
+    //    cover a bigger stretch of [0, 1], so get picked more.
+    int lightIndex;
+    float pickProbability;
+    if (scene.lightTree != 0) {
+        lightIndex = pickFromLightTree(hit.position, frame.normal, hit.diffuseTransmission > 0.0, seed, pickProbability);
+        if (lightIndex < 0) {
+            return vec3(0.0);  // all glowing triangles are behind the surface
         }
+    } else {
+        float pick = randomFloat(seed);
+        uint low = 0, high = scene.emissiveTriangleCount - 1;
+        while (low < high) {
+            uint middle = (low + high) / 2;
+            if (emissiveTriangles[middle].cdf < pick) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        lightIndex = int(low);
+        pickProbability = emissiveTriangles[low].probability;
     }
-    EmissiveTriangle light = emissiveTriangles[low];
+    EmissiveTriangle light = emissiveTriangles[lightIndex];
     // Triangles with probability 0 (a black part of an emissive texture) have no stretch of [0, 1] of their own,
     // but the search can still land on one when the random number is exactly a boundary (e.g. 0). Dividing by
     // its pdf of 0 would give infinity, which would stick in the pixel's running average forever.
-    if (light.probability <= 0.0) {
+    if (pickProbability <= 0.0) {
         return vec3(0.0);
     }
 
@@ -1054,7 +1171,7 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
         return vec3(0.0);
     }
 
-    float pdfLight = lightPdf(int(low), distance, cosLight);
+    float pdfLight = lightPdf(lightIndex, pickProbability, distance, cosLight);
     // Behind glass, bounce rays don't count this light (see tracePath), so light sampling takes all of it.
     float weight = scene.emissiveSampling == EMISSIVE_MIS && !crossedGlass && withBounceSampling
                    ? misWeight(pdfLight, pdfBounce) : 1.0;
@@ -1322,6 +1439,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
     // reflection: fireflies. So the sky needs to know about solid glass, and the last reflection's pdf.
     bool throughSolidGlass = false;  // went through solid glass since the last reflection
     float reflectionPdf = 0.0;       // bouncePdf of the last reflection (glass passes don't change it)
+    // Where the last reflection was: the light tree's chance of picking a glowing triangle depends on the point
+    vec3 reflectionPosition = vec3(0.0);
+    vec3 reflectionNormal = vec3(0.0, 0.0, 1.0);
+    bool reflectionTwoSided = false;
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
@@ -1383,7 +1504,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
                     weight = 0.0;
                 } else {
                     float cosLight = abs(dot(hit.geometricNormal, direction));
-                    weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, hit.t, cosLight));
+                    float pickProbability = lightPickProbability(hit.lightIndex, reflectionPosition, reflectionNormal,
+                                                                 reflectionTwoSided);
+                    weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, pickProbability, hit.t, cosLight));
                 }
             }
             // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
@@ -1575,6 +1698,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
             throughSolidGlass = false;
             reflectedOnce = true;
             reflectionPdf = bouncePdf;
+            reflectionPosition = hit.position;
+            reflectionNormal = frame.normal;
+            reflectionTwoSided = hit.diffuseTransmission > 0.0;
         }
 
         // Russian roulette: after a few bounces, randomly stop paths that carry little light and

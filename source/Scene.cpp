@@ -332,10 +332,13 @@ void Application::updateScene() {
         buildLightList();  // uploaded in this frame's command buffer
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
         VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();
-        if (trianglesSize > emissiveTriangleBuffer.capacity || offsetsSize > instanceLightBuffer.capacity) {
+        VkDeviceSize treeSize = sizeof(LightTreeNode) * lightTree.size();
+        if (trianglesSize > emissiveTriangleBuffer.capacity || offsetsSize > instanceLightBuffer.capacity ||
+            treeSize > lightTreeBuffer.capacity) {
             vkp.deviceWaitIdle(device);  // the buffers are replaced, no frame may use them
             ensureStreamedCapacity(emissiveTriangleBuffer, trianglesSize);
             ensureStreamedCapacity(instanceLightBuffer, offsetsSize);
+            ensureStreamedCapacity(lightTreeBuffer, treeSize);
             if (rtDescriptorSet != VK_NULL_HANDLE) {
                 updateRayTracingDescriptorSet();
             }

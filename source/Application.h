@@ -63,6 +63,7 @@ struct SceneUniforms {
     float cacheCellScale;            // cell size per unit of distance from the camera
     float cacheMinWeight;            // samples a cell needs before it is used
     uint32_t cacheUpdateTile;        // one update path per cacheUpdateTile x cacheUpdateTile pixels
+    uint32_t lightTree;              // 1 = light sampling picks glowing triangles with the light tree (LightPicking)
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -298,6 +299,22 @@ struct EmissiveTriangle {
     float probability;  // chance of picking this triangle: proportional to area * brightness
     float cdf;          // sum of the probabilities up to and including this one (for picking with a binary search)
     float area;
+    uint32_t treeTrail; // its way down the light tree: bit d = 1 means "right child" at depth d
+};
+
+// How light sampling picks one of the glowing triangles at a surface point
+enum class LightPicking : int {
+    Power = 0,  // by its share of the scene's light (area * brightness), wherever it is
+    Tree = 1    // walking down the light tree: by how much each part of the scene could send to this point
+};
+
+// Must match LightTreeNode in shaders/raytrace.comp (scalar layout). The light tree: a binary tree over the glowing
+// triangles that light sampling can pick (probability > 0), built in Lights.cpp. Node 0 is the root.
+struct LightTreeNode {
+    glm::vec3 boundsMin;  // box around all its triangles
+    float power;          // sum of their probabilities (= their share of the scene's light)
+    glm::vec3 boundsMax;
+    int32_t child;        // >= 0: the first of its two children (the second follows); < 0: a leaf, triangle -child-1
 };
 
 // Must match PunctualLight in shaders/raytrace.comp (scalar layout). One per enabled light of every visible object,
@@ -334,6 +351,7 @@ struct RenderSettings {
 
     int environment = static_cast<int>(Environment::Sky);  // what rays see when they leave the scene
     int emissiveSampling = static_cast<int>(EmissiveSampling::Mis);
+    int lightPicking = static_cast<int>(LightPicking::Tree);
     glm::vec3 skyZenithColor = {0.08f, 0.36f, 0.72f};
     glm::vec3 skyHorizonColor = {1.0f, 1.0f, 1.0f};
     glm::vec3 groundColor = {0.35f, 0.3f, 0.35f};
@@ -475,6 +493,9 @@ private:
     std::vector<int32_t> instanceFirstLight;  // per TLAS instance: index of its first triangle in the list, or -1
     StreamedBuffer emissiveTriangleBuffer;
     StreamedBuffer instanceLightBuffer;
+    std::vector<LightTreeNode> lightTree;
+    uint32_t lightTreeDepth = 0;  // levels below the root, for the UI
+    StreamedBuffer lightTreeBuffer;
     bool lightsUploadPending = false;
     // Punctual lights (Lights.cpp): this frame's, and what the GPU has (uploaded only when they differ)
     std::vector<GpuPunctualLight> framePunctualLights;
@@ -731,6 +752,7 @@ private:
     void createLightBuffers();
     void destroyLightBuffers();
     void buildLightList();
+    void buildLightTree();
     void recordLightUpload(VkCommandBuffer commandBuffer);
     void buildPunctualLightList();
     void recordPunctualLightUpload(VkCommandBuffer commandBuffer);

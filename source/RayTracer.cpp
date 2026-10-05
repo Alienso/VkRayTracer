@@ -400,8 +400,8 @@ void Application::createRayTracingDescriptors() {
     // 6: mesh infos, 7: all textures, 8: materials, 9: emissive triangles, 10: first light per instance,
     // 11: specular albedo table, 12: instance motion, 13-17: motion vectors, diffuse albedo, specular albedo,
     // normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages,
-    // 21: environment map, 22: environment sampling distribution, 23: punctual lights
-    std::vector<VkDescriptorSetLayoutBinding> bindings(24);
+    // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree
+    std::vector<VkDescriptorSetLayoutBinding> bindings(25);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -424,6 +424,7 @@ void Application::createRayTracingDescriptors() {
     bindings[21] = {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[22] = {22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[23] = {23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[24] = {24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -447,7 +448,7 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 14},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -504,12 +505,13 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorImageInfo environmentInfo{environmentSampler, environmentTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorBufferInfo environmentDistributionInfo{environmentDistributionBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo punctualLightInfo{punctualLightBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo lightTreeInfo{lightTreeBuffer.buffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(24);
+    std::vector<VkWriteDescriptorSet> writes(25);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -557,6 +559,8 @@ void Application::updateRayTracingDescriptorSet() {
     writes[22].pBufferInfo = &environmentDistributionInfo;
     writes[23].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[23].pBufferInfo = &punctualLightInfo;
+    writes[24].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[24].pBufferInfo = &lightTreeInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -646,6 +650,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
     uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
+    uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !lightTree.empty() ? 1 : 0;
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
     // DLSS mode: every frame on its own (DLSS does the averaging over time), plus the guides it needs
     uniforms.accumulate = settings.accumulate && !dlssActive() ? 1 : 0;
