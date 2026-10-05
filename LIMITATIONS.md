@@ -82,6 +82,14 @@ A sampled direction that is above the smooth / normal-mapped normal but below th
 path (that light is lost), mostly near silhouettes of normal-mapped surfaces.
 - Where: `tracePath` (`side` check).
 
+### Diffuse transmission is thin only
+`KHR_materials_diffuse_transmission` is a Lambert lobe on the other side of the surface, for thin things (leaves,
+paper, fabric). On a solid (`KHR_materials_volume`) material it still acts at each surface: nothing scatters
+inside the volume (wax, skin, marble would need subsurface scattering). Shadow rays stop at translucent surfaces;
+light gets through them only by scattering at the surface a path hits, which is right for one leaf, and a
+canopy of many leaves is found by the paths themselves (slowly, so it stays noisy).
+- Where: `evaluateBrdf` (l.z < 0), `sampleBrdf`, the sun and `sampleEmissiveLight` (light behind the surface).
+
 ## Lights
 
 ### Emissive texture weighting is an estimate (Phase 6d)
@@ -161,6 +169,23 @@ alias; accumulation averages it out, single frames shimmer.
 - Phase 7: the DLSS albedo guides alias the same way (visible in the "DLSS input: reprojection error" view
   as noise on textured surfaces whenever the sample position moves by a fraction of a pixel).
 
+### DDS textures: first mip level, no CPU copy
+DDS files (`MSFT_texture_dds`) in BC1/BC2/BC3/BC5/BC7 go to the GPU still compressed, first mip level only
+(the others are dropped, see "No mipmaps"). BC5 normal maps have X and Y only; the shader rebuilds Z.
+Compressed emissive textures are not decoded on the CPU, so light sampling weights their triangles by the
+emissive constant alone (noisier when only small parts glow); the Bistro converter writes PNG emissives for this reason.
+- Where: `readDds` (source/ModelLoader.cpp), `toVulkan` (source/Materials.cpp), `normalTwoChannel` (shader).
+- Fix: a small CPU BC1/BC3 decoder for the emissive averages.
+
+### Bistro conversion is approximate
+`tools/bistro/convert_bistro.py` turns the FBX + DDS release into glTF. Falcor sets parts of the materials in its
+own scene files, so the converter guesses: every material named "glass" becomes clear glass, roughness 0 except
+frosted (the files' dark base colors are made for raster blending and would turn glass black). Normal maps are
+mostly DirectX (Y down); each one is tested (a real normal map has no curl) and flipped only if it isn't Y up
+already. Leaves and flowers get diffuse transmission 0.5, curtains and awnings 0.3, tinted by their base color
+(by name, a guess like the glass). The FBX point lights and directional light are dropped; emissive strength is 1 unless given.
+In the Wine scene, liquids touch or sit inside their glasses (Falcor uses nested priorities), see "Volumes assume closed meshes".
+
 ### Unsupported glTF features
 - Second UV set (`TEXCOORD_1`): the first set is used instead (a warning is printed).
 - KTX2 / WebP images: the texture is skipped, the constant is used.
@@ -169,8 +194,8 @@ alias; accumulation averages it out, single frames shimmer.
 - Other material extensions (clearcoat, sheen, specular, iridescence, anisotropy, ...) are ignored.
 - Where: source/ModelLoader.cpp.
 
-### No OBJ loader
-Only glTF / GLB is loaded.
+### No OBJ or FBX loader
+Only glTF / GLB is loaded; FBX scenes go through Blender first (see "Bistro conversion is approximate").
 
 ## Display
 

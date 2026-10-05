@@ -142,7 +142,8 @@ int Application::findOrLoadModel(const std::string& fileName) {
     }
     for (Material& material : model.materials) {
         for (int* texture : {&material.baseColorTexture, &material.metallicRoughnessTexture,
-                             &material.transmissionTexture, &material.emissiveTexture, &material.normalTexture}) {
+                             &material.transmissionTexture, &material.emissiveTexture, &material.normalTexture,
+                             &material.diffuseTransmissionTexture, &material.diffuseTransmissionColorTexture}) {
             if (*texture >= 0) {
                 *texture += firstTexture;
             }
@@ -545,6 +546,17 @@ void Application::buildMaterialUi(const SceneModel& model) {
             changed |= ImGui::SliderFloat("Transmission", &m.transmission, 0.0f, 1.0f);
             textureToggle("texture##transmission", m.transmissionTexture, sceneMaterial.useTransmissionTexture);
             changed |= ImGui::SliderFloat("IOR", &m.ior, 1.0f, 3.0f);
+            changed |= ImGui::SliderFloat("Diffuse transmission", &m.diffuseTransmission, 0.0f, 1.0f);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Thin surfaces that let light through and scatter it (leaves, paper, fabric):\n"
+                                  "this share of the matte light leaves on the other side.");
+            }
+            textureToggle("texture##diffuseTransmission", m.diffuseTransmissionTexture, sceneMaterial.useDiffuseTransmissionTexture);
+            if (m.diffuseTransmission > 0.0f) {
+                changed |= ImGui::ColorEdit3("Transmitted color", &m.diffuseTransmissionColor.x, ImGuiColorEditFlags_Float);
+                textureToggle("texture##diffuseTransmissionColor", m.diffuseTransmissionColorTexture,
+                              sceneMaterial.useDiffuseTransmissionColorTexture);
+            }
             changed |= ImGui::ColorEdit3("Emissive", &m.emissiveColor.x, ImGuiColorEditFlags_Float);
             textureToggle("texture##emissive", m.emissiveTexture, sceneMaterial.useEmissiveTexture);
             changed |= ImGui::DragFloat("Emissive strength", &m.emissiveStrength, 0.05f, 0.0f, 1000.0f);

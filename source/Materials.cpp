@@ -47,6 +47,19 @@ VkSampler Application::getSampler(const TextureData& texture) {
     return sampler;
 }
 
+// sRGB variants: the GPU converts to linear when sampling, so the shader always works with linear values.
+// BC5 (two-channel normal maps) has no sRGB variant, and doesn't need one.
+static VkFormat toVulkan(const TextureData& texture) {
+    switch (texture.format) {
+        case TextureFormat::BC1: return texture.srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case TextureFormat::BC2: return texture.srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
+        case TextureFormat::BC3: return texture.srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        case TextureFormat::BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+        case TextureFormat::BC7: return texture.srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        default: return texture.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
 // Uploads the textures loaded since the last call. Textures are never removed, so earlier indices stay valid.
 void Application::uploadNewTextures() {
     if (sceneTextures.size() > maxTextures) {
@@ -57,8 +70,7 @@ void Application::uploadNewTextures() {
         TextureData& texture = sceneTextures[i];
         GpuTexture gpu;
 
-        // sRGB format: the GPU converts to linear when sampling, so the shader always works with linear values.
-        VkFormat format = texture.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        VkFormat format = toVulkan(texture);
         createImage(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     gpu.image, gpu.memory, gpu.view);
         gpu.sampler = getSampler(texture);
@@ -144,11 +156,20 @@ std::vector<GpuMaterial> Application::packMaterials() const {
         gpu.emissiveTexture = sceneMaterial.useEmissiveTexture ? m.emissiveTexture : -1;
         gpu.normalTexture = sceneMaterial.useNormalTexture ? m.normalTexture : -1;
         gpu.normalScale = m.normalScale;
+        gpu.normalTwoChannel = gpu.normalTexture >= 0 &&
+                               sceneTextures[gpu.normalTexture].format == TextureFormat::BC5 ? 1 : 0;
         gpu.baseColorUvTransform = m.baseColorUvTransform;
         gpu.metallicRoughnessUvTransform = m.metallicRoughnessUvTransform;
         gpu.transmissionUvTransform = m.transmissionUvTransform;
         gpu.emissiveUvTransform = m.emissiveUvTransform;
         gpu.normalUvTransform = m.normalUvTransform;
+        gpu.diffuseTransmission = m.diffuseTransmission;
+        gpu.diffuseTransmissionColor = m.diffuseTransmissionColor;
+        gpu.diffuseTransmissionTexture = sceneMaterial.useDiffuseTransmissionTexture ? m.diffuseTransmissionTexture : -1;
+        gpu.diffuseTransmissionColorTexture =
+                sceneMaterial.useDiffuseTransmissionColorTexture ? m.diffuseTransmissionColorTexture : -1;
+        gpu.diffuseTransmissionUvTransform = m.diffuseTransmissionUvTransform;
+        gpu.diffuseTransmissionColorUvTransform = m.diffuseTransmissionColorUvTransform;
         gpu.solid = m.solid ? 1 : 0;
         // Beer's law: after distance d, exp(-absorption * d) of the light is left. glTF gives the color left
         // after attenuationDistance, so absorption = -ln(color) / distance per channel.

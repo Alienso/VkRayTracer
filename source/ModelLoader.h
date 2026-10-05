@@ -21,11 +21,16 @@ struct SceneVertex {
 
 enum class TextureWrap : int { Repeat = 0, ClampToEdge = 1, MirroredRepeat = 2 };
 
-// Decoded image, always 8-bit RGBA.
+// How TextureData::pixels is stored. Block-compressed formats (from .dds files) stay compressed on the GPU too:
+// 4x4 texels per block of 8 (BC1) or 16 bytes. BC5 has two channels only (normal maps: X and Y, Z is rebuilt).
+enum class TextureFormat : int { RGBA8 = 0, BC1, BC2, BC3, BC5, BC7 };
+
+// An image as it goes to the GPU: 8-bit RGBA, or the blocks of a compressed format (first mip level only).
 struct TextureData {
     std::string name;
     uint32_t width = 0;
     uint32_t height = 0;
+    TextureFormat format = TextureFormat::RGBA8;
     std::vector<uint8_t> pixels;
     bool srgb = false;     // colors (base color, emissive) are stored sRGB-encoded; data (roughness, ...) is linear
     bool nearest = false;  // magnification filter: nearest instead of linear
@@ -50,6 +55,10 @@ struct Material {
     bool solid = false;
     glm::vec3 attenuationColor = glm::vec3(1.0f);  // color white light takes on after attenuationDistance inside
     float attenuationDistance = 0.0f;              // in the model's own units; 0 = no absorption (infinite)
+    // KHR_materials_diffuse_transmission: thin surfaces that let light through and scatter it (leaves, paper,
+    // fabric). This share of the diffuse layer leaves on the other side instead, tinted by its own color.
+    float diffuseTransmission = 0.0f;
+    glm::vec3 diffuseTransmissionColor = glm::vec3(1.0f);
     glm::vec3 emissiveColor = glm::vec3(0.0f);
     float emissiveStrength = 1.0f;  // KHR_materials_emissive_strength: lets emission go above 1
     AlphaMode alphaMode = AlphaMode::Opaque;
@@ -59,7 +68,9 @@ struct Material {
     int metallicRoughnessTexture = -1;  // G: roughness, B: metallic (R is often ambient occlusion, which we ignore)
     int transmissionTexture = -1;       // R: transmission
     int emissiveTexture = -1;           // RGB: emitted color
-    int normalTexture = -1;             // RGB: surface direction in tangent space, see the shader
+    int diffuseTransmissionTexture = -1;       // A: diffuse transmission
+    int diffuseTransmissionColorTexture = -1;  // RGB: color of the light that goes through
+    int normalTexture = -1;             // RGB (or RG, see TextureFormat::BC5): surface direction in tangent space, see the shader
     float normalScale = 1.0f;           // strength of the normal map's bumps
 
     // KHR_texture_transform: where each texture is read, texture UV = transform * (mesh UV, 1). Lets a file tile,
@@ -69,6 +80,8 @@ struct Material {
     glm::mat3x2 transmissionUvTransform = glm::mat3x2(1.0f);
     glm::mat3x2 emissiveUvTransform = glm::mat3x2(1.0f);
     glm::mat3x2 normalUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 diffuseTransmissionUvTransform = glm::mat3x2(1.0f);
+    glm::mat3x2 diffuseTransmissionColorUvTransform = glm::mat3x2(1.0f);
 };
 
 // One glTF "primitive": a list of triangles that share one material.

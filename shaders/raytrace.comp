@@ -100,6 +100,7 @@ struct Material {
     int emissiveTexture;
     int normalTexture;             // RGB: direction in tangent space (X along U, Y along "up" in the image, Z out)
     float normalScale;
+    uint normalTwoChannel;         // 1 = the texture has X and Y only (BC5 from .dds), Z = sqrt(1 - X^2 - Y^2)
     uint solid;                    // transmissive: 1 = closed volume that refracts, 0 = thin (light passes straight)
     vec3 absorption;               // inside a solid: light left after distance d is exp(-absorption * d)
     // KHR_texture_transform: each texture is read at transform * (mesh UV, 1); identity when the file has none
@@ -108,6 +109,12 @@ struct Material {
     mat3x2 transmissionUvTransform;
     mat3x2 emissiveUvTransform;
     mat3x2 normalUvTransform;
+    float diffuseTransmission;           // share of the diffuse layer that leaves on the other side (leaves, paper)
+    vec3 diffuseTransmissionColor;       // its tint (not multiplied by the base color)
+    int diffuseTransmissionTexture;      // A: diffuse transmission
+    int diffuseTransmissionColorTexture; // RGB: tint
+    mat3x2 diffuseTransmissionUvTransform;
+    mat3x2 diffuseTransmissionColorUvTransform;
 };
 layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
 
@@ -211,6 +218,8 @@ struct Hit {
     float ior;
     bool solid;
     vec3 absorption;
+    float diffuseTransmission;
+    vec3 diffuseTransmissionColor;
     vec3 emissive;
 };
 
@@ -245,6 +254,16 @@ void evaluateMaterial(inout Hit hit) {
     hit.ior = material.ior;
     hit.solid = material.solid != 0;
     hit.absorption = material.absorption;
+
+    hit.diffuseTransmission = material.diffuseTransmission;
+    if (material.diffuseTransmissionTexture >= 0) {
+        hit.diffuseTransmission *= sampleTexture(material.diffuseTransmissionTexture, material.diffuseTransmissionUvTransform, hit.uv).a;
+    }
+    hit.diffuseTransmissionColor = material.diffuseTransmissionColor;
+    if (hit.diffuseTransmission > 0.0 && material.diffuseTransmissionColorTexture >= 0) {
+        hit.diffuseTransmissionColor *= sampleTexture(material.diffuseTransmissionColorTexture,
+                                                      material.diffuseTransmissionColorUvTransform, hit.uv).rgb;
+    }
 
     hit.emissive = material.emissive;
     if (material.emissiveTexture >= 0) {
@@ -370,6 +389,9 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
                 float sign = (tangent.w < 0.0 ? -1.0 : 1.0) * (determinant(objectToWorld) < 0.0 ? -1.0 : 1.0);
                 vec3 b = cross(hit.normal, t) * sign;
                 vec3 mapped = sampleTexture(material.normalTexture, material.normalUvTransform, hit.uv).rgb * 2.0 - 1.0;  // [0,1] -> [-1,1]
+                if (material.normalTwoChannel != 0) {
+                    mapped.z = sqrt(max(1.0 - dot(mapped.xy, mapped.xy), 0.0));
+                }
                 mapped.xy *= material.normalScale;
                 // A rotated (or mirrored) texture turns its bumps with it: the map's X/Y follow the texture's axes,
                 // the tangent frame follows the mesh UVs. X/Y are a slope (the normal leans away from where the
@@ -538,6 +560,8 @@ ReflectionEnergy reflectionEnergy(Hit hit, float cosV) {
 // Transmission (glass): what passes the reflection layer of a non-metal either scatters inside (diffuse) or
 // goes through (transmission), in the ratio given by the transmission value. Light that goes through is
 // tinted by the base color.
+// Diffuse transmission (leaves, paper): of the diffuse layer, this share comes out on the other side (scattered
+// evenly, tinted by its own color) instead of back on the side the light came from.
 //
 // Sampling picks one layer at random, each with its share of the light it returns. The specular one gets a
 // minimum so that a highlight on a dark plastic still gets enough samples.
@@ -545,27 +569,32 @@ struct LobeProbabilities {
     float diffuse;
     float specular;
     float transmission;
+    float diffuseTransmission;
 };
 
 LobeProbabilities lobeProbabilities(Hit hit, ReflectionEnergy energy) {
     float specular = mix(energy.dielectricAlbedo, luminance(energy.metalAlbedo), hit.metallic);
-    float base = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * luminance(hit.albedo);
-    float diffuse = base * (1.0 - hit.transmission);
-    float transmission = base * hit.transmission;
+    float base = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo);
+    float transmission = base * hit.transmission * luminance(hit.albedo);
+    float diffuse = base * (1.0 - hit.transmission) * (1.0 - hit.diffuseTransmission) * luminance(hit.albedo);
+    float diffuseTransmission = base * (1.0 - hit.transmission) * hit.diffuseTransmission
+                                * luminance(hit.diffuseTransmissionColor);
 
     LobeProbabilities p;
-    float total = specular + diffuse + transmission;
+    float total = specular + diffuse + transmission + diffuseTransmission;
     if (total <= 0.0) {
-        p.diffuse = p.specular = p.transmission = 0.0;
+        p.diffuse = p.specular = p.transmission = p.diffuseTransmission = 0.0;
         return p;
     }
     p.specular = specular / total;
-    float rest = diffuse + transmission;
+    float rest = diffuse + transmission + diffuseTransmission;
     if (specular > 0.0 && rest > 0.0) {
         p.specular = max(p.specular, 0.1);
     }
-    p.diffuse = rest > 0.0 ? (1.0 - p.specular) * diffuse / rest : 0.0;
-    p.transmission = rest > 0.0 ? (1.0 - p.specular) * transmission / rest : 0.0;
+    float share = rest > 0.0 ? (1.0 - p.specular) / rest : 0.0;
+    p.diffuse = diffuse * share;
+    p.transmission = transmission * share;
+    p.diffuseTransmission = diffuseTransmission * share;
     return p;
 }
 
@@ -584,9 +613,19 @@ float fresnelDielectric(float cosIncident, float eta) {
 }
 
 // Reflected light towards v per unit of light arriving from l (the BRDF value), and the pdf with which
-// sampleBrdf would pick l. Both vectors local, l.z > 0 and v.z > 0. Covers the reflecting layers only:
-// light arriving through transmission is never evaluated this way (see shadowTransmittance and tracePath).
+// sampleBrdf would pick l. Both vectors local, v.z > 0. Covers the reflecting layers (l.z > 0) and diffuse
+// transmission (l.z < 0, light arriving from the other side of a thin surface). Light arriving through glass
+// (specular transmission) is never evaluated this way (see shadowTransmittance and tracePath).
 vec3 evaluateBrdf(Hit hit, vec3 v, vec3 l, out float pdf) {
+    if (l.z < 0.0) {
+        // Diffuse transmission: Lambert on the other side. Only its own lobe produces such directions with a
+        // pdf (specular transmission has none, see sampleBrdf).
+        ReflectionEnergy energy = reflectionEnergy(hit, v.z);
+        LobeProbabilities p = lobeProbabilities(hit, energy);
+        pdf = p.diffuseTransmission * -l.z / PI;
+        return (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * (1.0 - hit.transmission)
+               * hit.diffuseTransmission * hit.diffuseTransmissionColor / PI;
+    }
     float alpha = ggxAlpha(hit.roughness);
     vec3 h = normalize(v + l);
     float cosVH = dot(v, h);
@@ -601,14 +640,15 @@ vec3 evaluateBrdf(Hit hit, vec3 v, vec3 l, out float pdf) {
     // Dielectric: diffuse below, getting exactly the light the reflection doesn't return. (The glTF reference
     // takes away 1 - F(v.h) instead, which varies with the light direction: at grazing view angles diffuse +
     // reflection then add up to more than 100%, visible as bright rims in the white furnace.)
-    vec3 dielectric = (1.0 - energy.dielectricAlbedo) * (1.0 - hit.transmission) * hit.albedo / PI
+    vec3 dielectric = (1.0 - energy.dielectricAlbedo) * (1.0 - hit.transmission) * (1.0 - hit.diffuseTransmission)
+                      * hit.albedo / PI
                       + fresnelDielectric * specular * energy.dielectricCompensation;
     vec3 metal = fresnelMetal * specular * energy.metalCompensation;
     vec3 brdf = mix(dielectric, metal, hit.metallic);
 
     // Diffuse: cosine-weighted. Specular: the VNDF pdf of h, converted to a pdf of l (the reflection doubles
     // angles, hence the 1 / (4 cos_vh)); simplifies to G1(v) * D / (4 cos_v). Transmission only produces
-    // directions on the other side, so it adds nothing here.
+    // directions on the other side, so it adds nothing here (nor does diffuse transmission).
     LobeProbabilities p = lobeProbabilities(hit, energy);
     float pdfDiffuse = l.z / PI;
     float pdfSpecular = smithG1(v.z, alpha) * d / (4.0 * v.z);
@@ -632,8 +672,9 @@ vec3 sampleGgxVisibleNormal(vec3 v, float alpha, vec2 u) {
 // Picks the direction the path continues in. Returns false if the sample is unusable (points into the
 // surface); otherwise l, its pdf, and weight = BRDF * cos / pdf, the factor the path's throughput changes by.
 // lobeRoughness: how spread out the picked layer is (the diffuse layer counts as fully rough).
-// transmitted: the path went through the surface (l.z < 0). Then pdf is meaningless (not used for MIS) and
+// transmitted: the path went through glass (l.z < 0). Then pdf is meaningless (not used for MIS) and
 // weight is simply the transmitted share of the light: the direction follows the visible microfacets.
+// Diffuse transmission also gives l.z < 0, but is an ordinary scattering (transmitted = false, with a pdf).
 // specularLobe: a reflection or transmission was picked, not the diffuse layer (for the DLSS hit distance).
 bool sampleBrdf(Hit hit, vec3 v, inout uint seed, out vec3 l, out vec3 weight, out float pdf,
                 out float lobeRoughness, out bool transmitted, out bool specularLobe) {
@@ -643,6 +684,23 @@ bool sampleBrdf(Hit hit, vec3 v, inout uint seed, out vec3 l, out vec3 weight, o
     LobeProbabilities p = lobeProbabilities(hit, energy);
     transmitted = false;
     specularLobe = u0 < p.transmission + p.specular;
+
+    if (u0 >= 1.0 - p.diffuseTransmission) {
+        // Out the other side, cosine-weighted around the reversed normal
+        lobeRoughness = 1.0;
+        float r = sqrt(u.x);
+        float phi = 2.0 * PI * u.y;
+        l = vec3(r * cos(phi), r * sin(phi), -sqrt(max(1.0 - u.x, 0.0)));
+        if (l.z >= -1e-6) {
+            return false;
+        }
+        vec3 btdf = evaluateBrdf(hit, v, l, pdf);
+        if (pdf <= 0.0) {
+            return false;
+        }
+        weight = btdf * -l.z / pdf;
+        return true;
+    }
 
     if (u0 < p.transmission) {
         // Through the surface. A rough surface spreads the direction like it spreads reflections.
@@ -870,8 +928,15 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
     vec3 l = toLocal(frame, direction);
     vec3 lightNormal = normalize(cross(light.p1 - light.p0, light.p2 - light.p0));
     float cosLight = abs(dot(lightNormal, direction));  // glowing triangles shine from both sides, like everything we hit
-    if (l.z <= 0.0 || cosLight <= 1e-6 || dot(hit.geometricNormal, direction) <= 0.0) {
+    // A light behind the surface only reaches it through diffuse transmission; the shading normal and the real
+    // triangle must agree on the side.
+    bool behind = l.z < 0.0;
+    float side = dot(hit.geometricNormal, direction);
+    if (cosLight <= 1e-6 || (behind ? hit.diffuseTransmission <= 0.0 || side >= 0.0 : l.z == 0.0 || side <= 0.0)) {
         return vec3(0.0);  // the light is behind the surface, or seen exactly edge-on
+    }
+    if (behind) {
+        surfacePoint = hit.position - hit.geometricNormal * 0.001;  // the shadow ray starts on the far side
     }
 
     vec3 emission = emissionAt(light.materialIndex, lightUv);
@@ -892,7 +957,7 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
     float weight = scene.emissiveSampling == EMISSIVE_MIS && !crossedGlass && withBounceSampling
                    ? misWeight(pdfLight, pdfBounce) : 1.0;
     // Monte Carlo: (what arrives * how the surface reflects it) / how likely we were to pick this sample
-    return emission * transmittance * brdf * l.z / pdfLight * weight;
+    return emission * transmittance * brdf * abs(l.z) / pdfLight * weight;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1196,7 +1261,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
             // (it stays sharp, like a reflection).
             ReflectionEnergy energy = reflectionEnergy(hit, v.z);
             vec3 base = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * hit.albedo;
-            guides.diffuseAlbedo = base * (1.0 - hit.transmission);
+            guides.diffuseAlbedo = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * (1.0 - hit.transmission)
+                                   * mix(hit.albedo, hit.diffuseTransmissionColor, hit.diffuseTransmission);
             guides.specularAlbedo = mix(vec3(energy.dielectricAlbedo), energy.metalAlbedo, hit.metallic)
                                     + base * hit.transmission;
             guides.normalRoughness = vec4(hit.normal, hit.roughness);
@@ -1222,17 +1288,20 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
             if (sunOn) {
                 vec3 towardsSun = randomDirectionInCone(sunDirection, sunCosRadius, seed);
                 vec3 sunL = toLocal(frame, towardsSun);
-                bool sunAboveTriangle = dot(hit.geometricNormal, towardsSun) > 0.0;
-                if (sunL.z > 0.0 && sunAboveTriangle) {
+                float sunSide = dot(hit.geometricNormal, towardsSun);
+                // In front of the surface, or behind a thin one that lets light through (diffuse transmission)
+                bool sunBehind = sunL.z < 0.0 && sunSide < 0.0 && hit.diffuseTransmission > 0.0;
+                if ((sunL.z > 0.0 && sunSide > 0.0) || sunBehind) {
                     float pdfBounce;
                     vec3 brdf = evaluateBrdf(hit, v, sunL, pdfBounce);
                     if (any(greaterThan(brdf, vec3(0.0)))) {
                         bool crossedGlass = false;
                         vec3 transmittance = scene.shadowsEnabled != 0
-                                ? shadowTransmittance(surfacePoint, towardsSun, 1000.0, seed, crossedGlass) : vec3(1.0);
+                                ? shadowTransmittance(sunBehind ? hit.position - hit.geometricNormal * 0.001 : surfacePoint,
+                                                      towardsSun, 1000.0, seed, crossedGlass) : vec3(1.0);
                         // Ending in the cache, no bounce ray will look for the sun: the shadow ray counts fully
                         float sunWeight = sunMis && !crossedGlass && !endInCache ? misWeight(sunPdf, pdfBounce) : 1.0;
-                        ADD_LIGHT_EXCEPT(throughput * transmittance * brdf * PI * scene.sunColor.rgb * sunL.z * sunWeight,
+                        ADD_LIGHT_EXCEPT(throughput * transmittance * brdf * PI * scene.sunColor.rgb * abs(sunL.z) * sunWeight,
                                          currentVertex);
                     }
                 }
@@ -1280,8 +1349,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
 
         // Russian roulette: after a few bounces, randomly stop paths that carry little light and
         // boost the survivors by the same factor, so on average the result stays the same.
+        // A throughput above 1 (sample weights can exceed 1) always survives: dividing by a chance above 1 would
+        // take light away.
         if (bounce >= 2) {
-            float survive = max(throughput.r, max(throughput.g, throughput.b));
+            float survive = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
             if (randomFloat(seed) >= survive) {
                 break;
             }

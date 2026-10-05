@@ -49,39 +49,134 @@ static TextureWrap toWrap(cgltf_wrap_mode mode) {
     }
 }
 
+// DDS (DirectDraw Surface): a 128-byte header, for newer formats a 20-byte "DX10" header after it, then the
+// mip levels one after the other. We keep the first level's blocks as they are. Returns false if the file
+// isn't a DDS in one of the formats we can sample.
+static bool readDds(const uint8_t* data, size_t size, TextureData& texture, std::string& error) {
+    auto read32 = [&](size_t offset) {
+        uint32_t value;
+        std::memcpy(&value, data + offset, 4);
+        return value;
+    };
+    if (size < 128 || std::memcmp(data, "DDS ", 4) != 0) {
+        error = "not a DDS file";
+        return false;
+    }
+    texture.height = read32(12);
+    texture.width = read32(16);
+    size_t offset = 128;
+    char fourCC[5] = {};
+    std::memcpy(fourCC, data + 84, 4);
+    std::string format = fourCC;
+    if (format == "DX10") {
+        if (size < 148) {
+            error = "truncated DDS header";
+            return false;
+        }
+        switch (read32(128)) {  // DXGI_FORMAT, typeless / UNORM / UNORM_SRGB
+            case 70: case 71: case 72: format = "DXT1"; break;
+            case 73: case 74: case 75: format = "DXT3"; break;
+            case 76: case 77: case 78: format = "DXT5"; break;
+            case 82: case 83: format = "ATI2"; break;
+            case 97: case 98: case 99: format = "BC7"; break;
+            default: format = "DXGI " + std::to_string(read32(128));
+        }
+        offset = 148;
+    }
+    uint32_t blockBytes = 16;
+    if (format == "DXT1") {
+        texture.format = TextureFormat::BC1;
+        blockBytes = 8;
+    } else if (format == "DXT2" || format == "DXT3") {
+        texture.format = TextureFormat::BC2;
+    } else if (format == "DXT4" || format == "DXT5") {
+        texture.format = TextureFormat::BC3;
+    } else if (format == "ATI2" || format == "BC5U") {
+        texture.format = TextureFormat::BC5;
+    } else if (format == "BC7") {
+        texture.format = TextureFormat::BC7;
+    } else {
+        error = "DDS format " + format + " not supported";
+        return false;
+    }
+    size_t levelSize = static_cast<size_t>((texture.width + 3) / 4) * ((texture.height + 3) / 4) * blockBytes;
+    if (texture.width == 0 || texture.height == 0 || offset + levelSize > size) {
+        error = "truncated DDS file";
+        return false;
+    }
+    texture.pixels.assign(data + offset, data + offset + levelSize);
+    return true;
+}
+
+static std::vector<uint8_t> readFile(const std::string& path) {
+    FILE* file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        return {};
+    }
+    std::fseek(file, 0, SEEK_END);
+    long size = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    std::vector<uint8_t> bytes(size > 0 ? static_cast<size_t>(size) : 0);
+    size_t read = bytes.empty() ? 0 : std::fread(bytes.data(), 1, bytes.size(), file);
+    std::fclose(file);
+    bytes.resize(read);
+    return bytes;
+}
+
 // Images live either inside the file (.glb, or a base64 "data:" URI) or in a file next to the .gltf.
+// PNG / JPEG / ... are decoded with stb_image; DDS (MSFT_texture_dds) stays block-compressed.
 static TextureData decodeImage(const cgltf_image* image, const std::string& directory) {
     TextureData texture;
     texture.name = image->name ? image->name : (image->uri && std::strncmp(image->uri, "data:", 5) != 0 ? image->uri : "image");
 
-    int width = 0, height = 0, channels = 0;
-    stbi_uc* pixels = nullptr;
+    std::vector<uint8_t> fileBytes;
+    const uint8_t* bytes = nullptr;
+    size_t size = 0;
+    void* base64Data = nullptr;
     if (image->buffer_view) {
-        const uint8_t* data = cgltf_buffer_view_data(image->buffer_view);
-        pixels = stbi_load_from_memory(data, static_cast<int>(image->buffer_view->size), &width, &height, &channels, STBI_rgb_alpha);
+        bytes = cgltf_buffer_view_data(image->buffer_view);
+        size = image->buffer_view->size;
     } else if (image->uri && std::strncmp(image->uri, "data:", 5) == 0) {
         const char* base64 = std::strstr(image->uri, "base64,");
         if (base64) {
             base64 += 7;
             size_t length = std::strlen(base64);
             size_t padding = (length > 0 && base64[length - 1] == '=') + (length > 1 && base64[length - 2] == '=');
-            size_t size = length / 4 * 3 - padding;
+            size_t decodedSize = length / 4 * 3 - padding;
             cgltf_options options{};
-            void* data = nullptr;
-            if (cgltf_load_buffer_base64(&options, size, base64, &data) == cgltf_result_success) {
-                pixels = stbi_load_from_memory(static_cast<stbi_uc*>(data), static_cast<int>(size), &width, &height, &channels, STBI_rgb_alpha);
-                free(data);  // cgltf allocates with malloc by default
+            if (cgltf_load_buffer_base64(&options, decodedSize, base64, &base64Data) == cgltf_result_success) {
+                bytes = static_cast<const uint8_t*>(base64Data);
+                size = decodedSize;
             }
         }
     } else if (image->uri) {
         std::string uri = image->uri;
         uri.resize(cgltf_decode_uri(&uri[0]));  // "%20" -> " ", ...
-        pixels = stbi_load((directory + uri).c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        fileBytes = readFile(directory + uri);
+        bytes = fileBytes.data();
+        size = fileBytes.size();
     }
+
+    int width = 0, height = 0, channels = 0;
+    stbi_uc* pixels = nullptr;
+    if (size >= 4 && std::memcmp(bytes, "DDS ", 4) == 0) {
+        std::string error;
+        bool ok = readDds(bytes, size, texture, error);
+        free(base64Data);  // cgltf allocates with malloc by default
+        if (!ok) {
+            throw std::runtime_error("failed to load image '" + texture.name + "': " + error);
+        }
+        return texture;
+    }
+    if (size > 0) {
+        pixels = stbi_load_from_memory(bytes, static_cast<int>(size), &width, &height, &channels, STBI_rgb_alpha);
+    }
+    free(base64Data);
 
     if (!pixels) {
         throw std::runtime_error("failed to decode image '" + texture.name + "': " +
-                                 (stbi_failure_reason() ? stbi_failure_reason() : "unknown format"));
+                                 (size == 0 ? "file missing or empty"
+                                            : stbi_failure_reason() ? stbi_failure_reason() : "unknown format"));
     }
     texture.width = static_cast<uint32_t>(width);
     texture.height = static_cast<uint32_t>(height);
@@ -114,7 +209,12 @@ public:
         if (!view.texture) {
             return -1;
         }
-        if (!view.texture->image) {
+        // MSFT_texture_dds: the DDS version of the image is preferred (its "source" may be the only one)
+        const cgltf_image* image = ddsImage(*view.texture);
+        if (!image) {
+            image = view.texture->image;
+        }
+        if (!image) {
             std::cerr << model.name << ": " << materialName << " " << slot
                       << ": image format not supported (KTX2/WebP?), using the constant only" << std::endl;
             return -1;
@@ -133,7 +233,7 @@ public:
             return it->second;
         }
 
-        TextureData texture = decodeImage(view.texture->image, directory);
+        TextureData texture = decodeImage(image, directory);
         texture.srgb = srgb;
         if (const cgltf_sampler* sampler = view.texture->sampler) {
             texture.nearest = sampler->mag_filter == cgltf_filter_type_nearest;
@@ -147,6 +247,25 @@ public:
     }
 
 private:
+    // cgltf keeps extensions it doesn't know as JSON text, e.g. {"source":3}
+    const cgltf_image* ddsImage(const cgltf_texture& texture) const {
+        for (cgltf_size i = 0; i < texture.extensions_count; i++) {
+            const cgltf_extension& extension = texture.extensions[i];
+            if (!extension.name || !extension.data || std::strcmp(extension.name, "MSFT_texture_dds") != 0) {
+                continue;
+            }
+            const char* source = std::strstr(extension.data, "\"source\"");
+            const char* colon = source ? std::strchr(source, ':') : nullptr;
+            if (colon) {
+                long index = std::strtol(colon + 1, nullptr, 10);
+                if (index >= 0 && static_cast<cgltf_size>(index) < data->images_count) {
+                    return &data->images[index];
+                }
+            }
+        }
+        return nullptr;
+    }
+
     const cgltf_data* data;
     std::string directory;
     Model& model;
@@ -191,6 +310,16 @@ static Material loadMaterial(const cgltf_material& gltfMaterial, TextureLoader& 
         material.attenuationColor = glm::make_vec3(gltfMaterial.volume.attenuation_color);
         float distance = gltfMaterial.volume.attenuation_distance;  // cgltf: FLT_MAX when not given
         material.attenuationDistance = distance < 1e30f ? distance : 0.0f;
+    }
+
+    if (gltfMaterial.has_diffuse_transmission) {
+        const cgltf_diffuse_transmission& dt = gltfMaterial.diffuse_transmission;
+        material.diffuseTransmission = dt.diffuse_transmission_factor;
+        material.diffuseTransmissionColor = glm::make_vec3(dt.diffuse_transmission_color_factor);
+        material.diffuseTransmissionTexture = textures.load(dt.diffuse_transmission_texture, false, "diffuse transmission", material.name);
+        material.diffuseTransmissionColorTexture = textures.load(dt.diffuse_transmission_color_texture, true, "diffuse transmission color", material.name);
+        material.diffuseTransmissionUvTransform = uvTransform(dt.diffuse_transmission_texture);
+        material.diffuseTransmissionColorUvTransform = uvTransform(dt.diffuse_transmission_color_texture);
     }
 
     material.emissiveColor = glm::make_vec3(gltfMaterial.emissive_factor);
@@ -358,8 +487,8 @@ static void computeEmissiveTextureAverages(Model& model) {
             continue;
         }
         const TextureData& texture = model.textures[material.emissiveTexture];
-        if (texture.pixels.empty()) {
-            continue;
+        if (texture.pixels.empty() || texture.format != TextureFormat::RGBA8) {
+            continue;  // compressed: not decoded on the CPU, light sampling uses the emissive constant alone
         }
         float toLinear[256];
         for (int i = 0; i < 256; i++) {

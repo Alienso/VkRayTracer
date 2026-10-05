@@ -188,6 +188,8 @@ void Application::createLogicalDevice(){
     features2.pNext = &vulkan13Features;
     // Storage images with 1 or 2 channels (rg32f motion vectors for DLSS) count as "extended formats"
     features2.features.shaderStorageImageExtendedFormats = VK_TRUE;
+    // Block-compressed textures (BC1-7, from .dds files): a quarter of the memory or less, every desktop GPU has them
+    features2.features.textureCompressionBC = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -631,6 +633,7 @@ bool checkDeviceFeatureSupport(VkPhysicalDevice device) {
     vkGetPhysicalDeviceFeatures2(device, &features2);
 
     return features2.features.shaderStorageImageExtendedFormats &&
+           features2.features.textureCompressionBC &&
            vulkan12Features.bufferDeviceAddress &&
            vulkan12Features.descriptorIndexing &&
            vulkan12Features.runtimeDescriptorArray &&

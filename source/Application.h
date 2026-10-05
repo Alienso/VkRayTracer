@@ -195,6 +195,7 @@ struct GpuMaterial {
     int32_t emissiveTexture;
     int32_t normalTexture;
     float normalScale;
+    uint32_t normalTwoChannel;  // 1 = the normal texture has X and Y only (BC5), Z is rebuilt
     uint32_t solid;          // 1 = closed volume that refracts, 0 = thin
     glm::vec3 absorption;    // per unit of distance inside a solid (Beer's law), 0 = clear
     glm::mat3x2 baseColorUvTransform;  // KHR_texture_transform per texture, see Material
@@ -202,6 +203,12 @@ struct GpuMaterial {
     glm::mat3x2 transmissionUvTransform;
     glm::mat3x2 emissiveUvTransform;
     glm::mat3x2 normalUvTransform;
+    float diffuseTransmission;              // KHR_materials_diffuse_transmission, see Material
+    glm::vec3 diffuseTransmissionColor;
+    int32_t diffuseTransmissionTexture;
+    int32_t diffuseTransmissionColorTexture;
+    glm::mat3x2 diffuseTransmissionUvTransform;
+    glm::mat3x2 diffuseTransmissionColorUvTransform;
 };
 
 // A texture on the GPU. Samplers are shared between textures with the same settings.
@@ -220,6 +227,8 @@ struct SceneMaterial {
     bool useTransmissionTexture = true;
     bool useEmissiveTexture = true;
     bool useNormalTexture = true;
+    bool useDiffuseTransmissionTexture = true;
+    bool useDiffuseTransmissionColorTexture = true;
 };
 
 // The first group is drawn by the trace shader (one property of the first hit). The "guide" group shows the
