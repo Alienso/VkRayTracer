@@ -136,7 +136,8 @@ void Application::recordExposure(VkCommandBuffer commandBuffer) {
         exposureInfoValid = exposureInfo.exposure > 0.0f;
     }
 
-    bool active = settings.autoExposure && settings.debugView == static_cast<int>(DebugView::None);
+    bool active = settings.autoExposure && (settings.debugView == static_cast<int>(DebugView::None) ||
+                                            settings.debugView == static_cast<int>(DebugView::RadianceCache));
     if (active && !exposureWasAuto) {
         exposureReset = true;  // just switched on: jump to the right exposure instead of fading in
     }

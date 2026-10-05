@@ -180,6 +180,7 @@ void Application::destroyMaterialBuffer() {
 // A material was edited in the UI: copy all materials into the buffer, inside this frame's command buffer
 // (like the uniforms), so editing never has to wait for the GPU.
 void Application::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
+    cacheClearPending = true;  // the cached light came from the old materials
     std::vector<GpuMaterial> packed = packMaterials();
     VkDeviceSize size = sizeof(GpuMaterial) * packed.size();
 

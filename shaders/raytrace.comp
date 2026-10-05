@@ -2,9 +2,15 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_atomic_float : require
 
 // One thread per pixel, in 8x8 tiles.
 layout(local_size_x = 8, local_size_y = 8) in;
+
+// The same shader runs as two pipelines (RayTracer.cpp): 0 = the image, 1 = the radiance cache's update paths
+// (a few full-length paths that fill the cache, see "Radiance cache" below). A specialization constant, so each
+// pipeline only contains the code it needs.
+layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
@@ -46,6 +52,11 @@ layout(binding = 3) uniform SceneUniforms {
     uint blurCaustics;      // 1 = path regularization, see tracePath
     float farDistance;      // depth written for rays that hit nothing
     uint writeGuides;       // 1 = write the DLSS input images
+    uint cacheQuery;        // 1 = paths end in the radiance cache where they can
+    uint cacheCapacity;     // entries in the cache (a power of two)
+    float cacheCellScale;   // cache cell size per unit of distance from the camera
+    float cacheMinWeight;   // samples a cache entry needs before paths use it
+    uint cacheUpdateTile;   // update pass: one path per cacheUpdateTile x cacheUpdateTile pixels
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -99,6 +110,12 @@ struct Material {
     mat3x2 normalUvTransform;
 };
 layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
+
+// Radiance cache (RadianceCache.cpp, shaders/cache_resolve.comp): a hash table of small cells on the surfaces,
+// each with the light that leaves it (reflected, not its own emission), averaged over recent frames.
+layout(binding = 18, scalar) buffer CacheKeys { uint cacheKeys[]; };                  // 0 = empty, else the cell's fingerprint
+layout(binding = 19, scalar) buffer CacheAccumulators { vec4 cacheAccumulators[]; }; // this frame's samples: rgb sum, count
+layout(binding = 20, scalar) readonly buffer CacheValues { vec4 cacheValues[]; };    // rgb: average light, w: sample weight
 
 const uint ALPHA_OPAQUE = 0;
 const uint ALPHA_MASK = 1;
@@ -818,7 +835,8 @@ vec3 emissionAt(uint materialIndex, vec2 uv) {
 
 // Light sampling at a surface point: returns the light from one randomly picked point on the glowing
 // triangles, already multiplied by the surface's response (BRDF * cos) and its MIS weight. v: local.
-vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint, inout uint seed) {
+// withBounceSampling: the surface's bounce ray may find the same lights (MIS); false when the path ends here.
+vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint, bool withBounceSampling, inout uint seed) {
     // 1: pick a triangle: binary search for the first one whose running sum exceeds a random number.
     //    Triangles with a bigger share of the total light cover a bigger stretch of [0, 1], so get picked more.
     float pick = randomFloat(seed);
@@ -871,7 +889,8 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
 
     float pdfLight = lightPdf(int(low), distance, cosLight);
     // Behind glass, bounce rays don't count this light (see tracePath), so light sampling takes all of it.
-    float weight = scene.emissiveSampling == EMISSIVE_MIS && !crossedGlass ? misWeight(pdfLight, pdfBounce) : 1.0;
+    float weight = scene.emissiveSampling == EMISSIVE_MIS && !crossedGlass && withBounceSampling
+                   ? misWeight(pdfLight, pdfBounce) : 1.0;
     // Monte Carlo: (what arrives * how the surface reflects it) / how likely we were to pick this sample
     return emission * transmittance * brdf * l.z / pdfLight * weight;
 }
@@ -920,6 +939,83 @@ Guides skyGuides(vec3 direction) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Radiance cache
+//
+// In a scene lit mostly indirectly (Sponza's shade: sunlight bouncing off the courtyard floor and walls), a path
+// needs several random bounces to find the light, and most don't: noise. The cache remembers, for small cells on
+// the surfaces, how much indirect light leaves them. A path whose bounce spread out (diffuse or rough) lights the
+// surface it lands on directly (shadow rays to the sun and the lamps, as usual), adds the cell's indirect light
+// and stops there: one bounce ray instead of many, and an average of many paths instead of one.
+// The cells are filled by a few full-length "update paths" per frame (one per cacheUpdateTile^2 pixels): every
+// surface they hit gets the light they found from there on, except its own direct light. Direct light has sharp
+// shadow edges, and a cell lying across one would spread sunlight into the shade (a path from a dark corner
+// mostly lands on the shaded part of such a cell); indirect light is smooth enough for cells.
+// Averaged over recent frames, so the cache follows changes (moving objects, the sun) with a short lag. Biased:
+// a cell averages its whole area and all directions, which blurs indirect light a little.
+//
+// Cells: about scene.cacheCellScale * distance wide (a few pixels on screen wherever they are), rounded to a power
+// of two so that nearby points agree, and separate per side a surface faces (floor and wall meeting at a corner
+// don't mix). Hash table with up to CACHE_PROBES slots tried per cell (linear probing).
+
+const uint CACHE_PROBES = 8;
+const uint CACHE_MAX_VERTICES = 8;      // update paths fill the cells of their first 8 surfaces
+const float CACHE_ROUGHNESS = 0.25;     // smoother surfaces (and glass) reflect too sharply to be cached
+const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this (rare glints of the sun)
+// A cell averages its whole area, so in a corner it holds more light than the corner itself gets (the walls
+// further out are brighter). A path that reached the cell with a short ray, i.e. from right next to it (inside
+// a corner, under an object), would show that average as light leaking in; only rays longer than this many
+// cell sizes end in the cache, the others trace on.
+const float CACHE_MIN_RAY_CELLS = 2.0;
+
+bool cacheableSurface(Hit hit) {
+    return hit.transmission <= 0.0 && hit.roughness >= CACHE_ROUGHNESS;
+}
+
+// The cell of a surface point: where the table search starts (slot) and the cell's id (fingerprint, never 0).
+// Two different hashes of the same cell coordinates, so two cells sharing a slot are told apart.
+void cacheCell(vec3 position, vec3 normal, out uint slot, out uint fingerprint, out float cellSize) {
+    float distance = max(length(position - scene.cameraPosition.xyz), 1e-4);
+    int level = clamp(int(floor(log2(distance * scene.cacheCellScale))), -14, 10);
+    cellSize = exp2(float(level));
+    ivec3 cell = ivec3(floor(position / cellSize));
+    vec3 a = abs(normal);
+    uint axis = a.x >= a.y && a.x >= a.z ? 0u : (a.y >= a.z ? 1u : 2u);
+    uint facing = axis * 2u + (normal[axis] < 0.0 ? 1u : 0u);  // which of the 6 main directions it faces
+    uint extra = uint(level + 16) | (facing << 8);
+    slot = pcgHash(uint(cell.x) + pcgHash(uint(cell.y) + pcgHash(uint(cell.z) + pcgHash(extra))));
+    fingerprint = pcgHash((uint(cell.x) * 0x27d4eb2du) ^ pcgHash((uint(cell.y) * 0x165667b1u)
+                  ^ pcgHash((uint(cell.z) * 0x85ebca6bu) ^ (extra * 0x9e3779b9u)))) | 1u;
+}
+
+int cacheFind(uint slot, uint fingerprint) {
+    uint mask = scene.cacheCapacity - 1u;
+    for (uint i = 0; i < CACHE_PROBES; i++) {
+        uint index = (slot + i) & mask;
+        if (cacheKeys[index] == fingerprint) {
+            return int(index);
+        }
+    }
+    return -1;
+}
+
+// Finds the cell's entry or claims the first empty slot for it. -1: all slots taken by other cells.
+int cacheFindOrInsert(uint slot, uint fingerprint) {
+    int found = cacheFind(slot, fingerprint);
+    if (found >= 0) {
+        return found;
+    }
+    uint mask = scene.cacheCapacity - 1u;
+    for (uint i = 0; i < CACHE_PROBES; i++) {
+        uint index = (slot + i) & mask;
+        uint previous = atomicCompSwap(cacheKeys[index], 0u, fingerprint);
+        if (previous == 0u || previous == fingerprint) {  // claimed it, or another path just did for the same cell
+            return int(index);
+        }
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------------------------
 
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
 // guides: the DLSS inputs, from the first hit (and the distance to the second if the first bounce reflected).
@@ -940,7 +1036,26 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
     vec3 radiance = vec3(0.0);    // light collected along this path
     vec3 throughput = vec3(1.0);  // fraction of light found further along that still reaches the camera
     // The guides cost a little at the first hit (projections, albedos); skipped when nobody reads them.
-    bool wantGuides = scene.writeGuides != 0;
+    bool wantGuides = scene.writeGuides != 0 && CACHE_UPDATE_PASS == 0;
+
+    // Update paths: the cache entries of the surfaces hit so far, and per surface the light found after it,
+    // as seen from that surface (divided by the throughput up to it). Adding to these as the light is found
+    // (ADD_LIGHT) keeps dim light found late accurate, instead of subtracting large sums at the end.
+    int cacheEntries[CACHE_MAX_VERTICES];
+    vec3 cacheInverseThroughput[CACHE_MAX_VERTICES];
+    vec3 cacheLight[CACHE_MAX_VERTICES];
+    uint cacheVertices = 0;
+    bool previousLobeRough = false;  // the bounce that led to this hit spread out (diffuse or rough)
+    // The update path's entry of the surface hit in this bounce and in the one before (-1: none): their direct
+    // light (shadow rays from there, and the light-sampled lights their bounce ray hits) stays out of their cells.
+    int currentVertex = -1;
+    int previousVertex = -1;
+    bool endInCache = false;     // image paths: the cell of this surface has its indirect light
+    vec3 cachedLight = vec3(0.0);
+#define ADD_LIGHT_EXCEPT(light, skipped) { vec3 light_ = (light); radiance += light_; \
+        if (CACHE_UPDATE_PASS != 0) { for (int i_ = 0; i_ < int(cacheVertices); i_++) { \
+            if (i_ != (skipped)) { cacheLight[i_] += light_ * cacheInverseThroughput[i_]; } } } }
+#define ADD_LIGHT(light) ADD_LIGHT_EXCEPT(light, -1)
     if (wantGuides) {
         guides = skyGuides(direction);
     }
@@ -963,18 +1078,21 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
     // by bouncing would be one bounce short, and the methods wouldn't agree.
     for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
         Hit hit = traceClosest(origin, direction, seed);
+        previousVertex = currentVertex;
+        currentVertex = -1;
         if (bounce == 1 && firstBounceSpecular) {
             guides.specularHitDistance = hit.found ? hit.t : scene.farDistance;
         }
 
         if (!hit.found) {
-            radiance += throughput * environmentLight(direction);
+            ADD_LIGHT(throughput * environmentLight(direction));
             // The sun's disc: always visible to the camera; for bounce rays, the MIS share of the bounce method
             if (sunOn && dot(direction, sunDirection) >= sunCosRadius) {
                 if (!reflectedOnce) {
-                    radiance += throughput * sunRadiance;  // the camera sees it, maybe through glass
+                    ADD_LIGHT(throughput * sunRadiance);  // the camera sees it, maybe through glass
                 } else if (!throughGlass && sunMis) {
-                    radiance += throughput * sunRadiance * misWeight(bouncePdf, sunPdf);
+                    // the bounce-sampling share of the last surface's direct sunlight
+                    ADD_LIGHT_EXCEPT(throughput * sunRadiance * misWeight(bouncePdf, sunPdf), previousVertex);
                 }
             }
             break;
@@ -1007,7 +1125,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
                     weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, hit.t, cosLight));
                 }
             }
-            radiance += throughput * hit.emissive * weight;
+            // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
+            ADD_LIGHT_EXCEPT(throughput * hit.emissive * weight, reflectedOnce && lightSampled ? previousVertex : -1);
         }
         if (bounce == scene.maxBounces) {
             break;  // the final ray: only what it sees counts
@@ -1023,6 +1142,38 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
         // patterns are lost. What the camera sees directly or through mirrors is unaffected.
         if (scene.blurCaustics != 0) {
             hit.roughness = max(hit.roughness, 0.5 * pathRoughness);
+        }
+
+        // Radiance cache (see above). Update paths remember this surface; image paths that got here by a bounce
+        // that spread out take the cell's indirect light, add this surface's direct light below and stop.
+        if (cacheableSurface(hit)) {
+            if (CACHE_UPDATE_PASS != 0) {
+                if (cacheVertices < CACHE_MAX_VERTICES) {
+                    uint slot, fingerprint;
+                    float cellSize;
+                    cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
+                    int entry = cacheFindOrInsert(slot, fingerprint);
+                    if (entry >= 0) {
+                        currentVertex = int(cacheVertices);
+                        cacheEntries[cacheVertices] = entry;
+                        // Channels that carry (almost) nothing can't tell how bright the light behind them is
+                        cacheInverseThroughput[cacheVertices] = mix(vec3(0.0), 1.0 / max(throughput, vec3(1e-8)),
+                                                                    greaterThan(throughput, vec3(1e-6)));
+                        cacheLight[cacheVertices] = vec3(0.0);
+                        cacheVertices++;
+                    }
+                }
+            } else if (scene.cacheQuery != 0 && bounce >= 1 && previousLobeRough) {
+                uint slot, fingerprint;
+                float cellSize;
+                cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
+                int entry = hit.t >= CACHE_MIN_RAY_CELLS * cellSize ? cacheFind(slot, fingerprint) : -1;
+                if (entry >= 0) {
+                    vec4 cached = cacheValues[entry];
+                    endInCache = cached.w >= scene.cacheMinWeight;
+                    cachedLight = cached.rgb;
+                }
+            }
         }
 
         // Start new rays slightly above the surface so they don't hit the surface they start on.
@@ -1079,15 +1230,23 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
                         bool crossedGlass = false;
                         vec3 transmittance = scene.shadowsEnabled != 0
                                 ? shadowTransmittance(surfacePoint, towardsSun, 1000.0, seed, crossedGlass) : vec3(1.0);
-                        float sunWeight = sunMis && !crossedGlass ? misWeight(sunPdf, pdfBounce) : 1.0;
-                        radiance += throughput * transmittance * brdf * PI * scene.sunColor.rgb * sunL.z * sunWeight;
+                        // Ending in the cache, no bounce ray will look for the sun: the shadow ray counts fully
+                        float sunWeight = sunMis && !crossedGlass && !endInCache ? misWeight(sunPdf, pdfBounce) : 1.0;
+                        ADD_LIGHT_EXCEPT(throughput * transmittance * brdf * PI * scene.sunColor.rgb * sunL.z * sunWeight,
+                                         currentVertex);
                     }
                 }
             }
 
             // Direct light from glowing surfaces: the same idea, aimed at a random point on a random glowing triangle.
             if (sampleLights) {
-                radiance += throughput * sampleEmissiveLight(hit, frame, v, surfacePoint, seed);
+                ADD_LIGHT_EXCEPT(throughput * sampleEmissiveLight(hit, frame, v, surfacePoint, !endInCache, seed),
+                                 currentVertex);
+            }
+
+            if (endInCache) {
+                radiance += throughput * cachedLight;  // all the light reflected here that came via other surfaces
+                break;
             }
 
             // Indirect light: continue the path in a direction picked by the surface's reflection (mostly where
@@ -1097,6 +1256,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
             }
         }
         pathRoughness = max(pathRoughness, lobeRoughness);
+        previousLobeRough = !transmitted && lobeRoughness >= CACHE_ROUGHNESS;
         if (bounce == 0 && wantGuides) {
             firstBounceSpecular = specularLobe;
         }
@@ -1128,6 +1288,22 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
             throughput /= survive;
         }
     }
+
+    // Update paths: hand each surface's light to its cache entry (averaged in cache_resolve.comp)
+    if (CACHE_UPDATE_PASS != 0) {
+        for (uint i = 0; i < cacheVertices; i++) {
+            vec3 light = min(cacheLight[i], vec3(CACHE_MAX_RADIANCE));
+            if (any(isnan(light)) || any(isinf(light))) {
+                continue;
+            }
+            atomicAdd(cacheAccumulators[cacheEntries[i]].x, light.r);
+            atomicAdd(cacheAccumulators[cacheEntries[i]].y, light.g);
+            atomicAdd(cacheAccumulators[cacheEntries[i]].z, light.b);
+            atomicAdd(cacheAccumulators[cacheEntries[i]].w, 1.0);
+        }
+    }
+#undef ADD_LIGHT
+#undef ADD_LIGHT_EXCEPT
     return radiance;
 }
 
@@ -1163,11 +1339,43 @@ vec3 debugColor(vec3 direction, inout uint seed) {
         case 8: return vec3(hit.transmission);
         case 9: return hit.emissive;
         case 10: return hit.tangent * 0.5 + 0.5;
+        case 11: {
+            // The cached (indirect) light where the camera looks (cells of surfaces that can't be cached are black)
+            if (!cacheableSurface(hit)) {
+                return vec3(0.0);
+            }
+            uint slot, fingerprint;
+            float cellSize;
+            cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
+            int entry = cacheFind(slot, fingerprint);
+            if (entry < 0) {
+                return vec3(1.0, 0.0, 1.0);
+            }
+            vec4 cached = cacheValues[entry];
+            return cached.w >= scene.cacheMinWeight ? cached.rgb : vec3(0.3, 0.0, 0.0);
+        }
     }
     return vec3(1.0, 0.0, 1.0);
 }
 
+// Radiance cache update pass: one full-length path from a random pixel of each tile; only the cache gets written.
+void updateCache() {
+    ivec2 size = imageSize(radianceImage);
+    uint tile = scene.cacheUpdateTile;
+    uint seed = pcgHash(gl_GlobalInvocationID.x + pcgHash(gl_GlobalInvocationID.y + pcgHash(scene.frameIndex ^ 0x5bd1e995u)));
+    vec2 position = vec2(gl_GlobalInvocationID.xy * tile) + vec2(randomFloat(seed), randomFloat(seed)) * float(tile);
+    if (position.x >= float(size.x) || position.y >= float(size.y)) {
+        return;
+    }
+    Guides guides;
+    tracePath(scene.cameraPosition.xyz, cameraRayDirection(position, size), seed, guides);
+}
+
 void main() {
+    if (CACHE_UPDATE_PASS != 0) {
+        updateCache();
+        return;
+    }
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(radianceImage);
     if (pixel.x >= size.x || pixel.y >= size.y) {

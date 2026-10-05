@@ -399,8 +399,8 @@ void Application::createRayTracingDescriptors() {
     // 0: TLAS, 1: radiance (HDR output), 2: linear depth, 3: scene uniforms, 4: vertices, 5: indices,
     // 6: mesh infos, 7: all textures, 8: materials, 9: emissive triangles, 10: first light per instance,
     // 11: specular albedo table, 12: instance motion, 13-17: motion vectors, diffuse albedo, specular albedo,
-    // normal + roughness, specular hit distance
-    std::vector<VkDescriptorSetLayoutBinding> bindings(18);
+    // normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages
+    std::vector<VkDescriptorSetLayoutBinding> bindings(21);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -416,6 +416,9 @@ void Application::createRayTracingDescriptors() {
     bindings[12] = {12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (uint32_t i = 13; i <= 17; i++) {
         bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    }
+    for (uint32_t i = 18; i <= 20; i++) {
+        bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     }
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
@@ -440,7 +443,7 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -489,12 +492,17 @@ void Application::updateRayTracingDescriptorSet() {
             {VK_NULL_HANDLE, normalRoughnessImage.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, specularHitDistanceImage.view, VK_IMAGE_LAYOUT_GENERAL},
     };
+    VkDescriptorBufferInfo cacheInfos[3] = {
+            {cacheKeyBuffer, 0, VK_WHOLE_SIZE},
+            {cacheAccumulatorBuffer, 0, VK_WHOLE_SIZE},
+            {cacheValueBuffer, 0, VK_WHOLE_SIZE},
+    };
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(18);
+    std::vector<VkWriteDescriptorSet> writes(21);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -532,6 +540,10 @@ void Application::updateRayTracingDescriptorSet() {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[i].pImageInfo = &guideInfos[i - 13];
     }
+    for (uint32_t i = 18; i <= 20; i++) {
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &cacheInfos[i - 18];
+    }
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -550,15 +562,23 @@ void Application::createRayTracingPipeline() {
 
     VkShaderModule shaderModule = createShaderModule(readFile("raytrace.comp.spv"));
 
-    VkComputePipelineCreateInfo pipelineInfo{};
-    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    pipelineInfo.stage.module = shaderModule;
-    pipelineInfo.stage.pName = "main";
-    pipelineInfo.layout = rtPipelineLayout;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &rtPipeline) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create ray tracing pipeline!");
+    // Two pipelines from the one shader: the image (CACHE_UPDATE_PASS = 0) and the radiance cache's update
+    // paths (1). The constant lets the compiler drop the other pass's code from each.
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        VkSpecializationMapEntry entry{0, 0, sizeof(uint32_t)};
+        VkSpecializationInfo specialization{1, &entry, sizeof(uint32_t), &pass};
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = shaderModule;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.stage.pSpecializationInfo = &specialization;
+        pipelineInfo.layout = rtPipelineLayout;
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+                                     pass == 0 ? &rtPipeline : &rtCacheUpdatePipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create ray tracing pipeline!");
+        }
     }
 
     vkDestroyShaderModule(device, shaderModule, nullptr);
@@ -612,12 +632,32 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.debugView = isGuideView(settings.debugView) ? 0 : static_cast<uint32_t>(settings.debugView);
     uniforms.farDistance = Configuration::cameraFar;
     uniforms.writeGuides = dlssActive() || isGuideView(settings.debugView) ? 1 : 0;
+    uniforms.cacheQuery = settings.radianceCache && !cacheQueriesSuspended ? 1 : 0;
+    uniforms.cacheCapacity = cacheCapacity;
+    // A cell about cacheCellPixels render pixels wide at distance 1, growing with the distance
+    uniforms.cacheCellScale = 2.0f * uniforms.tanHalfFov / static_cast<float>(renderExtent.height) * settings.cacheCellPixels;
+    uniforms.cacheMinWeight = settings.cacheMinSamples;
+    uniforms.cacheUpdateTile = static_cast<uint32_t>(std::max(settings.cacheUpdateTile, 1));
+
+    // The cache holds light that is no longer right after the lighting or the cells change: start it over.
+    // (Moving objects and edited materials are followed within its history instead; see cacheHistoryFrames.)
+    bool lightingChanged =
+            std::memcmp(&uniforms.sunDirection, &previousUniforms.sunDirection,
+                        offsetof(SceneUniforms, samplesPerPixel) - offsetof(SceneUniforms, sunDirection)) != 0 ||
+            uniforms.maxBounces != previousUniforms.maxBounces || uniforms.shadowsEnabled != previousUniforms.shadowsEnabled ||
+            uniforms.emissiveSampling != previousUniforms.emissiveSampling ||
+            uniforms.blurCaustics != previousUniforms.blurCaustics ||
+            uniforms.cacheCellScale != previousUniforms.cacheCellScale;
+    if (lightingChanged) {
+        cacheClearPending = true;
+    }
 
     // Anything that changes the image (camera moved, slider dragged, ...) restarts accumulation.
     // frameIndex and accumulatedFrames change every frame by design, so those are filled in after comparing.
     // (Exposure and tone mapping aren't in here: they only affect the display pass, see recordDisplay.)
     if (resetAccumulation || std::memcmp(&uniforms, &previousUniforms, sizeof(SceneUniforms)) != 0) {
         accumulatedFrames = 0;
+        accumulationRestarts++;
         resetAccumulation = false;
     }
     previousUniforms = uniforms;
@@ -712,25 +752,30 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &shaderImagesBarrier, 1, &uniformBarrier, 1, preBarriers);
 
-    // 2: trace
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
+    // 2: radiance cache: update paths fill it, then the new samples are averaged in
     writeTimestamp(commandBuffer, 0);
-    vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
+    recordRadianceCache(commandBuffer);
     writeTimestamp(commandBuffer, 1);
 
-    // 3: DLSS mode: denoise + upscale the noisy frame into the DLSS output image
-    recordDlss(commandBuffer);
+    // 3: trace
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipeline);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
+    vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
     writeTimestamp(commandBuffer, 2);
 
-    // 4: measure the image for the exposure, then exposure + tone mapping into the display image
-    recordExposure(commandBuffer);
+    // 4: DLSS mode: denoise + upscale the noisy frame into the DLSS output image
+    recordDlss(commandBuffer);
     writeTimestamp(commandBuffer, 3);
-    recordDisplay(commandBuffer);
+
+    // 5: measure the image for the exposure, then exposure + tone mapping into the display image
+    recordExposure(commandBuffer);
+    recordNoise(commandBuffer);  // noise measurement, if one is running (not timed: part of "exposure")
     writeTimestamp(commandBuffer, 4);
+    recordDisplay(commandBuffer);
+    writeTimestamp(commandBuffer, 5);
     timestampsWritten[currentFrame] = true;
 
-    // 5: display image -> blit source, swapchain image -> blit destination.
+    // 6: display image -> blit source, swapchain image -> blit destination.
     //    The swapchain image only becomes available at the TRANSFER stage (see the semaphore wait in drawFrame).
     VkImageMemoryBarrier blitBarriers[2]{};
     blitBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -757,7 +802,7 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 2, blitBarriers);
 
-    // 6: blit (output size = swapchain size, so this is a copy plus format conversion)
+    // 7: blit (output size = swapchain size, so this is a copy plus format conversion)
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {(int32_t) outputExtent.width, (int32_t) outputExtent.height, 1};
@@ -793,6 +838,7 @@ void Application::readTimestamps() {
     float msPerTick = physicalDeviceProperties.limits.timestampPeriod * 1e-6f;  // the period is in nanoseconds
     for (uint32_t i = 0; i + 1 < timestampsPerFrame; i++) {
         float ms = static_cast<float>(ticks[i + 1] - ticks[i]) * msPerTick;
+        lastPassTimes[i] = ms;
         gpuPassTimes[i] = gpuPassTimes[i] == 0.0f ? ms : gpuPassTimes[i] * 0.95f + ms * 0.05f;
     }
 }
@@ -837,6 +883,8 @@ void Application::recordInstanceMotionUpload(VkCommandBuffer commandBuffer) {
 
 void Application::cleanupRayTracing() {
     vkDestroyPipeline(device, rtPipeline, nullptr);
+    vkDestroyPipeline(device, rtCacheUpdatePipeline, nullptr);
+    destroyRadianceCache();
     vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, rtDescriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(device, rtDescriptorSetLayout, nullptr);
@@ -846,6 +894,7 @@ void Application::cleanupRayTracing() {
     destroyMaterialBuffer();
     destroySpecularAlbedoTable();
     destroyExposureResources();
+    destroyNoiseResources();
     destroyDisplayResources();
     vkDestroyQueryPool(device, timestampQueryPool, nullptr);
     destroyTextures();

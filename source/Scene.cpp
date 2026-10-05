@@ -324,6 +324,7 @@ void Application::updateScene() {
 // Packs all meshes into one vertex buffer and one index buffer. Indices stay relative to their mesh;
 // MeshInfo remembers where each mesh starts.
 void Application::uploadSceneGeometry() {
+    cacheClearPending = true;  // the radiance cache's cells belong to the old geometry
     std::vector<SceneVertex> vertices;
     std::vector<uint32_t> indices;
     // glTF gives distances inside a material (absorption) in the file's world units, after the node transforms;

@@ -56,6 +56,7 @@ void Application::initVulkan() {
     createRayTracingImages();
     createDisplayImages();
     createExposureResources();
+    createRadianceCache();
     createRayTracingDescriptors();
     createRayTracingPipeline();
     createDisplayResources();  // reads the radiance image and the exposure buffer

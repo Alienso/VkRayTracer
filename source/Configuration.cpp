@@ -20,7 +20,8 @@ const std::vector<const char*> Configuration::deviceExtensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_QUERY_EXTENSION_NAME,
-        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME  // required by VK_KHR_acceleration_structure
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,  // required by VK_KHR_acceleration_structure
+        VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME        // radiance cache: adding up samples with atomicAdd
 };
 
 const bool Configuration::enableValidationLayers = true;

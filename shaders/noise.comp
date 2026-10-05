@@ -1,0 +1,86 @@
+#version 460
+//
+// Noise measurement: compares the image that gets displayed (linear HDR, before exposure) with a converged
+// reference of the same view. One invocation per pixel; each workgroup adds up its pixels and writes one sum,
+// the CPU adds the workgroup sums (Noise.cpp).
+//
+// Pass 0: copies the image into the reference (it has been accumulated for many frames), sums its brightness.
+// Pass 1: per pixel the relative squared error of the luminance, (measured - reference)^2 / (reference + floor)^2.
+//   Relative, so a dark corridor counts as much as the sunlit courtyard. The floor (1% of the reference's
+//   average brightness) keeps nearly black pixels from dominating with huge ratios.
+//   Also the brightness inside a rectangle of the image (e.g. a dark corner): a local bias hardly changes the
+//   whole image's brightness, but shows up there. The rectangle's average converges much faster than its pixels.
+//
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba32f) uniform readonly image2D measuredImage;  // the image display.comp shows
+layout(binding = 1, rgba32f) uniform image2D referenceImage;
+// Two per workgroup. First: x = sum of the relative squared errors, y = measured luminance, z = reference
+// luminance, w = pixels left out because they are NaN or infinite. Second, inside the rectangle only:
+// x = measured luminance, y = reference luminance, z = pixel count.
+layout(binding = 2, scalar) writeonly buffer GroupSums { vec4 groupSums[]; };
+
+// Must match NoisePushConstants in Application.h
+layout(push_constant, scalar) uniform PushConstants {
+    uint pass;
+    float floorLuminance;  // see above
+    ivec2 regionMin;       // the rectangle, in pixels (max exclusive)
+    ivec2 regionMax;
+} pc;
+
+shared vec4 partial[256];
+shared vec4 partialDark[256];
+
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool isBroken(float value) {
+    return isnan(value) || isinf(value);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(referenceImage);
+    vec4 sums = vec4(0.0);
+    vec4 darkSums = vec4(0.0);
+    if (pixel.x < size.x && pixel.y < size.y) {
+        vec3 measured = imageLoad(measuredImage, pixel).rgb;
+        float measuredLuminance = luminance(measured);
+        if (pc.pass == 0) {
+            imageStore(referenceImage, pixel, vec4(measured, 1.0));
+            sums = isBroken(measuredLuminance) ? vec4(0.0, 0.0, 0.0, 1.0) : vec4(0.0, measuredLuminance, measuredLuminance, 0.0);
+        } else {
+            float referenceLuminance = luminance(imageLoad(referenceImage, pixel).rgb);
+            if (isBroken(measuredLuminance) || isBroken(referenceLuminance)) {
+                sums = vec4(0.0, 0.0, 0.0, 1.0);
+            } else {
+                float error = (measuredLuminance - referenceLuminance) / (referenceLuminance + pc.floorLuminance);
+                sums = vec4(error * error, measuredLuminance, referenceLuminance, 0.0);
+                if (all(greaterThanEqual(pixel, pc.regionMin)) && all(lessThan(pixel, pc.regionMax))) {
+                    darkSums = vec4(measuredLuminance, referenceLuminance, 1.0, 0.0);
+                }
+            }
+        }
+    }
+
+    // Add up the workgroup's 256 values: halve the number of active threads each step
+    uint index = gl_LocalInvocationIndex;
+    partial[index] = sums;
+    partialDark[index] = darkSums;
+    barrier();
+    for (uint stride = 128; stride > 0; stride /= 2) {
+        if (index < stride) {
+            partial[index] += partial[index + stride];
+            partialDark[index] += partialDark[index + stride];
+        }
+        barrier();
+    }
+    if (index == 0) {
+        uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+        groupSums[2 * group] = partial[0];
+        groupSums[2 * group + 1] = partialDark[0];
+    }
+}

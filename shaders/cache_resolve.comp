@@ -1,0 +1,66 @@
+#version 460
+//
+// Radiance cache, once per frame after the update paths (RadianceCache.cpp): blends each entry's new samples into
+// its average and forgets entries nobody has updated for a while. One invocation per table entry.
+//
+// The average is weighted by samples, and the old samples' weight shrinks every frame (decay), so the cache
+// follows changes in the lighting within a few dozen frames while a still view keeps refining. The weight is
+// capped (maxWeight): a cell that gets many samples per frame still reacts as quickly.
+//
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, scalar) buffer CacheKeys { uint keys[]; };
+layout(binding = 1, scalar) buffer CacheAccumulators { vec4 accumulators[]; };  // rgb sum, count; emptied here
+layout(binding = 2, scalar) buffer CacheValues { vec4 values[]; };              // rgb: average, w: sample weight
+layout(binding = 3, scalar) buffer CacheAges { uint ages[]; };                  // frames without a new sample
+layout(binding = 4, scalar) buffer CacheStats { uint usedEntries; } stats;     // for the UI
+
+// Must match CacheResolvePushConstants in Application.h
+layout(push_constant, scalar) uniform PushConstants {
+    uint capacity;
+    float decay;      // weight kept by the old samples each frame
+    float maxWeight;
+    uint maxAge;      // frames without a sample until the entry is freed
+} pc;
+
+shared uint groupUsed;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        groupUsed = 0;
+    }
+    barrier();
+
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.capacity && keys[i] != 0u) {
+        vec4 added = accumulators[i];
+        vec4 value = values[i];
+        float history = value.w * pc.decay;
+        bool keep = true;
+        if (added.w > 0.0) {
+            accumulators[i] = vec4(0.0);
+            float total = history + added.w;
+            value = vec4((value.rgb * history + added.rgb) / total, min(total, pc.maxWeight));
+            ages[i] = 0;
+        } else {
+            value.w = history;
+            uint age = ages[i] + 1;
+            keep = age <= pc.maxAge;
+            ages[i] = keep ? age : 0;
+        }
+        if (keep) {
+            values[i] = value;
+            atomicAdd(groupUsed, 1);
+        } else {
+            keys[i] = 0u;  // free the slot
+            values[i] = vec4(0.0);
+        }
+    }
+
+    barrier();
+    if (gl_LocalInvocationIndex == 0 && groupUsed > 0) {
+        atomicAdd(stats.usedEntries, groupUsed);
+    }
+}

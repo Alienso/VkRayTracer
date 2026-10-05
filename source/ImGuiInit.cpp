@@ -68,8 +68,8 @@ void Application::buildImGui() {
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::Text("GPU: %s", physicalDeviceProperties.deviceName);
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-    ImGui::Text("GPU: trace %.2f ms, DLSS %.2f, exposure %.2f, display %.2f",
-                gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3]);
+    ImGui::Text("GPU: cache %.2f ms, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
+                gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4]);
     ImGui::Text("%u triangles", primitiveCount);
 
     buildSceneUi();
@@ -113,11 +113,14 @@ void Application::buildImGui() {
         ImGui::Combo("Debug view", &settings.debugView,
                      "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"
                      "Base color\0Metallic\0Roughness\0Transmission\0Emissive\0Tangents\0"
+                     "Radiance cache\0"
                      "DLSS input: depth\0DLSS input: motion vectors\0DLSS input: diffuse albedo\0"
                      "DLSS input: specular albedo\0DLSS input: normals\0DLSS input: roughness\0"
                      "DLSS input: specular hit distance\0DLSS input: reprojection error\0");
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("DLSS inputs: the images DLSS will get, written during normal path tracing.\n"
+            ImGui::SetTooltip("Radiance cache: the indirect light the cache holds for what the camera sees, cell by cell\n"
+                              "(magenta: no cell yet, dark red: too few samples).\n"
+                              "DLSS inputs: the images DLSS will get, written during normal path tracing.\n"
                               "Depth / hit distance: grey = near to far, light blue = sky, black = unknown.\n"
                               "Motion vectors: grey = still, red/green = moving left/up.\n"
                               "Reprojection error: last frame's albedo fetched through the motion vectors,\n"
@@ -133,6 +136,7 @@ void Application::buildImGui() {
         ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
         ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                             "instead of slowly converging sparkles (fireflies)");
+        buildRadianceCacheUi();
         ImGui::BeginDisabled(dlssActive());  // DLSS averages over time itself
         ImGui::Checkbox("Accumulate", &settings.accumulate);
         ImGui::EndDisabled();
@@ -145,6 +149,8 @@ void Application::buildImGui() {
             }
         }
     }
+
+    buildNoiseUi();
 
     ImGui::Separator();
     ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);

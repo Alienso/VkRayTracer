@@ -51,6 +51,19 @@ struct SceneUniforms {
     uint32_t blurCaustics;           // 1 = path regularization, see tracePath in the shader
     float farDistance;               // view depth written where rays hit nothing
     uint32_t writeGuides;            // 1 = write the DLSS input images (depth, motion vectors, albedos, ...)
+    uint32_t cacheQuery;             // 1 = image paths end in the radiance cache where they can
+    uint32_t cacheCapacity;          // entries in the cache's hash table
+    float cacheCellScale;            // cell size per unit of distance from the camera
+    float cacheMinWeight;            // samples a cell needs before it is used
+    uint32_t cacheUpdateTile;        // one update path per cacheUpdateTile x cacheUpdateTile pixels
+};
+
+// Must match the push constants in shaders/cache_resolve.comp
+struct CacheResolvePushConstants {
+    uint32_t capacity;
+    float decay;      // weight the old samples keep each frame
+    float maxWeight;  // cap of a cell's sample weight
+    uint32_t maxAge;  // frames without new samples until a cell is freed
 };
 
 // Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the display pass
@@ -92,6 +105,25 @@ struct DisplayPushConstants {
     uint32_t view;          // DisplayView
     float farDistance;      // sky depth, to show it apart in the depth views
 };
+
+// Must match the push constants in shaders/noise.comp
+struct NoisePushConstants {
+    uint32_t pass;         // 0 = copy the image into the reference, 1 = compare with it
+    float floorLuminance;  // added to the reference in the relative error's denominator
+    glm::ivec2 regionMin;  // a rectangle whose brightness is also measured on its own
+    glm::ivec2 regionMax;
+};
+
+// One frame of a noise measurement (Noise.cpp)
+struct NoiseResult {
+    uint32_t frame;      // 1 = the first frame after the start
+    float relativeMse;   // mean of ((measured - reference) / (reference + floor))^2 over the image, luminance
+    float brightness;    // measured / reference, summed over the image (1 = no bias)
+    float regionBrightness;  // the same inside noiseRegion only (local bias, e.g. light leaking into a corner)
+    float traceMs;       // GPU time of this frame's trace (+ radiance cache) and DLSS passes
+    float dlssMs;
+};
+enum class NoiseState { Idle, BuildingReference, WaitingToMeasure, Measuring };
 
 // What the display pass shows. Must match the constants in shaders/display.comp.
 enum class DisplayView : uint32_t {
@@ -195,6 +227,7 @@ struct SceneMaterial {
 enum class DebugView : int {
     None = 0, Normals, TexCoords, MeshIndex, MaterialIndex,
     BaseColor, Metallic, Roughness, Transmission, Emissive, Tangents,
+    RadianceCache,  // the cached light of the cell at the first hit (with exposure, like the image)
     GuideDepth, GuideMotionVectors, GuideDiffuseAlbedo, GuideSpecularAlbedo, GuideNormals, GuideRoughness,
     GuideSpecularHitDistance, GuideReprojectionError
 };
@@ -279,6 +312,11 @@ struct RenderSettings {
     int samplesPerPixel = 1;
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
+    bool radianceCache = true;      // paths stop after a diffuse bounce and read the light from the cache
+    float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
+    int cacheUpdateTile = 4;        // one cache update path per N x N pixels
+    float cacheHistoryFrames = 32.0f;  // old cache samples fade out over about this many frames
+    float cacheMinSamples = 4.0f;   // a cell is used once it has this much sample weight
     bool accumulate = true;
 
     float exposure = 0.6f;          // manual: brightness multiplier
@@ -444,6 +482,25 @@ private:
     VkDescriptorSet rtDescriptorSet = VK_NULL_HANDLE;  // null until created, see loadScene
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
+    VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
+
+    // Radiance cache (RadianceCache.cpp): hash table of surface cells, on the GPU only
+    static constexpr uint32_t cacheCapacity = 1u << 20;  // entries (40 MB in all)
+    static constexpr float cacheMaxWeight = 256.0f;
+    static constexpr uint32_t cacheMaxAge = 128;
+    VkBuffer cacheKeyBuffer, cacheAccumulatorBuffer, cacheValueBuffer, cacheAgeBuffer, cacheStatsBuffer;
+    VkDeviceMemory cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory;
+    std::vector<VkBuffer> cacheStatsReadbackBuffers;
+    std::vector<VkDeviceMemory> cacheStatsReadbackMemories;
+    std::vector<void*> cacheStatsReadbackMapped;
+    uint32_t cacheUsedEntries = 0;      // for the UI, a few frames late
+    bool cacheClearPending = true;      // empty the cache before the next update (new scene, lighting changed)
+    bool cacheQueriesSuspended = false; // noise reference: plain path tracing (the cache keeps filling)
+    VkDescriptorSetLayout cacheDescriptorSetLayout;
+    VkDescriptorPool cacheDescriptorPool;
+    VkDescriptorSet cacheDescriptorSet;
+    VkPipelineLayout cachePipelineLayout;
+    VkPipeline cachePipeline;
 
     // DLSS Ray Reconstruction via Streamline (Dlss.cpp)
     bool dlssDisabledByFlag = false;   // --no-dlss: Streamline is never loaded
@@ -482,6 +539,40 @@ private:
     VkPipeline exposurePipeline;
     float frameDeltaTime = 0.0f;   // seconds, set in mainLoop
 
+    // Noise measurement (Noise.cpp): a converged reference of the current view, then the error of the displayed
+    // image against it, frame by frame. Resources are created on first use.
+    bool noiseResourcesCreated = false;
+    RenderImage noiseReferenceImage;          // RGBA32F at output size
+    VkExtent2D noiseReferenceExtent{};
+    bool noiseReferenceValid = false;
+    float noiseReferenceLuminance = 0.0f;     // average over the reference image
+    uint32_t noiseGroupCapacity = 0;          // workgroup sums the buffers below have room for
+    std::vector<VkBuffer> noiseSumBuffers;    // one per frame in flight, host visible: the GPU writes, the CPU reads
+    std::vector<VkDeviceMemory> noiseSumMemories;
+    std::vector<void*> noiseSumMapped;
+    struct NoisePending { uint32_t pass = 0; uint32_t frame = 0; uint32_t groups = 0; bool active = false; };
+    std::vector<NoisePending> noisePending;   // what each frame slot's buffer holds once its fence has passed
+    VkDescriptorSetLayout noiseDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool noiseDescriptorPool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> noiseDescriptorSets;  // one per frame in flight (each with its own sum buffer)
+    VkPipelineLayout noisePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline noisePipeline = VK_NULL_HANDLE;
+    NoiseState noiseState = NoiseState::Idle;
+    int noiseReferenceFrames = 4096;          // UI: frames accumulated for the reference
+    int noiseMeasureFrames = 256;             // UI: frames measured
+    int noiseMeasureMode = 0;                 // RenderMode the measurement runs in
+    glm::ivec4 noiseRegion = glm::ivec4(0);   // x0, y0, x1, y1 in output pixels; empty = the whole image
+    uint32_t noiseFrame = 0;                  // frames measured so far
+    uint32_t noiseRestartsAtStart = 0;
+    std::vector<NoiseResult> noiseResults;
+    std::string noiseStatus;
+    // Scripted run (set before the first frame, e.g. in createDefaultScene): reference, measure in
+    // noiseAutoMode, print the results, then close the window if noiseAutoExit.
+    bool noiseAutoRun = false;
+    int noiseAutoMode = 0;
+    bool noiseAutoExit = false;
+    bool noiseAutoContinue = false;  // the scripted run's reference is being built
+
     // Display pass (Display.cpp): exposure + tone mapping into an 8-bit image at output size, blitted to the swapchain
     VkImage displayImage;
     VkDeviceMemory displayImageMemory;
@@ -494,10 +585,11 @@ private:
 
     // GPU time of each pass (trace, exposure, display): timestamps before and after them, one set of queries
     // per frame in flight, read when that frame slot is recorded again. Smoothed over ~20 frames, in ms.
-    static constexpr uint32_t timestampsPerFrame = 5;  // before trace, after trace / DLSS / exposure / display
+    static constexpr uint32_t timestampsPerFrame = 6;  // before the cache, after cache / trace / DLSS / exposure / display
     VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
     std::vector<bool> timestampsWritten;
     float gpuPassTimes[timestampsPerFrame - 1] = {};
+    float lastPassTimes[timestampsPerFrame - 1] = {};  // the same, unsmoothed, of the frame last read back
 
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
@@ -510,6 +602,7 @@ private:
 
     // Accumulation restarts whenever the uniforms (camera, light, settings) differ from the previous frame.
     uint32_t accumulatedFrames = 0;
+    uint32_t accumulationRestarts = 0;  // counts the restarts (also in DLSS modes: the uniforms changed)
     bool resetAccumulation = true;
     SceneUniforms previousUniforms{};
 
@@ -614,6 +707,23 @@ private:
     void recordExposure(VkCommandBuffer commandBuffer);
     void destroyExposureResources();
     void buildExposureUi();
+
+    // RadianceCache.cpp
+    void createRadianceCache();
+    void recordRadianceCache(VkCommandBuffer commandBuffer);
+    void destroyRadianceCache();
+    void buildRadianceCacheUi();
+
+    // Noise.cpp
+    void ensureNoiseResources();
+    void updateNoiseDescriptorSets();
+    void startNoiseReference();
+    void startNoiseMeasurement(int renderMode);
+    void readNoiseResults();
+    void finishNoiseMeasurement();
+    void recordNoise(VkCommandBuffer commandBuffer);
+    void destroyNoiseResources();
+    void buildNoiseUi();
 
     // Display.cpp
     void chooseExtents();

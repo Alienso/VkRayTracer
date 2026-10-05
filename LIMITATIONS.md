@@ -102,6 +102,49 @@ uploaded. Fine for thousands of triangles, slow for scenes with many glowing mes
 A sun with angular radius 0 can only be found by shadow rays: mirrors don't show it, and the camera sees a
 disc clamped to a minimum size.
 
+## Radiance cache
+
+### The cache is biased
+Paths stop at the first cell they reach after a diffuse or rough bounce: they light that point directly
+(shadow rays, exact) and take the cell's averaged indirect light. A cell averages its whole area (about 32 pixels
+wide on screen) and all directions, so indirect light is slightly blurred. Direct light is kept out of the cells
+on purpose: with it, cells across a sun shadow's edge made Sponza 0.2..0.3% too bright. Cells are only used by
+rays longer than 2 cells (inside a corner the paths trace on). Measured against the plain path tracer (HDR):
+Sponza within 0.1%, the dark corner by the basin within the measurement's ±2-3%, Cornell box -0.2%, helmet
+-0.1%. Cached values come from update paths that hit the cell at any depth, so they don't carry exactly
+`maxBounces` minus the depth of the path that reads them, and the light rules of glass and "Blur caustics"
+follow the update path's own history.
+- Where: shaders/raytrace.comp ("Radiance cache"), source/RadianceCache.cpp.
+- Workaround: the "Radiance cache" checkbox gives the plain path tracer (the noise reference always uses it).
+
+### Dark corners look brighter with the cache than without (after the same time)
+Not a leak: without the cache, a dark corner of Sponza is still far from converged after 10 000 frames (each
+pixel ±90%), and most of its light sits in rare bright pixels that tone mapping compresses, so on screen the
+corner looks darker than it is. Its HDR average matches the cache's (see above). DLSS darkens such corners even
+more without the cache (see "DLSS RR darkens Sponza's shade a little").
+
+### The cache follows changes with a delay
+Old samples fade out over ~32 frames ("History"). The cache is cleared when the sun, sky, bounce count, light
+sampling settings or cell size change, when a model is loaded and when a material is edited; moving objects are
+only followed by the fading (their old light lingers for a moment, in DLSS modes as a short glow or shadow trail).
+- Where: `buildSceneUniforms` (`lightingChanged`), `recordMaterialUpdate`, `uploadSceneGeometry`.
+
+### Fixed size, fixed cost
+The table has 2^20 entries (40 MB); when the 8 slots a cell may use are taken, the cell isn't cached (its paths
+just trace on). The update paths and the resolve over all entries cost ~0.3 ms even where the cache helps
+little (the helmet scene: 1.27 ms instead of 1.03 ms per frame).
+- Fix: resolve only the entries that were used (a list of them), size the table from the scene.
+
+### One sample's light is clamped
+Update paths clamp what one sample brings into a cell to 256 (a glint of the sun seen in a mirror would make the
+cell flicker for its whole history). Biased only for very bright indirect light.
+
+### It doesn't help the first bounce
+The noise left in Sponza's shade comes mostly from whether a pixel's first bounce happens to reach the sunlit
+part of the courtyard; the cache only replaces what comes after that bounce.
+- Fix: ReSTIR GI (reuse first-bounce samples across pixels and frames) or path guiding; or several cheap
+  first-bounce rays per pixel that end in the cache.
+
 ## Alpha (Phase 6b)
 
 ### Blend mode is noisy
@@ -140,6 +183,16 @@ accumulating, the measurement comes from the averaged image, so early noisy fram
 differently from the converged result.
 - Where: shaders/exposure.comp, source/Exposure.cpp (applied in shaders/display.comp).
 - Fix (if it matters): a smarter metering mode.
+
+### The noise measurement's reference has noise too
+The reference is the same renderer accumulated for N frames (default 4096), so its own error is about 1/N of
+one frame's. Measurements far beyond N/16 frames start to show the reference's noise (with 2048 frames, a
+plain 64-frame measurement in Sponza already looked like a bias that wasn't there). The error is the
+luminance's only (colour noise doesn't count), relative to the reference plus 1% of its average brightness.
+In very noisy views (Sponza's dark corners) even a 8192-frame reference is ±2-3% off over an 80x180 pixel
+region; compare brightness with a control run (the same renderer against its own reference). Judge brightness
+by the HDR numbers, not by screenshots: tone mapping compresses unconverged bright pixels.
+- Where: source/Noise.cpp, shaders/noise.comp.
 
 ## DLSS / Streamline (Phase 7)
 

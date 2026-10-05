@@ -41,6 +41,8 @@ add_executable(vulkanDemo main.cpp
         source/BuiltInModels.cpp source/BuiltInModels.h
         source/Lights.cpp
         source/Exposure.cpp
+        source/Noise.cpp
+        source/RadianceCache.cpp
         source/Display.cpp
         source/Dlss.cpp
         include/cgltf/cgltf.h)

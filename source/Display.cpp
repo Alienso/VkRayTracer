@@ -36,6 +36,7 @@ void Application::recreateRenderImages() {
     updateRayTracingDescriptorSet();
     updateExposureDescriptorSet();
     updateDisplayDescriptorSet();
+    updateNoiseDescriptorSets();  // the displayed image changed (and the reference may no longer fit)
     resetAccumulation = true;
     dlssReset = true;
 }
@@ -201,8 +202,9 @@ void Application::recordDisplay(VkCommandBuffer commandBuffer) {
     if (isGuideView(settings.debugView)) {
         view = static_cast<DisplayView>(static_cast<uint32_t>(DisplayView::Depth) + settings.debugView
                                         - static_cast<int>(DebugView::GuideDepth));
-    } else if (settings.debugView != static_cast<int>(DebugView::None)) {
-        view = DisplayView::PassThrough;
+    } else if (settings.debugView != static_cast<int>(DebugView::None) &&
+               settings.debugView != static_cast<int>(DebugView::RadianceCache)) {
+        view = DisplayView::PassThrough;  // values as they are (the radiance cache view is light: shown like the image)
     }
     push.view = static_cast<uint32_t>(view);
     push.farDistance = Configuration::cameraFar;
