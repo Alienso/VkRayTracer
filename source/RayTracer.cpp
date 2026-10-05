@@ -8,6 +8,8 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
+#include <iostream>
+#include <glm/gtc/constants.hpp>
 #include "Application.h"
 #include "Configuration.h"
 #include "VulkanExtensions.h"
@@ -592,6 +594,9 @@ void Application::createRayTracingPipeline() {
         pipelineInfo.stage.pName = "main";
         pipelineInfo.stage.pSpecializationInfo = &specialization;
         pipelineInfo.layout = rtPipelineLayout;
+        if (pipelineStatisticsSupported) {
+            pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        }
         if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
                                      pass == 0 ? &rtPipeline : &rtCacheUpdatePipeline) != VK_SUCCESS) {
             throw std::runtime_error("failed to create ray tracing pipeline!");
@@ -599,6 +604,43 @@ void Application::createRayTracingPipeline() {
     }
 
     vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    if (pipelineStatisticsSupported) {
+        rtPipelineStatistics = "Image paths:\n" + readPipelineStatistics(rtPipeline) +
+                               "Cache update paths:\n" + readPipelineStatistics(rtCacheUpdatePipeline);
+        std::cout << "Trace shader statistics (from the driver):\n" << rtPipelineStatistics << std::flush;
+    }
+}
+
+// The driver's statistics about a compiled pipeline, one "name: value" line each (on NVIDIA e.g. the registers per
+// thread, which limit how many threads an SM can run at once: fewer threads hide the waits for rays and memory worse).
+std::string Application::readPipelineStatistics(VkPipeline pipeline) {
+    if (vkext::vkGetPipelineExecutablePropertiesKHR == nullptr || vkext::vkGetPipelineExecutableStatisticsKHR == nullptr) {
+        return "";
+    }
+    VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+    uint32_t executableCount = 0;
+    vkext::vkGetPipelineExecutablePropertiesKHR(device, &pipelineInfo, &executableCount, nullptr);
+    std::string text;
+    for (uint32_t executable = 0; executable < executableCount; executable++) {
+        VkPipelineExecutableInfoKHR executableInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, executable};
+        uint32_t statisticCount = 0;
+        vkext::vkGetPipelineExecutableStatisticsKHR(device, &executableInfo, &statisticCount, nullptr);
+        std::vector<VkPipelineExecutableStatisticKHR> statistics(statisticCount, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        vkext::vkGetPipelineExecutableStatisticsKHR(device, &executableInfo, &statisticCount, statistics.data());
+        for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
+            std::string value;
+            switch (statistic.format) {
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: value = statistic.value.b32 ? "yes" : "no"; break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: value = std::to_string(statistic.value.i64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: value = std::to_string(statistic.value.u64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: value = std::to_string(statistic.value.f64); break;
+                default: value = "?"; break;
+            }
+            text += std::string("  ") + statistic.name + ": " + value + "\n";
+        }
+    }
+    return text;
 }
 
 SceneUniforms Application::buildSceneUniforms() {
@@ -631,6 +673,13 @@ SceneUniforms Application::buildSceneUniforms() {
     float sun = settings.sunEnabled ? settings.sunIntensity : 0.0f;
     float sky = settings.environment == static_cast<int>(Environment::Sky) ? settings.skyIntensity : 0.0f;
     uniforms.sunColor = glm::vec4(settings.sunColor * sun, 0.0f);
+    // The disc: its total light PI * sunColor (see tracePath) spread evenly over its solid angle. A disc of size 0
+    // can only be found by shadow rays.
+    float sunSolidAngle = 2.0f * glm::pi<float>() * (1.0f - uniforms.sunDirection.w);
+    uniforms.sunOn = glm::any(glm::greaterThan(glm::vec3(uniforms.sunColor), glm::vec3(0.0f))) ? 1 : 0;
+    uniforms.sunMis = uniforms.sunOn && sunSolidAngle > 1e-6f && settings.shadowsEnabled ? 1 : 0;
+    uniforms.sunPdf = 1.0f / std::max(sunSolidAngle, 1e-6f);
+    uniforms.sunRadianceScale = glm::pi<float>() / std::max(sunSolidAngle, 1e-4f);
     uniforms.skyZenithColor = glm::vec4(settings.skyZenithColor * sky, 0.0f);
     uniforms.skyHorizonColor = glm::vec4(settings.skyHorizonColor * sky, 0.0f);
     uniforms.groundColor = glm::vec4(settings.groundColor * sky, 0.0f);

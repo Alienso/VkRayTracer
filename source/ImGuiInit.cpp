@@ -207,6 +207,12 @@ void Application::buildDebugUi() {
 
     buildNoiseUi();
 
+    if (!rtPipelineStatistics.empty() && ImGui::CollapsingHeader("Trace shader (from the driver)")) {
+        ImGui::TextUnformatted(rtPipelineStatistics.c_str());
+        ImGui::TextDisabled("More registers per thread = fewer threads per SM at once, so waiting for rays\n"
+                            "and memory is hidden worse. Counts for the whole shader, even unused branches.");
+    }
+
     ImGui::Separator();
     ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
 }

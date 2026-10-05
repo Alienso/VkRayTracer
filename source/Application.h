@@ -64,6 +64,12 @@ struct SceneUniforms {
     float cacheMinWeight;            // samples a cell needs before it is used
     uint32_t cacheUpdateTile;        // one update path per cacheUpdateTile x cacheUpdateTile pixels
     uint32_t lightTree;              // 1 = light sampling picks glowing triangles with the light tree (LightPicking)
+    // Derived from the sun values above, once here instead of per pixel: kept in registers through the whole path,
+    // they made the trace shader slower (see updateUniforms)
+    uint32_t sunOn;                  // 1 = the sun gives light
+    uint32_t sunMis;                 // 1 = the sun has a size, so bounce rays find it too (MIS with its shadow rays)
+    float sunPdf;                    // 1 / the disc's solid angle: the pdf of a shadow ray towards it
+    float sunRadianceScale;          // sunColor times this = the light of one point of the disc (PI / solid angle)
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -283,6 +289,14 @@ struct SceneObject {
 // loses energy then looks exactly as bright as the background; anything darker shows where energy is lost.
 enum class Environment : int { Sky = 0, Map = 1, Black = 2, White = 3 };
 
+// Whether surfaces aim a shadow ray at the sky (see Environment.cpp). It costs a ray per bounce and pays off where the
+// sky has bright spots (an HDR map's sun); a smooth gradient is found about as well by the bounce rays alone.
+enum class SkySampling : int {
+    Auto = 0,  // HDR maps only
+    On = 1,
+    Off = 2
+};
+
 // How light from glowing (emissive) surfaces is found. All three converge to the same image; they differ in noise.
 enum class EmissiveSampling : int {
     BouncesOnly = 0,   // only when a bounce ray happens to hit a glowing surface (what we had before)
@@ -359,7 +373,7 @@ struct RenderSettings {
     int environmentMap = 0;            // index into Application::availableEnvironments
     float environmentRotation = 0.0f;  // degrees around the vertical axis
     float environmentIntensity = 1.0f;
-    bool skySampling = true;           // shadow rays towards the sky (see Environment.cpp)
+    int skySampling = static_cast<int>(SkySampling::Auto);  // shadow rays towards the sky (see Environment.cpp)
     bool punctualLights = true;        // the lights that came with the models (KHR_lights_punctual)
     float punctualLightScale = 1.0f;   // multiplies them all
 
@@ -560,6 +574,10 @@ private:
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
     VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
+    // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
+    // has it): registers per thread etc., for the Debug tab. Empty if not available.
+    bool pipelineStatisticsSupported = false;
+    std::string rtPipelineStatistics;
 
     // Radiance cache (RadianceCache.cpp): hash table of surface cells, on the GPU only
     static constexpr uint32_t cacheCapacity = 1u << 20;  // entries (40 MB in all)
@@ -834,6 +852,7 @@ private:
     void createRayTracingDescriptors();
     void updateRayTracingDescriptorSet();
     void createRayTracingPipeline();
+    std::string readPipelineStatistics(VkPipeline pipeline);
     SceneUniforms buildSceneUniforms();
     void recordInstanceMotionUpload(VkCommandBuffer commandBuffer);
     void createTimestampQueries();

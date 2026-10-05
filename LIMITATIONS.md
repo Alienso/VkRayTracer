@@ -141,8 +141,9 @@ Shadow rays pick sky directions by brightness alone. For an HDR map that is what
 samples): one-frame error vs bounce rays only, Bistro Exterior ~150x lower per ms, Bistro Interior ~3x. The
 gradient sky is brightest at the horizon and on the "ground" below it, which walls and floors usually block, so
 many of its shadow rays are wasted: Bistro Interior (windows) ~1.2x better per ms, Sponza about even (it costs
-1-1.5 ms more per frame there, the noise is the same). The "Sample the sky" checkbox switches it off.
-- Where: source/Environment.cpp (the table), `sampleEnvironment` and the "Direct skylight" part of `tracePath`.
+1-1.5 ms more per frame there, the noise is the same; Bistro Exterior by day 5-7 ms more). So "Sample the sky"
+defaults to Auto: HDR maps only. On samples the gradient too, Off never samples.
+- Where: source/Environment.cpp (the table), `sampleEnvironment` and the sky slot of the light loop in `tracePath`.
 - Fix: also weight by the surface's cosine (a few tables per normal direction), or learn which directions are
   open per region of the scene (path guiding).
 

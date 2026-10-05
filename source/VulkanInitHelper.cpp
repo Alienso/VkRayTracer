@@ -183,6 +183,23 @@ void Application::createLogicalDevice(){
     std::vector<const char*> extensions = Configuration::deviceExtensions;
     addStreamlineDeviceRequirements(extensions, vulkan12Features, vulkan13Features);
 
+    // Optional: the driver's statistics about compiled shaders (registers per thread, ...), see the Debug tab
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executableFeatures{};
+    executableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    executableFeatures.pipelineExecutableInfo = VK_TRUE;
+    uint32_t availableCount = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &availableCount, nullptr);
+    std::vector<VkExtensionProperties> available(availableCount);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &availableCount, available.data());
+    for (const VkExtensionProperties& extension : available) {
+        if (std::string(extension.extensionName) == VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) {
+            extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            executableFeatures.pNext = atomicFloatFeatures.pNext;
+            atomicFloatFeatures.pNext = &executableFeatures;
+            pipelineStatisticsSupported = true;
+        }
+    }
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vulkan13Features;

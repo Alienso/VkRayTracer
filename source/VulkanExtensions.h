@@ -18,7 +18,11 @@ namespace vkext {
     extern PFN_vkCmdWriteAccelerationStructuresPropertiesKHR vkCmdWriteAccelerationStructuresPropertiesKHR;
     extern PFN_vkCmdCopyAccelerationStructureKHR vkCmdCopyAccelerationStructureKHR;
 
-    // Loads all of the above; throws if any is missing.
+    // VK_KHR_pipeline_executable_properties (optional, debug info only: nullptr if the device doesn't have it)
+    extern PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR;
+    extern PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR;
+
+    // Loads all of the above; throws if a required one is missing.
     void load(VkDevice device);
 }
 

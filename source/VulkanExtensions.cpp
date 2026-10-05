@@ -14,6 +14,8 @@ namespace vkext {
     PFN_vkGetAccelerationStructureDeviceAddressKHR vkGetAccelerationStructureDeviceAddressKHR = nullptr;
     PFN_vkCmdWriteAccelerationStructuresPropertiesKHR vkCmdWriteAccelerationStructuresPropertiesKHR = nullptr;
     PFN_vkCmdCopyAccelerationStructureKHR vkCmdCopyAccelerationStructureKHR = nullptr;
+    PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR = nullptr;
+    PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR = nullptr;
 
     template<typename T>
     static void loadFunction(VkDevice device, T& function, const char* name) {
@@ -31,5 +33,10 @@ namespace vkext {
         loadFunction(device, vkGetAccelerationStructureDeviceAddressKHR, "vkGetAccelerationStructureDeviceAddressKHR");
         loadFunction(device, vkCmdWriteAccelerationStructuresPropertiesKHR, "vkCmdWriteAccelerationStructuresPropertiesKHR");
         loadFunction(device, vkCmdCopyAccelerationStructureKHR, "vkCmdCopyAccelerationStructureKHR");
+        // Optional: null when the extension wasn't enabled
+        vkGetPipelineExecutablePropertiesKHR = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+                vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
+        vkGetPipelineExecutableStatisticsKHR = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+                vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
     }
 }
