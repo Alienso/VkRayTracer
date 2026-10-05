@@ -23,6 +23,11 @@ public:
 
     void lookAt(const glm::vec3& target);
 
+    // Matrices matching the rays the path tracer shoots (Vulkan clip space: y down, depth 0..1), without jitter.
+    // Rays don't need them; motion vectors and DLSS do.
+    glm::mat4 viewMatrix() const;
+    glm::mat4 projectionMatrix(float aspectRatio, float nearPlane, float farPlane) const;
+
     // Applies keyboard/mouse input. Pass false for a device ImGui is currently using.
     void update(GLFWwindow* window, float deltaTime, bool keyboardAvailable, bool mouseAvailable);
 

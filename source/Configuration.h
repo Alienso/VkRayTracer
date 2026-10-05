@@ -14,6 +14,8 @@ public:
     static const int wHeight;
     static const float fov;
     static const float fovMax;
+    static const float cameraNear;  // projection matrix planes (motion vectors, DLSS); rays aren't clipped by them
+    static const float cameraFar;   // also the depth written where rays hit nothing (sky)
     static const std::vector<const char*> validationLayers;
     static const std::vector<const char*> deviceExtensions;
     static const bool enableValidationLayers;

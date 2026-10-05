@@ -10,10 +10,18 @@ layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
 // view). Exposure and tone mapping happen later, in display.comp.
 layout(binding = 1, rgba32f) uniform image2D radianceImage;
-layout(binding = 2, r32f) uniform writeonly image2D outDepth;     // hit distance along the ray, 0 = miss
+// DLSS inputs ("guides"), all about the first surface the camera ray hits; written only if scene.writeGuides
+layout(binding = 2, r32f) uniform writeonly image2D linearDepthImage;          // view-space depth, sky = farDistance
+layout(binding = 13, rg32f) uniform writeonly image2D motionVectorImage;       // pixels: last frame's position - this
+layout(binding = 14, rgba16f) uniform writeonly image2D diffuseAlbedoImage;
+layout(binding = 15, rgba16f) uniform writeonly image2D specularAlbedoImage;
+layout(binding = 16, rgba16f) uniform writeonly image2D normalRoughnessImage;  // world-space normal, roughness in alpha
+layout(binding = 17, r32f) uniform writeonly image2D specularHitDistanceImage; // 0 = unknown
 
 // Must match SceneUniforms in Application.h
 layout(binding = 3) uniform SceneUniforms {
+    mat4 viewProjection;          // this frame, without jitter: world -> clip (Vulkan: y down)
+    mat4 previousViewProjection;  // last frame's
     vec4 cameraPosition;
     vec4 cameraForward;
     vec4 cameraRight;
@@ -36,6 +44,8 @@ layout(binding = 3) uniform SceneUniforms {
     uint emissiveTriangleCount;
     uint emissiveSampling;  // 0 = bounces only, 1 = light sampling only, 2 = both with MIS
     uint blurCaustics;      // 1 = path regularization, see tracePath
+    float farDistance;      // depth written for rays that hit nothing
+    uint writeGuides;       // 1 = write the DLSS input images
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -104,6 +114,10 @@ layout(binding = 10, scalar) readonly buffer InstanceFirstLight { int instanceFi
 // How much light the GGX reflection returns in total (see createSpecularAlbedoTable in Materials.cpp):
 // entry [roughness * SIZE + view angle], total for a given F0 = F0 * x + y.
 layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
+
+// Per TLAS instance: takes a point on it from this frame's world position to last frame's (object motion).
+// Identity for objects that didn't move.
+layout(binding = 12, scalar) readonly buffer InstanceMotion { mat4 instanceMotion[]; };
 const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
@@ -159,6 +173,7 @@ struct Hit {
     vec3 tangent;           // world space, only for the debug view
     vec2 uv;
     uint meshIndex;
+    uint instanceIndex;     // which TLAS instance (for its motion)
     uint materialIndex;
     int lightIndex;         // this triangle in emissiveTriangles, -1 if it doesn't glow
     bool frontFace;         // hit from the outside (the side the normals point to)
@@ -275,6 +290,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
     // The ray query only tells us WHICH instance and triangle was hit and WHERE on it (barycentrics).
     // Everything else we look up in our own buffers. The custom index was set to the mesh index in the TLAS.
     hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+    hit.instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
     MeshInfo mesh = meshInfos[hit.meshIndex];
     int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
     uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
@@ -585,13 +601,15 @@ vec3 sampleGgxVisibleNormal(vec3 v, float alpha, vec2 u) {
 // lobeRoughness: how spread out the picked layer is (the diffuse layer counts as fully rough).
 // transmitted: the path went through the surface (l.z < 0). Then pdf is meaningless (not used for MIS) and
 // weight is simply the transmitted share of the light: the direction follows the visible microfacets.
+// specularLobe: a reflection or transmission was picked, not the diffuse layer (for the DLSS hit distance).
 bool sampleBrdf(Hit hit, vec3 v, inout uint seed, out vec3 l, out vec3 weight, out float pdf,
-                out float lobeRoughness, out bool transmitted) {
+                out float lobeRoughness, out bool transmitted, out bool specularLobe) {
     float u0 = randomFloat(seed);
     vec2 u = vec2(randomFloat(seed), randomFloat(seed));
     ReflectionEnergy energy = reflectionEnergy(hit, v.z);
     LobeProbabilities p = lobeProbabilities(hit, energy);
     transmitted = false;
+    specularLobe = u0 < p.transmission + p.specular;
 
     if (u0 < p.transmission) {
         // Through the surface. A rough surface spreads the direction like it spreads reflections.
@@ -844,8 +862,52 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
 
 // ---------------------------------------------------------------------------------------------
 
+// DLSS inputs
+
+// What DLSS needs to know about the first surface a camera ray hits (see the images at the top)
+struct Guides {
+    float viewDepth;
+    vec2 motion;
+    vec3 diffuseAlbedo;
+    vec3 specularAlbedo;
+    vec4 normalRoughness;
+    float specularHitDistance;
+};
+
+// Pixel position of a world-space point (w = 1) or direction (w = 0, a point infinitely far away) on the image
+vec2 projectToPixel(mat4 viewProjection, vec4 point) {
+    vec4 clip = viewProjection * point;
+    vec2 ndc = clip.xy / clip.w;
+    return (ndc * 0.5 + 0.5) * vec2(imageSize(radianceImage));
+}
+
+// Motion vector: where the point was on the image last frame minus where it is now, both without jitter.
+// A point behind last frame's camera has no sensible position: no motion then.
+vec2 motionVector(vec4 current, vec4 previous) {
+    if ((scene.previousViewProjection * previous).w <= 0.0) {
+        return vec2(0.0);
+    }
+    return projectToPixel(scene.previousViewProjection, previous) - projectToPixel(scene.viewProjection, current);
+}
+
+// Rays that hit nothing: far away, moving only with the camera's rotation. Diffuse albedo 1, so the sky's light
+// passes unchanged if DLSS divides by it. The normal faces the camera (DLSS wants a normalized one).
+Guides skyGuides(vec3 direction) {
+    Guides guides;
+    guides.viewDepth = scene.farDistance;
+    guides.motion = motionVector(vec4(direction, 0.0), vec4(direction, 0.0));
+    guides.diffuseAlbedo = vec3(1.0);
+    guides.specularAlbedo = vec3(0.0);
+    guides.normalRoughness = vec4(-direction, 1.0);
+    guides.specularHitDistance = 0.0;
+    return guides;
+}
+
+// ---------------------------------------------------------------------------------------------
+
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
-vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHitDistance) {
+// guides: the DLSS inputs, from the first hit (and the distance to the second if the first bounce reflected).
+vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) {
     vec3 sunDirection = scene.sunDirection.xyz;
     float sunCosRadius = scene.sunDirection.w;
 
@@ -861,7 +923,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
 
     vec3 radiance = vec3(0.0);    // light collected along this path
     vec3 throughput = vec3(1.0);  // fraction of light found further along that still reaches the camera
-    primaryHitDistance = 0.0;
+    // The guides cost a little at the first hit (projections, albedos); skipped when nobody reads them.
+    bool wantGuides = scene.writeGuides != 0;
+    if (wantGuides) {
+        guides = skyGuides(direction);
+    }
+    bool firstBounceSpecular = false;  // the bounce ray leaving the first hit came from a reflection/transmission
     float bouncePdf = 0.0;        // pdf of the bounce direction that led to the current hit (for MIS)
     float pathRoughness = 0.0;    // roughest reflection along the path so far (for blurCaustics)
     bool sampleLights = scene.emissiveTriangleCount > 0 && scene.emissiveSampling != EMISSIVE_BOUNCES_ONLY;
@@ -880,6 +947,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
     // by bouncing would be one bounce short, and the methods wouldn't agree.
     for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
         Hit hit = traceClosest(origin, direction, seed);
+        if (bounce == 1 && firstBounceSpecular) {
+            guides.specularHitDistance = hit.found ? hit.t : scene.farDistance;
+        }
 
         if (!hit.found) {
             radiance += throughput * environmentLight(direction);
@@ -893,8 +963,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
             }
             break;
         }
-        if (bounce == 0) {
-            primaryHitDistance = hit.t;
+        if (bounce == 0 && wantGuides) {
+            // A point on an object that moved is reprojected with the object's own motion as well
+            vec4 previousPosition = instanceMotion[hit.instanceIndex] * vec4(hit.position, 1.0);
+            guides.viewDepth = hit.t * dot(direction, scene.cameraForward.xyz);
+            guides.motion = motionVector(vec4(hit.position, 1.0), previousPosition);
         }
 
         // Leaving a solid from the inside: the ray just travelled hit.t through it, losing light (Beer's law).
@@ -950,10 +1023,23 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
         ShadingFrame frame = makeShadingFrame(hit.normal);
         vec3 v = toLocal(frame, towardsViewer);
 
+        if (bounce == 0 && wantGuides) {
+            // The albedos split the surface's response the way evaluateBrdf does: the diffuse layer gets what the
+            // (energy compensated) reflection doesn't return; light going through glass counts as specular
+            // (it stays sharp, like a reflection).
+            ReflectionEnergy energy = reflectionEnergy(hit, v.z);
+            vec3 base = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * hit.albedo;
+            guides.diffuseAlbedo = base * (1.0 - hit.transmission);
+            guides.specularAlbedo = mix(vec3(energy.dielectricAlbedo), energy.metalAlbedo, hit.metallic)
+                                    + base * hit.transmission;
+            guides.normalRoughness = vec4(hit.normal, hit.roughness);
+        }
+
         vec3 l;
         vec3 weight = vec3(1.0);
         float lobeRoughness = hit.roughness;
         bool transmitted = false;
+        bool specularLobe = true;
         bool leavingGlass = hit.solid && !hit.frontFace && hit.transmission > 0.0;
         if (leavingGlass) {
             // Inside glass there is nothing to light-sample: lights are outside, behind the glass surface.
@@ -990,11 +1076,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out float primaryHi
 
             // Indirect light: continue the path in a direction picked by the surface's reflection (mostly where
             // it reflects the most light), or through it. The throughput is multiplied by BRDF * cos / pdf.
-            if (!sampleBrdf(hit, v, seed, l, weight, bouncePdf, lobeRoughness, transmitted)) {
+            if (!sampleBrdf(hit, v, seed, l, weight, bouncePdf, lobeRoughness, transmitted, specularLobe)) {
                 break;
             }
         }
         pathRoughness = max(pathRoughness, lobeRoughness);
+        if (bounce == 0 && wantGuides) {
+            firstBounceSpecular = specularLobe;
+        }
         direction = toWorld(frame, l);
         // Around the smooth normal, a direction can still end up on the wrong side of the actual triangle.
         // Such a path ends: on the real surface, this light would be blocked.
@@ -1041,9 +1130,8 @@ vec3 randomColor(uint value) {
 }
 
 // Shows one property of the first surface hit, to check that the mesh and material data arrive correctly.
-vec3 debugColor(vec3 direction, inout uint seed, out float depth) {
+vec3 debugColor(vec3 direction, inout uint seed) {
     Hit hit = traceClosest(scene.cameraPosition.xyz, direction, seed);
-    depth = hit.found ? hit.t : 0.0;
     if (!hit.found) {
         return vec3(0.0);
     }
@@ -1073,10 +1161,8 @@ void main() {
     uint seed = pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(scene.frameIndex)));
 
     if (scene.debugView != 0) {
-        float depth;
-        vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed, depth);
+        vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed);
         imageStore(radianceImage, pixel, vec4(color, 1.0));
-        imageStore(outDepth, pixel, vec4(depth));
         return;
     }
 
@@ -1085,16 +1171,16 @@ void main() {
     bool randomOffset = scene.samplesPerPixel > 1 || scene.accumulate != 0;
 
     vec3 color = vec3(0.0);
-    float depth = 0.0;
+    Guides guides;
 
     for (uint s = 0; s < scene.samplesPerPixel; s++) {
         vec2 offset = randomOffset ? vec2(randomFloat(seed), randomFloat(seed)) - 0.5 : vec2(0.0);
         vec3 direction = cameraRayDirection(vec2(pixel) + 0.5 + offset, size);
 
-        float hitDistance;
-        color += tracePath(scene.cameraPosition.xyz, direction, seed, hitDistance);
+        Guides sampleGuides;
+        color += tracePath(scene.cameraPosition.xyz, direction, seed, sampleGuides);
         if (s == 0) {
-            depth = hitDistance;
+            guides = sampleGuides;  // DLSS gets one sample per pixel anyway
         }
     }
     color /= float(scene.samplesPerPixel);
@@ -1107,5 +1193,13 @@ void main() {
     // Stays linear and unbounded. Exposure and tone mapping only affect the displayed image (display.comp),
     // so changing them does not restart accumulation.
     imageStore(radianceImage, pixel, vec4(color, 1.0));
-    imageStore(outDepth, pixel, vec4(depth));
+
+    if (scene.writeGuides != 0) {
+        imageStore(linearDepthImage, pixel, vec4(guides.viewDepth));
+        imageStore(motionVectorImage, pixel, vec4(guides.motion, 0.0, 0.0));
+        imageStore(diffuseAlbedoImage, pixel, vec4(guides.diffuseAlbedo, 1.0));
+        imageStore(specularAlbedoImage, pixel, vec4(guides.specularAlbedo, 1.0));
+        imageStore(normalRoughnessImage, pixel, guides.normalRoughness);
+        imageStore(specularHitDistanceImage, pixel, vec4(guides.specularHitDistance));
+    }
 }

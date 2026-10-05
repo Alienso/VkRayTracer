@@ -115,6 +115,8 @@ Textures are always read at full resolution (a compute shader has no screen deri
 alias; accumulation averages it out, single frames shimmer.
 - Where: `sampleTexture` (shader), `uploadNewTextures` (source/Materials.cpp).
 - Fix: generate mipmaps + ray cones (or ray differentials) to pick a level.
+- Phase 7: the DLSS albedo guides alias the same way (visible in the "DLSS input: reprojection error" view
+  as noise on textured surfaces whenever the sample position moves by a fraction of a pixel).
 
 ### Unsupported glTF features
 - Second UV set (`TEXCOORD_1`): the first set is used instead (a warning is printed).
@@ -133,7 +135,7 @@ Only glTF / GLB is loaded.
 The exposure is measured from the finished HDR image and applied by the display pass in the same frame.
 Like a real light meter, it maps the average to middle grey, so a mostly white scene
 (the sunlit default floor) comes out greyer than with a hand-picked exposure; use Compensation. The
-histogram covers luminance 2^-20 .. 2^12; darker pixels count as black and are not metered. While
+histogram covers luminance 2^-16 .. 2^12; darker pixels count as black and are not metered. While
 accumulating, the measurement comes from the averaged image, so early noisy frames may meter slightly
 differently from the converged result.
 - Where: shaders/exposure.comp, source/Exposure.cpp (applied in shaders/display.comp).
@@ -149,15 +151,57 @@ appears at the same moment. Not the cause: the present mode (IMMEDIATE is affect
 forced), DXGI or a D3D12 device in the process (tested without Streamline: no cap), the DLSS plugin or model
 (also capped with no features requested), and the "Vulkan/OpenGL present method" setting.
 - Workaround: NVIDIA Control Panel > Manage 3D settings > Program Settings > add `vulkanDemo.exe` >
-  Vertical sync = Off.
+  Vertical sync = Off. Or start with `--no-dlss` when DLSS isn't needed.
 - Where: `initStreamline` (source/Dlss.cpp).
+
+### Specular hit distance is often unknown
+DLSS gets the distance from the first surface to what its reflection (or refraction) shows. It comes for free
+from the path's first bounce, but only when that bounce picked the reflection; when it picked the diffuse
+layer the value is 0 (unknown). Shiny surfaces get it almost everywhere, rough ones in roughly 1 of 10 pixels.
+- Where: tracePath in shaders/raytrace.comp (`firstBounceSpecular`).
+- Fix (if DLSS reflections smear): trace one extra reflection ray from the first hit just for the distance,
+  or provide specular motion vectors instead.
 
 ### Streamline costs about 0.28 ms per frame even when unused
 With Streamline loaded (vsync off), the helmet scene takes 1.57 ms per frame instead of 1.29 ms, although no
 Streamline function is called per frame yet. Likely the driver's handling of "DLSS games" (its overlay and
 telemetry DLLs get loaded into the process); not investigated further. Small next to the DLSS evaluation itself.
-- Fix: make Streamline optional at startup (it must be decided before the Vulkan instance is created).
+- Workaround: start with `--no-dlss` (Streamline isn't loaded at all; no DLSS modes then).
 - Where: `initStreamline` (source/Dlss.cpp).
+
+### DLSS RR darkens Sponza's shade a little
+In Sponza DLSS RR comes out darker than the accumulated reference: ~7% on sunlit walls and ~17% under the
+arches, where the light only arrives bounced. ACES' toe makes the shade look darker still (nearly black under
+the big arch). Not changed by 4 samples per pixel, by `exposureScale` (146 vs 1), by leaving out the specular
+hit distance, or by moving everything into the diffuse albedo. The other test scenes (helmet, Cornell box,
+dragon, glass) match the reference within ~1/255. Probably DLSS's firefly suppression costing energy where the
+noisy input consists of rare bright samples.
+- Where: DLSS itself (source/Dlss.cpp only passes the inputs).
+- Workarounds to try: more light paths per pixel for that light (e.g. a firefly-free estimator for the bounce
+  from the sunlit floor), or exposure compensation in DLSS modes.
+
+### The CNN models need a restart with --dlss-cnn
+The CNN models (presets A-C) only exist in DLSS RR 310.3.0, the transformer F only in 310.9.1, and a process can
+load only one `nvngx_dlssd.dll`. The default loads 310.9.1 (transformer D-F); `--dlss-cnn` loads 310.3.0 (CNN A-C,
+transformer D-E). The model combo greys out what the loaded version doesn't have.
+- Where: `initStreamline` (plugin folder `dlss/transformer` or `dlss/cnn`), `lib/streamline/`.
+
+### NGX reports two validation errors when DLSS starts (310.9.1 only)
+Each time DLSS 310.9.1 creates its resources (first frame in a DLSS mode, after a mode, model or size change),
+the validation layer reports `VUID-vkCmdDraw-None-09600` for two of NGX's own images ("nv.ngx.dlssd.resource",
+used in GENERAL while still UNDEFINED). Inside NVIDIA's code; calling `slAllocateResources` explicitly doesn't
+change it, and 310.3.0 (`--dlss-cnn`) doesn't do it. Harmless as far as visible.
+
+### DLSS RR is expensive on an RTX 3070
+At 1600x900 output the transformer models take ~8.5 ms (DLAA), ~4.5 ms (Quality), ~3.2 ms (Performance), more
+than the path tracing at those render sizes (helmet scene 0.5-1.8 ms, Sponza 1.7-7.2 ms); they are meant for
+newer GPUs. The CNN models (DLSS model combo) take about half (Quality: ~2.2-2.4 ms) and look a little softer.
+Tables in PHASE7_PLAN.md.
+
+### Streamline warns that it can't hook some Vulkan commands
+`Hook sl.common:Vulkan:CmdBindPipeline / CmdBindDescriptorSets / BeginCommandBuffer is NOT supported`: with
+manual hooking Streamline can't track command buffer state, which is why we must restore our own bindings
+after `slEvaluateFeature` (our exposure and display passes bind theirs anyway). Expected with manual hooking.
 
 ### Startup takes about 3 seconds longer
 `slInit` queries NGX (the driver's DLSS runtime) for its requirements, which is slow.

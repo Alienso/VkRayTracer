@@ -11,15 +11,37 @@
 #include <stdexcept>
 #include <string>
 #include "Application.h"
+#include "Configuration.h"
 
 std::vector<char> readFile(const std::string& filename);
 
 static const VkFormat displayFormat = VK_FORMAT_R8G8B8A8_UNORM;
+// Same format as the radiance image, so exposure and display read either through the same descriptors
+static const VkFormat dlssOutputFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 
-// Output = the window. Render = what the path tracer traces; the same for now (DLSS will render smaller).
+// Output = the window. Render = what the path tracer traces: the same in accumulation mode, smaller in the DLSS
+// modes (the size DLSS asks for, e.g. 67% per axis for Quality).
 void Application::chooseExtents() {
     outputExtent = swapChainExtent;
-    renderExtent = outputExtent;
+    renderExtent = dlssActive() ? dlssRenderExtent(activeRenderMode, outputExtent) : outputExtent;
+}
+
+// Everything whose size depends on the window or the render mode. The GPU must be idle.
+void Application::recreateRenderImages() {
+    destroyRayTracingImages();
+    destroyDisplayImages();
+    chooseExtents();
+    createRayTracingImages();
+    createDisplayImages();
+    updateRayTracingDescriptorSet();
+    updateExposureDescriptorSet();
+    updateDisplayDescriptorSet();
+    resetAccumulation = true;
+    dlssReset = true;
+}
+
+VkImageView Application::displayedHdrView() const {
+    return dlssActive() ? dlssOutputImage.view : radianceImageView;
 }
 
 void Application::createDisplayImages() {
@@ -34,30 +56,57 @@ void Application::createDisplayImages() {
     createImage(outputExtent.width, outputExtent.height, displayFormat,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                 displayImage, displayImageMemory, displayImageView);
+
+    // DLSS modes: where DLSS writes the denoised, upscaled frame. Stays in GENERAL.
+    if (dlssActive()) {
+        createImage(outputExtent, dlssOutputFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    dlssOutputImage);
+        immediateSubmit([&](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = dlssOutputImage.image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        });
+    }
 }
 
 void Application::destroyDisplayImages() {
     vkDestroyImageView(device, displayImageView, nullptr);
     vkDestroyImage(device, displayImage, nullptr);
     vkFreeMemory(device, displayImageMemory, nullptr);
+    if (dlssOutputImage.image != VK_NULL_HANDLE) {
+        destroyImage(dlssOutputImage);
+    }
 }
 
+// Descriptors: 0 = HDR image (read: DLSS output or the radiance image), 1 = display image (write),
+// 2 = exposure state (read), 3-9 = the DLSS input images and the history image (read, for the guide debug views),
+// 10 = the radiance image at render size (read, for the trace shader's debug views)
+static const uint32_t displayBindingCount = 11;
+
 void Application::createDisplayResources() {
-    // Descriptors: 0 = HDR image (read), 1 = display image (write), 2 = exposure state (read)
-    VkDescriptorSetLayoutBinding bindings[3] = {
-            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-    };
+    VkDescriptorSetLayoutBinding bindings[displayBindingCount];
+    for (uint32_t i = 0; i < displayBindingCount; i++) {
+        VkDescriptorType type = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i] = {i, type, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    }
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 3;
+    layoutInfo.bindingCount = displayBindingCount;
     layoutInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &displayDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display descriptor set layout!");
     }
 
-    VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, displayBindingCount - 1},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
@@ -102,25 +151,32 @@ void Application::createDisplayResources() {
     vkDestroyShaderModule(device, shaderModule, nullptr);
 }
 
-// Both images are recreated with the swapchain; called from recreateSwapChain.
+// The images are recreated with the swapchain; called from recreateSwapChain.
 void Application::updateDisplayDescriptorSet() {
-    VkDescriptorImageInfo hdrInfo{VK_NULL_HANDLE, radianceImageView, VK_IMAGE_LAYOUT_GENERAL};
-    VkDescriptorImageInfo displayInfo{VK_NULL_HANDLE, displayImageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkImageView views[displayBindingCount] = {
+            displayedHdrView(), displayImageView, VK_NULL_HANDLE,
+            linearDepthImage.view, motionVectorImage.view, diffuseAlbedoImage.view, specularAlbedoImage.view,
+            normalRoughnessImage.view, specularHitDistanceImage.view, guideHistoryImage.view,
+            radianceImageView,
+    };
+    VkDescriptorImageInfo imageInfos[displayBindingCount]{};
     VkDescriptorBufferInfo exposureInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet writes[3]{};
-    for (int i = 0; i < 3; i++) {
+    VkWriteDescriptorSet writes[displayBindingCount]{};
+    for (uint32_t i = 0; i < displayBindingCount; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = displayDescriptorSet;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
+        if (i == 2) {
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &exposureInfo;
+        } else {
+            imageInfos[i] = {VK_NULL_HANDLE, views[i], VK_IMAGE_LAYOUT_GENERAL};
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i].pImageInfo = &imageInfos[i];
+        }
     }
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[0].pImageInfo = &hdrInfo;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &displayInfo;
-    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[2].pBufferInfo = &exposureInfo;
-    vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device, displayBindingCount, writes, 0, nullptr);
 }
 
 // Recorded after the trace and the exposure measurement. displayImage is already in GENERAL (transitioned at the
@@ -140,13 +196,44 @@ void Application::recordDisplay(VkCommandBuffer commandBuffer) {
     push.exposure = settings.autoExposure ? std::exp2(settings.exposureCompensation) : settings.exposure;
     push.autoExposure = settings.autoExposure ? 1 : 0;
     push.toneMapping = settings.toneMapping ? 1 : 0;
-    push.passThrough = settings.debugView != static_cast<int>(DebugView::None) ? 1 : 0;
+    // Guide views map one to one onto DisplayView, starting at Depth
+    DisplayView view = DisplayView::Color;
+    if (isGuideView(settings.debugView)) {
+        view = static_cast<DisplayView>(static_cast<uint32_t>(DisplayView::Depth) + settings.debugView
+                                        - static_cast<int>(DebugView::GuideDepth));
+    } else if (settings.debugView != static_cast<int>(DebugView::None)) {
+        view = DisplayView::PassThrough;
+    }
+    push.view = static_cast<uint32_t>(view);
+    push.farDistance = Configuration::cameraFar;
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipelineLayout, 0, 1,
                             &displayDescriptorSet, 0, nullptr);
     vkCmdPushConstants(commandBuffer, displayPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(commandBuffer, (outputExtent.width + 7) / 8, (outputExtent.height + 7) / 8, 1);
+
+    // Reprojection error view: keep this frame's diffuse albedo for the next frame to compare against.
+    // (The display pass above has read the old history; the trace shader wrote the diffuse albedo before that.)
+    if (view == DisplayView::ReprojectionError) {
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+        VkImageCopy copy{};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = {renderExtent.width, renderExtent.height, 1};
+        vkCmdCopyImage(commandBuffer, diffuseAlbedoImage.image, VK_IMAGE_LAYOUT_GENERAL,
+                       guideHistoryImage.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        // Next frame: the display pass reads the history (the frame-start barrier covers the trace's writes)
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
 }
 
 void Application::destroyDisplayResources() {

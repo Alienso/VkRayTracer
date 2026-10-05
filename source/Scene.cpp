@@ -218,7 +218,7 @@ static VkTransformMatrixKHR toVkTransform(const glm::mat4& m) {
 void Application::updateScene() {
     // 1: a model was loaded -> new geometry buffers and BLASes. Rare, so simply wait for the GPU.
     if (geometryDirty) {
-        vkDeviceWaitIdle(device);
+        vkp.deviceWaitIdle(device);
         if (geometryUploaded) {
             destroySceneGeometry();
         }
@@ -232,6 +232,7 @@ void Application::updateScene() {
         geometryUploaded = true;
         geometryDirty = false;
         builtInstances.clear();  // instances point at the old BLASes: the TLAS must be rebuilt
+        dlssReset = true;        // a different scene: DLSS's history is useless
         if (rtDescriptorSet != VK_NULL_HANDLE) {
             updateRayTracingDescriptorSet();
         }
@@ -240,13 +241,18 @@ void Application::updateScene() {
     // 2: objects -> TLAS instances. An object becomes one instance per part of its model.
     frameInstances.clear();
     frameInstanceTransforms.clear();
+    frameInstanceMotion.clear();
     frameInstanceMeshes.clear();
     primitiveCount = 0;
     for (SceneObject& object : sceneObjects) {
         glm::mat4 objectTransform = object.transform();
-        // object.previousTransform still holds last frame's transform here; Phase 7 turns the difference
-        // into motion vectors.
+        // Motion vectors need where each point was last frame. A part's world matrix is object * fit * part,
+        // and only the object's transform changes, so for all parts alike:
+        // last frame's position = previous object transform * inverse(current) * this frame's position.
+        glm::mat4 motion = object.hasPreviousTransform ? object.previousTransform * glm::inverse(objectTransform)
+                                                       : glm::mat4(1.0f);
         object.previousTransform = objectTransform;
+        object.hasPreviousTransform = true;
         if (!object.visible) {
             continue;
         }
@@ -273,6 +279,7 @@ void Application::updateScene() {
             instance.accelerationStructureReference = blases[part.meshIndex].address;
             frameInstances.push_back(instance);
             frameInstanceTransforms.push_back(world);
+            frameInstanceMotion.push_back(motion);
             frameInstanceMeshes.push_back(part.meshIndex);
             primitiveCount += meshInfos[part.meshIndex].indexCount / 3;
         }
@@ -281,7 +288,7 @@ void Application::updateScene() {
     // 3: not enough room in the TLAS -> make a bigger one. Its handle changes, so the descriptor set
     //    must be updated, which is only allowed while no frame uses it.
     if (frameInstances.size() > tlasCapacity) {
-        vkDeviceWaitIdle(device);
+        vkp.deviceWaitIdle(device);
         uint32_t newCapacity = std::max(static_cast<uint32_t>(frameInstances.size()), tlasCapacity * 2);
         destroyTopLevelAccelerationStructure();
         createTopLevelAccelerationStructure(newCapacity);
@@ -304,7 +311,7 @@ void Application::updateScene() {
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
         VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();
         if (trianglesSize > emissiveTriangleBuffer.capacity || offsetsSize > instanceLightBuffer.capacity) {
-            vkDeviceWaitIdle(device);  // the buffers are replaced, no frame may use them
+            vkp.deviceWaitIdle(device);  // the buffers are replaced, no frame may use them
             ensureStreamedCapacity(emissiveTriangleBuffer, trianglesSize);
             ensureStreamedCapacity(instanceLightBuffer, offsetsSize);
             if (rtDescriptorSet != VK_NULL_HANDLE) {

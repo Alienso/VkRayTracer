@@ -18,9 +18,12 @@
 std::vector<char> readFile(const std::string& filename);
 
 // Histogram range in stops (log2 of luminance). Darker counts as black and isn't metered; brighter lands in
-// the top bin (the sun disc is about 2^10). 32 stops in 255 bins = an eighth of a stop per bin.
-static const float histogramMinLog2 = -20.0f;
-static const float histogramLog2Range = 32.0f;
+// the top bin (the sun disc is about 2^10). 28 stops in 255 bins = a ninth of a stop per bin.
+// The black level 2^-16 sits far below anything the exposure limits can brighten to middle grey (+10 stops:
+// 0.18 / 1024 ~ 2^-12.5). It has to be above zero-ish noise: DLSS's output for a black background is ~2^-19.6,
+// which metered as "very dark" pushed the exposure of the Cornell box to +7 stops.
+static const float histogramMinLog2 = -16.0f;
+static const float histogramLog2Range = 28.0f;
 
 void Application::createExposureResources() {
     // State buffer: histogram counters start at 0, the exposure at 1 (used by the very first frame)
@@ -107,9 +110,9 @@ void Application::createExposureResources() {
     vkDestroyShaderModule(device, shaderModule, nullptr);
 }
 
-// The HDR image is recreated with the swapchain; called from recreateSwapChain.
+// The HDR image is recreated with the swapchain and the render mode; called from recreateRenderImages.
 void Application::updateExposureDescriptorSet() {
-    VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, radianceImageView, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, displayedHdrView(), VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bufferInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet writes[2]{};
     for (int i = 0; i < 2; i++) {

@@ -55,23 +55,30 @@ add_custom_command(TARGET vulkanDemo PRE_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${PROJECT_SOURCE_DIR}/resource $<TARGET_FILE_DIR:vulkanDemo>)
 
-# NVIDIA Streamline (DLSS Ray Reconstruction): loaded at runtime from next to the executable.
+# NVIDIA Streamline (DLSS Ray Reconstruction): loaded at runtime. sl.interposer.dll goes next to the executable, the
+# plugins into dlss/transformer (current DLSS RR, transformer models) and dlss/cnn (older DLSS RR that still has the
+# CNN models, picked with --dlss-cnn); NGX loads nvngx_dlssd.dll from next to the plugins.
 # lib/streamline is not in git (download_streamline.ps1 fetches it); without it the app runs without DLSS.
-set(STREAMLINE_DLLS
-        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.interposer.dll
-        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.common.dll
-        ${PROJECT_SOURCE_DIR}/lib/streamline/sl.dlss_d.dll
-        ${PROJECT_SOURCE_DIR}/lib/streamline/nvngx_dlssd.dll
-        ${PROJECT_SOURCE_DIR}/lib/streamline/NvLowLatencyVk.dll)
+set(STREAMLINE_DIR ${PROJECT_SOURCE_DIR}/lib/streamline)
+set(STREAMLINE_PLUGIN_FILES sl.common.dll sl.dlss_d.dll NvLowLatencyVk.dll nvngx_dlssd.dll)
 set(STREAMLINE_FOUND TRUE)
-foreach (dll ${STREAMLINE_DLLS})
-    if (NOT EXISTS ${dll})
+foreach (file sl.interposer.dll transformer/nvngx_dlssd.dll cnn/nvngx_dlssd.dll)
+    if (NOT EXISTS ${STREAMLINE_DIR}/${file})
         set(STREAMLINE_FOUND FALSE)
     endif ()
 endforeach ()
 if (STREAMLINE_FOUND)
     add_custom_command(TARGET vulkanDemo PRE_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${STREAMLINE_DLLS} $<TARGET_FILE_DIR:vulkanDemo>)
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${STREAMLINE_DIR}/sl.interposer.dll $<TARGET_FILE_DIR:vulkanDemo>)
+    foreach (folder transformer cnn)
+        set(files)
+        foreach (file ${STREAMLINE_PLUGIN_FILES})
+            list(APPEND files ${STREAMLINE_DIR}/${folder}/${file})
+        endforeach ()
+        add_custom_command(TARGET vulkanDemo PRE_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vulkanDemo>/dlss/${folder}
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${files} $<TARGET_FILE_DIR:vulkanDemo>/dlss/${folder})
+    endforeach ()
 else ()
     message(WARNING "Streamline DLLs missing in lib/streamline: DLSS will be unavailable. "
             "Run: powershell -ExecutionPolicy Bypass -File download_streamline.ps1")

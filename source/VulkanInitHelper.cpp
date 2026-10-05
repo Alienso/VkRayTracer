@@ -181,6 +181,8 @@ void Application::createLogicalDevice(){
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vulkan13Features;
+    // Storage images with 1 or 2 channels (rg32f motion vectors for DLSS) count as "extended formats"
+    features2.features.shaderStorageImageExtendedFormats = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -251,13 +253,13 @@ void Application::createSwapChain() {
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = VK_NULL_HANDLE;
 
-    if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapChain) != VK_SUCCESS) {
+    if (vkp.createSwapchain(device, &createInfo, nullptr, &swapChain) != VK_SUCCESS) {
         throw std::runtime_error("failed to create swap chain!");
     }
 
-    vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
+    vkp.getSwapchainImages(device, swapChain, &imageCount, nullptr);
     swapChainImages.resize(imageCount);
-    vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+    vkp.getSwapchainImages(device, swapChain, &imageCount, swapChainImages.data());
 
     swapChainImageFormat = surfaceFormat.format;
     swapChainExtent = extent;
@@ -483,23 +485,17 @@ void Application::recreateSwapChain() {
         glfwWaitEvents();
     }
 
-    vkDeviceWaitIdle(device);
+    vkp.deviceWaitIdle(device);
 
     cleanupSwapChain();
     destroyRenderFinishedSemaphores();
-    destroyRayTracingImages();
-    destroyDisplayImages();
 
     createSwapChain();
     createImageViews();
     createFramebuffers();
     createRenderFinishedSemaphores();
-    chooseExtents();
-    createRayTracingImages();
-    createDisplayImages();
-    updateRayTracingDescriptorSet();
-    updateExposureDescriptorSet();
-    updateDisplayDescriptorSet();
+    freeDlssResources();  // DLSS can't change its sizes on the fly; it starts over on the next evaluate
+    recreateRenderImages();
 }
 
 void Application::cleanupSwapChain() {
@@ -509,7 +505,7 @@ void Application::cleanupSwapChain() {
     for (auto imageView : swapChainImageViews) {
         vkDestroyImageView(device, imageView, nullptr);
     }
-    vkDestroySwapchainKHR(device, swapChain, nullptr);
+    vkp.destroySwapchain(device, swapChain, nullptr);
 }
 
 bool checkValidationLayerSupport() {
@@ -629,7 +625,8 @@ bool checkDeviceFeatureSupport(VkPhysicalDevice device) {
 
     vkGetPhysicalDeviceFeatures2(device, &features2);
 
-    return vulkan12Features.bufferDeviceAddress &&
+    return features2.features.shaderStorageImageExtendedFormats &&
+           vulkan12Features.bufferDeviceAddress &&
            vulkan12Features.descriptorIndexing &&
            vulkan12Features.runtimeDescriptorArray &&
            vulkan12Features.shaderSampledImageArrayNonUniformIndexing &&

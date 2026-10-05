@@ -4,6 +4,8 @@
 // Display pass: exposure and tone mapping. Turns the linear HDR image (path traced; later DLSS output) into the
 // 8-bit image that gets blitted to the swapchain. Kept out of the trace shader so that whatever sits between
 // the two (DLSS) gets linear, unbounded input. One thread per output pixel, in 8x8 tiles.
+//
+// Also draws the guide debug views: the DLSS input images exactly as the trace shader wrote them.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;
@@ -14,20 +16,100 @@ layout(binding = 2, scalar) readonly buffer ExposureState {
     uint exposureHistograms[512];
     float measuredExposure;
 };
+// DLSS inputs, render size (see the trace shader)
+layout(binding = 3, r32f) uniform readonly image2D linearDepthImage;
+layout(binding = 4, rg32f) uniform readonly image2D motionVectorImage;
+layout(binding = 5, rgba16f) uniform readonly image2D diffuseAlbedoImage;
+layout(binding = 6, rgba16f) uniform readonly image2D specularAlbedoImage;
+layout(binding = 7, rgba16f) uniform readonly image2D normalRoughnessImage;
+layout(binding = 8, r32f) uniform readonly image2D specularHitDistanceImage;
+layout(binding = 9, rgba16f) uniform readonly image2D historyImage;  // last frame's diffuse albedo
+layout(binding = 10, rgba32f) uniform readonly image2D radianceImage;  // the trace shader's output, render size
 
 // Must match DisplayPushConstants in Application.h
 layout(push_constant) uniform DisplaySettings {
     float exposure;     // manual multiplier, or the compensation (2^stops) on top of the measured exposure
     uint autoExposure;  // 1 = also multiply by measuredExposure
     uint toneMapping;   // 0 = clamp, 1 = ACES filmic curve
-    uint passThrough;   // 1 = debug view: show the values as they are (no exposure, no tone mapping)
+    uint view;          // what to show, see the constants below
+    float farDistance;  // the depth of sky pixels
 } display;
+
+// Must match DisplayView in Application.h
+const uint VIEW_COLOR = 0;
+const uint VIEW_PASS_THROUGH = 1;  // a trace shader debug view: values as they are
+const uint VIEW_DEPTH = 2;
+const uint VIEW_MOTION_VECTORS = 3;
+const uint VIEW_DIFFUSE_ALBEDO = 4;
+const uint VIEW_SPECULAR_ALBEDO = 5;
+const uint VIEW_NORMALS = 6;
+const uint VIEW_ROUGHNESS = 7;
+const uint VIEW_SPECULAR_HIT_DISTANCE = 8;
+const uint VIEW_REPROJECTION_ERROR = 9;
 
 // Squeezes unbounded brightness into [0, 1] with a film-like S-curve instead of clipping it.
 // (Krzysztof Narkowicz's fit of the ACES curve)
 vec3 toneMapACES(vec3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Distances of any size as a grey level: 1 m -> 0.17, 5 m -> 0.5, 50 m -> 0.9. The sky (far) shows light blue.
+vec3 distanceColor(float d) {
+    if (d >= display.farDistance) {
+        return vec3(0.4, 0.6, 1.0);
+    }
+    return vec3(d / (d + 5.0));
+}
+
+// Last frame's diffuse albedo at a (fractional) pixel position, blended between the 4 nearest pixels
+vec3 sampleHistory(vec2 position, ivec2 size) {
+    vec2 p = position - 0.5;
+    ivec2 i = ivec2(floor(p));
+    vec2 f = p - vec2(i);
+    ivec2 last = size - 1;
+    vec3 c00 = imageLoad(historyImage, clamp(i, ivec2(0), last)).rgb;
+    vec3 c10 = imageLoad(historyImage, clamp(i + ivec2(1, 0), ivec2(0), last)).rgb;
+    vec3 c01 = imageLoad(historyImage, clamp(i + ivec2(0, 1), ivec2(0), last)).rgb;
+    vec3 c11 = imageLoad(historyImage, clamp(i + ivec2(1, 1), ivec2(0), last)).rgb;
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
+vec3 guideColor(ivec2 pixel) {
+    switch (display.view) {
+        case VIEW_DEPTH:
+            return distanceColor(imageLoad(linearDepthImage, pixel).r);
+        case VIEW_MOTION_VECTORS: {
+            // Grey = not moving. Red/green: moved left/up since the last frame (the point was further right/down
+            // before), full color at 16 pixels per frame.
+            vec2 motion = imageLoad(motionVectorImage, pixel).rg;
+            return vec3(0.5 + motion / 32.0, 0.5);
+        }
+        case VIEW_DIFFUSE_ALBEDO:
+            return imageLoad(diffuseAlbedoImage, pixel).rgb;
+        case VIEW_SPECULAR_ALBEDO:
+            return imageLoad(specularAlbedoImage, pixel).rgb;
+        case VIEW_NORMALS:
+            return imageLoad(normalRoughnessImage, pixel).rgb * 0.5 + 0.5;
+        case VIEW_ROUGHNESS:
+            return vec3(imageLoad(normalRoughnessImage, pixel).a);
+        case VIEW_SPECULAR_HIT_DISTANCE: {
+            float d = imageLoad(specularHitDistanceImage, pixel).r;
+            return d > 0.0 ? distanceColor(d) : vec3(0.0);  // black: unknown (the diffuse layer was picked)
+        }
+        case VIEW_REPROJECTION_ERROR: {
+            // Where this point was last frame, according to the motion vectors; last frame's albedo there should
+            // be this frame's albedo. Off-screen last frame: blue. Mismatch: bright (4x the difference).
+            ivec2 size = imageSize(diffuseAlbedoImage);
+            vec2 previous = vec2(pixel) + 0.5 + imageLoad(motionVectorImage, pixel).rg;
+            if (any(lessThan(previous, vec2(0.0))) || any(greaterThanEqual(previous, vec2(size)))) {
+                return vec3(0.0, 0.0, 0.5);
+            }
+            vec3 current = imageLoad(diffuseAlbedoImage, pixel).rgb;
+            return abs(sampleHistory(previous, size) - current) * 4.0;
+        }
+    }
+    return vec3(1.0, 0.0, 1.0);
 }
 
 void main() {
@@ -37,8 +119,16 @@ void main() {
         return;  // the last tiles can stick out past the image edge
     }
 
-    vec3 color = imageLoad(hdrImage, pixel).rgb;
-    if (display.passThrough == 0) {
+    // Render-size images (DLSS inputs, debug views): the render pixel this output pixel falls into
+    ivec2 renderPixel = pixel * imageSize(radianceImage) / size;
+    vec3 color;
+    if (display.view >= VIEW_DEPTH) {
+        color = guideColor(renderPixel);
+    } else if (display.view == VIEW_PASS_THROUGH) {
+        color = imageLoad(radianceImage, renderPixel).rgb;
+    } else {
+        // DLSS output or the radiance image, both at output size here
+        color = imageLoad(hdrImage, pixel).rgb;
         color = color * display.exposure * (display.autoExposure != 0 ? measuredExposure : 1.0);
         if (display.toneMapping != 0) {
             color = toneMapACES(color);

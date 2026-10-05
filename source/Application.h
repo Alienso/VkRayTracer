@@ -23,8 +23,10 @@ struct AccelerationStructure {
     VkDeviceAddress address = 0;
 };
 
-// Must match the SceneUniforms block in shaders/raytrace.comp (std140: vec4s first, no vec3s)
+// Must match the SceneUniforms block in shaders/raytrace.comp (std140: matrices and vec4s first, no vec3s)
 struct SceneUniforms {
+    glm::mat4 viewProjection;          // this frame, without jitter (motion vectors)
+    glm::mat4 previousViewProjection;  // last frame's
     glm::vec4 cameraPosition;
     glm::vec4 cameraForward;
     glm::vec4 cameraRight;
@@ -47,6 +49,8 @@ struct SceneUniforms {
     uint32_t emissiveTriangleCount;  // entries in the light list
     uint32_t emissiveSampling;       // EmissiveSampling
     uint32_t blurCaustics;           // 1 = path regularization, see tracePath in the shader
+    float farDistance;               // view depth written where rays hit nothing
+    uint32_t writeGuides;            // 1 = write the DLSS input images (depth, motion vectors, albedos, ...)
 };
 
 // Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the display pass
@@ -85,7 +89,48 @@ struct DisplayPushConstants {
     float exposure;         // manual multiplier, or 2^compensation on top of the measured exposure
     uint32_t autoExposure;  // 1 = multiply by the measured exposure (ExposureState) as well
     uint32_t toneMapping;   // 0 = clamp, 1 = ACES
-    uint32_t passThrough;   // 1 = debug view, shown without exposure and tone mapping
+    uint32_t view;          // DisplayView
+    float farDistance;      // sky depth, to show it apart in the depth views
+};
+
+// What the display pass shows. Must match the constants in shaders/display.comp.
+enum class DisplayView : uint32_t {
+    Color = 0,        // the path traced image, with exposure and tone mapping
+    PassThrough,      // a debug view of the trace shader, values as they are
+    Depth, MotionVectors, DiffuseAlbedo, SpecularAlbedo, Normals, Roughness, SpecularHitDistance,
+    ReprojectionError
+};
+
+// How the image is made. Accumulation: the path tracer averages frames at full size (the reference).
+// DLSS RR: one noisy frame at a smaller render size, denoised and upscaled by DLSS Ray Reconstruction.
+enum class RenderMode : int {
+    Accumulation = 0, DlssDlaa, DlssQuality, DlssBalanced, DlssPerformance, DlssUltraPerformance
+};
+
+// Which network DLSS RR runs (its "render presets", see toDlssPreset in Dlss.cpp). The transformer models look
+// better; the older CNN models cost about half on a 20/30 series GPU. Which ones exist depends on the DLSS RR version
+// loaded at startup (dlssModelAvailable): the current one has transformer D-F, the one loaded with --dlss-cnn has
+// transformer D-E and CNN A-C.
+enum class DlssModel : int {
+    TransformerF = 0, TransformerE, TransformerD, CnnA, CnnB, CnnC
+};
+
+// The Vulkan functions Streamline has to see with manual hooking (sl_hooks.h): swapchain, acquire, present,
+// wait idle. Vulkan's own until Streamline is connected, then Streamline's proxies (which call Vulkan's).
+struct PresentationFunctions {
+    PFN_vkCreateSwapchainKHR createSwapchain = vkCreateSwapchainKHR;
+    PFN_vkDestroySwapchainKHR destroySwapchain = vkDestroySwapchainKHR;
+    PFN_vkGetSwapchainImagesKHR getSwapchainImages = vkGetSwapchainImagesKHR;
+    PFN_vkAcquireNextImageKHR acquireNextImage = vkAcquireNextImageKHR;
+    PFN_vkQueuePresentKHR queuePresent = vkQueuePresentKHR;
+    PFN_vkDeviceWaitIdle deviceWaitIdle = vkDeviceWaitIdle;
+};
+
+// An image with its memory and view (the DLSS input images)
+struct RenderImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
 };
 
 // Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
@@ -140,10 +185,15 @@ struct SceneMaterial {
     bool useNormalTexture = true;
 };
 
+// The first group is drawn by the trace shader (one property of the first hit). The "guide" group shows the
+// DLSS input images as written during normal path tracing; the display pass draws them.
 enum class DebugView : int {
     None = 0, Normals, TexCoords, MeshIndex, MaterialIndex,
-    BaseColor, Metallic, Roughness, Transmission, Emissive, Tangents
+    BaseColor, Metallic, Roughness, Transmission, Emissive, Tangents,
+    GuideDepth, GuideMotionVectors, GuideDiffuseAlbedo, GuideSpecularAlbedo, GuideNormals, GuideRoughness,
+    GuideSpecularHitDistance, GuideReprojectionError
 };
+inline bool isGuideView(int view) { return view >= static_cast<int>(DebugView::GuideDepth); }
 
 // A model file, loaded once. Any number of objects can show it.
 struct SceneModel {
@@ -167,7 +217,8 @@ struct SceneObject {
     std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
 
     glm::mat4 transform() const;           // translate * rotate * scale
-    glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors (DLSS, Phase 7)
+    glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors
+    bool hasPreviousTransform = false;              // false in the object's first frame (no motion then)
 };
 
 // Values edited through ImGui
@@ -238,6 +289,8 @@ struct RenderSettings {
     float darkenSpeed = 3.0f;       //       getting used to the dark is slower than to bright light
     bool toneMapping = true;
     int debugView = static_cast<int>(DebugView::None);
+    int renderMode = static_cast<int>(RenderMode::Accumulation);  // RenderMode, picked in the UI
+    int dlssModel = static_cast<int>(DlssModel::TransformerF);     // DlssModel
 };
 
 class Application {
@@ -247,6 +300,12 @@ public:
     void run();
     void setFramebufferResized(bool b){
         this->framebufferResized = b;
+    }
+    void setDlssDisabled(bool disabled) {  // --no-dlss
+        dlssDisabledByFlag = disabled;
+    }
+    void setDlssCnn(bool cnn) {  // --dlss-cnn
+        dlssCnnVersion = cnn;
     }
 
 private:
@@ -325,6 +384,9 @@ private:
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, from the objects
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
     std::vector<glm::mat4> frameInstanceTransforms;  // world transform of each of frameInstances
+    std::vector<glm::mat4> frameInstanceMotion;      // per instance: this frame's world position -> last frame's
+    VkBuffer instanceMotionBuffer = VK_NULL_HANDLE;  // frameInstanceMotion on the GPU, room for tlasCapacity
+    VkDeviceMemory instanceMotionMemory = VK_NULL_HANDLE;
     std::vector<uint32_t> frameInstanceMeshes;       // mesh of each of frameInstances
     bool tlasDirty = true;
 
@@ -351,9 +413,26 @@ private:
     VkImage radianceImage;  // linear HDR: running average while accumulating, else this frame (or a debug view)
     VkDeviceMemory radianceImageMemory;
     VkImageView radianceImageView;
-    VkImage rtDepthImage;
-    VkDeviceMemory rtDepthImageMemory;
-    VkImageView rtDepthImageView;
+    // DLSS inputs ("guides"), all describing the first surface the camera ray hits. Written only when
+    // SceneUniforms::writeGuides is set (DLSS mode, guide debug views).
+    RenderImage linearDepthImage;         // R32F: view-space depth (distance along the camera's forward axis)
+    RenderImage motionVectorImage;        // RG32F: pixels to where this point was in the last frame
+    RenderImage diffuseAlbedoImage;       // RGBA16F
+    RenderImage specularAlbedoImage;      // RGBA16F
+    RenderImage normalRoughnessImage;     // RGBA16F: world-space shading normal, roughness in alpha
+    RenderImage specularHitDistanceImage; // R32F: first hit -> next hit along a reflection/refraction, 0 = unknown
+    RenderImage guideHistoryImage;        // RGBA16F: last frame's diffuse albedo, for the reprojection error view
+
+    // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
+    // from this frame's position to last frame's (object motion). Binding 12, uploaded every frame.
+    glm::mat4 previousViewProjection = glm::mat4(1.0f);
+    bool hasPreviousViewProjection = false;
+    uint32_t jitterIndex = 0;
+    glm::vec2 frameJitter = glm::vec2(0.0f);  // this frame's jitter in pixels (DLSS constants)
+    glm::mat4 frameView = glm::mat4(1.0f);    // this frame's matrices, without jitter (DLSS constants)
+    glm::mat4 frameProjection = glm::mat4(1.0f);
+    glm::mat4 frameViewProjection = glm::mat4(1.0f);
+    glm::mat4 framePreviousViewProjection = glm::mat4(1.0f);
 
     VkDescriptorSetLayout rtDescriptorSetLayout;
     VkDescriptorPool rtDescriptorPool;
@@ -362,10 +441,20 @@ private:
     VkPipeline rtPipeline;
 
     // DLSS Ray Reconstruction via Streamline (Dlss.cpp)
+    bool dlssDisabledByFlag = false;   // --no-dlss: Streamline is never loaded
+    bool dlssCnnVersion = false;       // --dlss-cnn: Streamline's plugins from dlss/cnn instead of dlss/transformer
+    std::string dlssVersion;           // of the loaded DLSS RR (NGX), for the UI
+    PresentationFunctions vkp;         // swapchain / present / wait idle, see PresentationFunctions
     void* streamlineModule = nullptr;  // HMODULE of sl.interposer.dll
     bool streamlineInitialized = false;
     bool dlssSupported = false;
     std::string dlssStatus = "not checked";
+    int activeRenderMode = static_cast<int>(RenderMode::Accumulation);  // what the images are currently built for
+    int activeDlssModel = static_cast<int>(DlssModel::TransformerF);    // what DLSS's resources were made for
+    RenderImage dlssOutputImage;       // RGBA32F at output size: the denoised, upscaled HDR image (DLSS modes only)
+    bool dlssResourcesInUse = false;   // DLSS created its own resources (on the first evaluate); free them on changes
+    bool dlssReset = true;             // the next frame has no usable history (mode/size/scene changed)
+    uint32_t dlssFrameIndex = 0;
     std::vector<std::string> streamlineInstanceExtensions;  // what Streamline asks for
     std::vector<std::string> streamlineDeviceExtensions;
     std::vector<std::string> streamlineFeatures12;  // Vulkan 1.2 / 1.3 feature names it needs enabled
@@ -397,6 +486,13 @@ private:
     VkDescriptorSet displayDescriptorSet;
     VkPipelineLayout displayPipelineLayout;
     VkPipeline displayPipeline;
+
+    // GPU time of each pass (trace, exposure, display): timestamps before and after them, one set of queries
+    // per frame in flight, read when that frame slot is recorded again. Smoothed over ~20 frames, in ms.
+    static constexpr uint32_t timestampsPerFrame = 5;  // before trace, after trace / DLSS / exposure / display
+    VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
+    std::vector<bool> timestampsWritten;
+    float gpuPassTimes[timestampsPerFrame - 1] = {};
 
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
@@ -449,6 +545,8 @@ private:
     VkDeviceAddress getBufferDeviceAddress(VkBuffer buffer);
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
     void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory, VkImageView& imageView);
+    void createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image);
+    void destroyImage(RenderImage& image);
 
     // RayTracer.cpp
     void createUniformBuffer();
@@ -497,6 +595,13 @@ private:
                                          VkPhysicalDeviceVulkan13Features& features13);
     void connectStreamline(uint32_t graphicsQueueFamily);
     void shutdownStreamline();
+    bool dlssActive() const { return activeRenderMode != static_cast<int>(RenderMode::Accumulation); }
+    bool dlssModelAvailable(int model) const;
+    VkExtent2D dlssRenderExtent(int renderMode, VkExtent2D output);
+    void applyRenderMode();
+    void recordDlss(VkCommandBuffer commandBuffer);
+    void freeDlssResources();
+    void buildRenderModeUi();
 
     // Exposure.cpp
     void createExposureResources();
@@ -507,6 +612,8 @@ private:
 
     // Display.cpp
     void chooseExtents();
+    void recreateRenderImages();
+    VkImageView displayedHdrView() const;  // what exposure and display read: DLSS output or the radiance image
     void createDisplayImages();
     void destroyDisplayImages();
     void createDisplayResources();
@@ -520,6 +627,10 @@ private:
     void updateRayTracingDescriptorSet();
     void createRayTracingPipeline();
     SceneUniforms buildSceneUniforms();
+    void recordInstanceMotionUpload(VkCommandBuffer commandBuffer);
+    void createTimestampQueries();
+    void readTimestamps();
+    void writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index);
     void recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageIndex);
     void cleanupRayTracing();
 

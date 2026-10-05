@@ -59,6 +59,7 @@ void Application::initVulkan() {
     createRayTracingDescriptors();
     createRayTracingPipeline();
     createDisplayResources();  // reads the radiance image and the exposure buffer
+    createTimestampQueries();
 
     initImGui();
 }
@@ -78,11 +79,12 @@ void Application::mainLoop() {
         ImGuiIO& io = ImGui::GetIO();
         camera.update(window, deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
         updateScene();  // apply object/model changes made in the UI
+        applyRenderMode();  // accumulation <-> DLSS modes: new render size
 
         drawFrame();
     }
 
-    vkDeviceWaitIdle(device);
+    vkp.deviceWaitIdle(device);
 }
 
 void Application::cleanup() {
@@ -120,7 +122,7 @@ void Application::drawFrame() {
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
     uint32_t imageIndex;
-    VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+    VkResult result = vkp.acquireNextImage(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapChain();
         return;
@@ -163,7 +165,7 @@ void Application::drawFrame() {
     presentInfo.pImageIndices = &imageIndex;
     presentInfo.pResults = nullptr;
 
-    result = vkQueuePresentKHR(presentQueue, &presentInfo);
+    result = vkp.queuePresent(presentQueue, &presentInfo);
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
         framebufferResized = false;
         recreateSwapChain();
@@ -241,6 +243,17 @@ void Application::createImage(uint32_t width, uint32_t height, VkFormat format, 
     if (vkCreateImageView(device, &viewInfo, nullptr, &imageView) != VK_SUCCESS) {
         throw std::runtime_error("failed to create image view!");
     }
+}
+
+void Application::createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image) {
+    createImage(extent.width, extent.height, format, usage, image.image, image.memory, image.view);
+}
+
+void Application::destroyImage(RenderImage& image) {
+    vkDestroyImageView(device, image.view, nullptr);
+    vkDestroyImage(device, image.image, nullptr);
+    vkFreeMemory(device, image.memory, nullptr);
+    image = RenderImage{};
 }
 
 void Application::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {

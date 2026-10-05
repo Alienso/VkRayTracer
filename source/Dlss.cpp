@@ -8,19 +8,27 @@
 // "Manual hooking": we keep creating the Vulkan instance and device ourselves (with the extensions Streamline
 // asks for) and hand them over with slSetVulkanInfo, instead of routing every Vulkan call through Streamline.
 //
-// So far this only checks whether DLSS Ray Reconstruction can run here and prints the answer.
+// Per frame in a DLSS mode (recordDlss): the trace shader renders one noisy frame at the render size plus the
+// guide images; we pass camera constants, options and the images ("tags") to Streamline and record DLSS into our
+// command buffer with slEvaluateFeature. Its output (window size, linear HDR) then goes through exposure and
+// display like the accumulated image does in the reference mode.
 //
 
 #include <windows.h>  // LoadLibrary; Streamline's headers also need HRESULT
 #include <vulkan/vulkan.h>
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <string>
+#include <glm/gtc/matrix_inverse.hpp>
 #include "../include/streamline/sl.h"
 #include "../include/streamline/sl_helpers_vk.h"
 #include "../include/streamline/sl_dlss_d.h"
+#include "../include/imgui/imgui.h"
 #include "Application.h"
+#include "Configuration.h"
 
 namespace {
 
@@ -33,7 +41,77 @@ struct StreamlineApi {
     PFun_slGetFeatureRequirements* getFeatureRequirements = nullptr;
     PFun_slGetFeatureVersion* getFeatureVersion = nullptr;
     PFun_slSetVulkanInfo* setVulkanInfo = nullptr;
+    PFun_slGetFeatureFunction* getFeatureFunction = nullptr;
+    PFun_slGetNewFrameToken* getNewFrameToken = nullptr;
+    PFun_slSetConstants* setConstants = nullptr;
+    PFun_slSetTagForFrame* setTagForFrame = nullptr;
+    PFun_slEvaluateFeature* evaluateFeature = nullptr;
+    PFun_slFreeResources* freeResources = nullptr;
+    // DLSS RR's own functions, asked from Streamline once the feature is loaded
+    PFun_slDLSSDGetOptimalSettings* dlssdGetOptimalSettings = nullptr;
+    PFun_slDLSSDGetState* dlssdGetState = nullptr;
+    PFun_slDLSSDSetOptions* dlssdSetOptions = nullptr;
 } sl_;
+
+// One window, one view: always viewport 0
+const sl::ViewportHandle dlssViewport(0u);
+
+sl::DLSSMode toDlssMode(int renderMode) {
+    switch (static_cast<RenderMode>(renderMode)) {
+        case RenderMode::DlssDlaa: return sl::DLSSMode::eDLAA;
+        case RenderMode::DlssQuality: return sl::DLSSMode::eMaxQuality;
+        case RenderMode::DlssBalanced: return sl::DLSSMode::eBalanced;
+        case RenderMode::DlssPerformance: return sl::DLSSMode::eMaxPerformance;
+        case RenderMode::DlssUltraPerformance: return sl::DLSSMode::eUltraPerformance;
+        default: return sl::DLSSMode::eOff;
+    }
+}
+
+// DLSS RR's models are picked through render presets. The current nvngx_dlssd.dll (310.9.1, Streamline SDK 2.14.1)
+// has the transformer models D, E and F. The CNN models (presets A-C) were dropped after 310.3.0 (SDK 2.8.0), which
+// has A-E; our 2.14 headers no longer name A-C, hence the plain numbers. Only one of the two DLLs can be loaded
+// in a process, so the choice is made at startup (--dlss-cnn, see initStreamline).
+sl::DLSSDPreset toDlssPreset(int model) {
+    switch (static_cast<DlssModel>(model)) {
+        case DlssModel::TransformerF: return sl::DLSSDPreset::ePresetF;
+        case DlssModel::TransformerE: return sl::DLSSDPreset::ePresetE;
+        case DlssModel::CnnA: return static_cast<sl::DLSSDPreset>(1);
+        case DlssModel::CnnB: return static_cast<sl::DLSSDPreset>(2);
+        case DlssModel::CnnC: return static_cast<sl::DLSSDPreset>(3);
+        default: return sl::DLSSDPreset::ePresetD;
+    }
+}
+
+bool isCnnModel(int model) {
+    return model >= static_cast<int>(DlssModel::CnnA);
+}
+
+// Streamline's matrices are row-major for row vectors (v * M, translation in the last row). That is exactly the
+// memory layout of a glm matrix (column-major, for column vectors M * v), so the bytes can be copied as they are.
+sl::float4x4 toSl(const glm::mat4& m) {
+    sl::float4x4 result;
+    static_assert(sizeof(result) == sizeof(m), "matrix sizes differ");
+    std::memcpy(&result, &m, sizeof(m));
+    return result;
+}
+
+sl::float3 toSl(const glm::vec3& v) {
+    return {v.x, v.y, v.z};
+}
+
+// What Streamline needs to know about one of our images (Vulkan can't be asked for an image's description)
+sl::Resource describeImage(VkImage image, VkDeviceMemory memory, VkImageView view, VkExtent2D extent,
+                           VkFormat format, VkImageUsageFlags usage) {
+    sl::Resource resource(sl::ResourceType::eTex2d, image, memory, view, VK_IMAGE_LAYOUT_GENERAL);
+    resource.width = extent.width;
+    resource.height = extent.height;
+    resource.nativeFormat = format;
+    resource.mipLevels = 1;
+    resource.arrayLayers = 1;
+    resource.flags = 0;
+    resource.usage = usage;
+    return resource;
+}
 
 const char* resultName(sl::Result result) {
     static const char* names[] = {
@@ -65,6 +143,11 @@ void logMessage(sl::LogType type, const char* message) {
 
 // Before vkCreateInstance: Streamline must be initialized first, and it tells us which extensions it needs.
 void Application::initStreamline() {
+    if (dlssDisabledByFlag) {
+        dlssStatus = "switched off with --no-dlss";
+        std::cout << "DLSS: " << dlssStatus << std::endl;
+        return;
+    }
     // Next to the executable (copied there by the build)
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -89,13 +172,19 @@ void Application::initStreamline() {
     bool ok = load(sl_.init, "slInit") & load(sl_.shutdown, "slShutdown") &
               load(sl_.isFeatureSupported, "slIsFeatureSupported") & load(sl_.isFeatureLoaded, "slIsFeatureLoaded") &
               load(sl_.getFeatureRequirements, "slGetFeatureRequirements") &
-              load(sl_.getFeatureVersion, "slGetFeatureVersion") & load(sl_.setVulkanInfo, "slSetVulkanInfo");
+              load(sl_.getFeatureVersion, "slGetFeatureVersion") & load(sl_.setVulkanInfo, "slSetVulkanInfo") &
+              load(sl_.getFeatureFunction, "slGetFeatureFunction") & load(sl_.getNewFrameToken, "slGetNewFrameToken") &
+              load(sl_.setConstants, "slSetConstants") & load(sl_.setTagForFrame, "slSetTagForFrame") &
+              load(sl_.evaluateFeature, "slEvaluateFeature") & load(sl_.freeResources, "slFreeResources");
     if (!ok) {
         dlssStatus = "sl.interposer.dll is missing functions";
         return;
     }
 
-    const wchar_t* pluginPaths[] = {directory.c_str()};
+    // The plugins (sl.common, sl.dlss_d) come from a subfolder, and NGX loads nvngx_dlssd.dll from next to them:
+    // dlss/transformer has the current DLSS RR, dlss/cnn the older one with the CNN models.
+    std::wstring pluginDirectory = directory + (dlssCnnVersion ? L"\\dlss\\cnn" : L"\\dlss\\transformer");
+    const wchar_t* pluginPaths[] = {pluginDirectory.c_str()};
     sl::Feature features[] = {sl::kFeatureDLSS_RR};
     sl::Preferences preferences;
     preferences.showConsole = false;
@@ -227,6 +316,30 @@ void Application::connectStreamline(uint32_t graphicsQueueFamily) {
         return;
     }
 
+    // From now on swapchain, acquire, present and wait idle go through Streamline's proxies: it has to see every
+    // present (its per-frame bookkeeping) and the swapchain the presents go to.
+    auto getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            GetProcAddress(static_cast<HMODULE>(streamlineModule), "vkGetDeviceProcAddr"));
+    PresentationFunctions proxies;
+    bool allFound = getDeviceProcAddr != nullptr;
+    auto proxy = [&](auto& function, const char* name) {
+        auto address = allFound ? getDeviceProcAddr(device, name) : nullptr;
+        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(address);
+        allFound = allFound && address != nullptr;
+    };
+    proxy(proxies.createSwapchain, "vkCreateSwapchainKHR");
+    proxy(proxies.destroySwapchain, "vkDestroySwapchainKHR");
+    proxy(proxies.getSwapchainImages, "vkGetSwapchainImagesKHR");
+    proxy(proxies.acquireNextImage, "vkAcquireNextImageKHR");
+    proxy(proxies.queuePresent, "vkQueuePresentKHR");
+    proxy(proxies.deviceWaitIdle, "vkDeviceWaitIdle");
+    if (!allFound) {
+        dlssStatus = "Streamline's Vulkan proxies are missing";
+        std::cout << "DLSS: " << dlssStatus << std::endl;
+        return;
+    }
+    vkp = proxies;
+
     sl::AdapterInfo adapter;
     adapter.vkPhysicalDevice = physicalDevice;
     result = sl_.isFeatureSupported(sl::kFeatureDLSS_RR, adapter);
@@ -243,14 +356,275 @@ void Application::connectStreamline(uint32_t graphicsQueueFamily) {
     sl::FeatureVersion version;
     if (sl_.getFeatureVersion(sl::kFeatureDLSS_RR, version) == sl::Result::eOk) {
         std::cout << "DLSS: Streamline " << versionString(version.versionSL) << ", NGX " << versionString(version.versionNGX) << std::endl;
+        dlssVersion = versionString(version.versionNGX);
     }
-    dlssSupported = loaded;
-    dlssStatus = loaded ? "DLSS Ray Reconstruction available" : "DLSS RR plugin not loaded";
+    if (!loaded) {
+        dlssStatus = "DLSS RR plugin not loaded";
+        return;
+    }
+
+    auto featureFunction = [](auto& function, const char* name) {
+        void* address = nullptr;
+        sl::Result r = sl_.getFeatureFunction(sl::kFeatureDLSS_RR, name, address);
+        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(address);
+        if (r != sl::Result::eOk || !function) {
+            std::cout << "DLSS: slGetFeatureFunction(" << name << ") -> " << resultName(r) << std::endl;
+        }
+        return function != nullptr;
+    };
+    if (!(featureFunction(sl_.dlssdGetOptimalSettings, "slDLSSDGetOptimalSettings") &
+          featureFunction(sl_.dlssdGetState, "slDLSSDGetState") &
+          featureFunction(sl_.dlssdSetOptions, "slDLSSDSetOptions"))) {
+        dlssStatus = "DLSS RR functions missing";
+        return;
+    }
+    dlssSupported = true;
+    dlssStatus = "DLSS Ray Reconstruction available";
 }
 
-// Before vkDestroyDevice
+// The render size DLSS wants for a mode and window size (e.g. Quality: 2/3 per axis, DLAA: the window size)
+VkExtent2D Application::dlssRenderExtent(int renderMode, VkExtent2D output) {
+    sl::DLSSDOptions options;
+    options.mode = toDlssMode(renderMode);
+    options.outputWidth = output.width;
+    options.outputHeight = output.height;
+    options.colorBuffersHDR = sl::Boolean::eTrue;
+    sl::DLSSDOptimalSettings optimal;
+    sl::Result result = sl_.dlssdGetOptimalSettings(options, optimal);
+    if (result != sl::Result::eOk || optimal.optimalRenderWidth == 0 || optimal.optimalRenderHeight == 0) {
+        std::cout << "DLSS: slDLSSDGetOptimalSettings -> " << resultName(result) << ", rendering at full size" << std::endl;
+        return output;
+    }
+    return {optimal.optimalRenderWidth, optimal.optimalRenderHeight};
+}
+
+// DLSS keeps its own resources (history, network state) per viewport, sized for the current render and output
+// sizes. It can't resize them on the fly, so they are freed when either changes and recreated by the next
+// evaluate. The GPU must be idle.
+void Application::freeDlssResources() {
+    if (dlssResourcesInUse) {
+        sl::Result result = sl_.freeResources(sl::kFeatureDLSS_RR, dlssViewport);
+        if (result != sl::Result::eOk) {
+            std::cout << "DLSS: slFreeResources -> " << resultName(result) << std::endl;
+        }
+        dlssResourcesInUse = false;
+    }
+}
+
+bool Application::dlssModelAvailable(int model) const {
+    if (dlssCnnVersion) {
+        return model != static_cast<int>(DlssModel::TransformerF);
+    }
+    return !isCnnModel(model);
+}
+
+// Called once per frame before drawing: switches between accumulation and the DLSS modes (new render size), and
+// between DLSS models (DLSS starts over with the new network).
+void Application::applyRenderMode() {
+    if (!dlssSupported) {
+        settings.renderMode = static_cast<int>(RenderMode::Accumulation);
+    }
+    if (!dlssModelAvailable(settings.dlssModel)) {
+        // The newest model the loaded DLSS version has
+        settings.dlssModel = static_cast<int>(dlssCnnVersion ? DlssModel::TransformerE : DlssModel::TransformerF);
+    }
+    if (settings.dlssModel != activeDlssModel) {
+        vkp.deviceWaitIdle(device);
+        freeDlssResources();
+        activeDlssModel = settings.dlssModel;
+        dlssReset = true;
+    }
+    if (settings.renderMode == activeRenderMode) {
+        return;
+    }
+    vkp.deviceWaitIdle(device);
+    freeDlssResources();
+    activeRenderMode = settings.renderMode;
+    recreateRenderImages();
+    hasPreviousViewProjection = false;
+    jitterIndex = 0;
+}
+
+// Records DLSS into the frame's command buffer, right after the trace shader. Does nothing in accumulation mode.
+void Application::recordDlss(VkCommandBuffer commandBuffer) {
+    if (!dlssActive()) {
+        return;
+    }
+    // The trace shader's debug views are shown without DLSS (they are drawn from the render-size image). DLSS's
+    // history doesn't match the scene afterwards, so it starts over then.
+    if (settings.debugView != static_cast<int>(DebugView::None) && !isGuideView(settings.debugView)) {
+        dlssReset = true;
+        return;
+    }
+
+    // The trace shader's images must be written before DLSS reads them (DLSS records its own compute work)
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    sl::FrameToken* frameToken = nullptr;
+    uint32_t frame = dlssFrameIndex++;
+    if (sl_.getNewFrameToken(frameToken, &frame) != sl::Result::eOk || !frameToken) {
+        std::cout << "DLSS: slGetNewFrameToken failed" << std::endl;
+        return;
+    }
+
+    // Camera: matrices without jitter, the jitter separately in pixels
+    sl::Constants constants;
+    glm::mat4 clipToPrevClip = framePreviousViewProjection * glm::inverse(frameViewProjection);
+    constants.cameraViewToClip = toSl(frameProjection);
+    constants.clipToCameraView = toSl(glm::inverse(frameProjection));
+    constants.clipToLensClip = toSl(glm::mat4(1.0f));
+    constants.clipToPrevClip = toSl(clipToPrevClip);
+    constants.prevClipToClip = toSl(glm::inverse(clipToPrevClip));
+    // Our rays go through pixel center + frameJitter; DLSS wants the offset the other way round (checked against
+    // the accumulated reference: with the same sign the image is visibly softer)
+    constants.jitterOffset = {-frameJitter.x, -frameJitter.y};
+    constants.mvecScale = {1.0f / static_cast<float>(renderExtent.width), 1.0f / static_cast<float>(renderExtent.height)};
+    constants.cameraPinholeOffset = {0.0f, 0.0f};
+    constants.cameraPos = toSl(camera.position);
+    constants.cameraUp = toSl(camera.up());
+    constants.cameraRight = toSl(camera.right());
+    constants.cameraFwd = toSl(camera.forward());
+    constants.cameraNear = Configuration::cameraNear;
+    constants.cameraFar = Configuration::cameraFar;
+    constants.cameraFOV = glm::radians(camera.fov);
+    constants.cameraAspectRatio = static_cast<float>(renderExtent.width) / static_cast<float>(renderExtent.height);
+    constants.depthInverted = sl::Boolean::eFalse;
+    constants.cameraMotionIncluded = sl::Boolean::eTrue;  // our motion vectors include the camera's motion
+    constants.motionVectors3D = sl::Boolean::eFalse;
+    constants.reset = dlssReset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    constants.orthographicProjection = sl::Boolean::eFalse;
+    constants.motionVectorsDilated = sl::Boolean::eFalse;
+    constants.motionVectorsJittered = sl::Boolean::eFalse;
+    sl::Result result = sl_.setConstants(constants, *frameToken, dlssViewport);
+    if (result != sl::Result::eOk) {
+        std::cout << "DLSS: slSetConstants -> " << resultName(result) << std::endl;
+        return;
+    }
+
+    sl::DLSSDOptions options;
+    options.mode = toDlssMode(activeRenderMode);
+    options.outputWidth = outputExtent.width;
+    options.outputHeight = outputExtent.height;
+    options.colorBuffersHDR = sl::Boolean::eTrue;
+    options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;  // roughness in the normals' alpha
+    sl::DLSSDPreset preset = toDlssPreset(activeDlssModel);  // the same model for every mode
+    options.dlaaPreset = options.qualityPreset = options.balancedPreset = preset;
+    options.performancePreset = options.ultraPerformancePreset = options.ultraQualityPreset = preset;
+    options.worldToCameraView = toSl(frameView);
+    options.cameraViewToWorld = toSl(glm::inverse(frameView));
+    result = sl_.dlssdSetOptions(dlssViewport, options);
+    if (result != sl::Result::eOk) {
+        std::cout << "DLSS: slDLSSDSetOptions -> " << resultName(result) << std::endl;
+        return;
+    }
+
+    // The images. They stay in GENERAL and aren't touched again before the next frame's trace. (DLSS switches
+    // them to SHADER_READ_ONLY_OPTIMAL while reading and back, hence the sampled usage.)
+    const VkImageUsageFlags storage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    sl::Resource color = describeImage(radianceImage, radianceImageMemory, radianceImageView, renderExtent,
+                                       VK_FORMAT_R32G32B32A32_SFLOAT, storage);
+    sl::Resource output = describeImage(dlssOutputImage.image, dlssOutputImage.memory, dlssOutputImage.view,
+                                        outputExtent, VK_FORMAT_R32G32B32A32_SFLOAT, storage);
+    sl::Resource depth = describeImage(linearDepthImage.image, linearDepthImage.memory, linearDepthImage.view,
+                                       renderExtent, VK_FORMAT_R32_SFLOAT, storage);
+    sl::Resource motion = describeImage(motionVectorImage.image, motionVectorImage.memory, motionVectorImage.view,
+                                        renderExtent, VK_FORMAT_R32G32_SFLOAT, storage);
+    sl::Resource diffuse = describeImage(diffuseAlbedoImage.image, diffuseAlbedoImage.memory, diffuseAlbedoImage.view,
+                                         renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                         storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    sl::Resource specular = describeImage(specularAlbedoImage.image, specularAlbedoImage.memory,
+                                          specularAlbedoImage.view, renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT, storage);
+    sl::Resource normals = describeImage(normalRoughnessImage.image, normalRoughnessImage.memory,
+                                         normalRoughnessImage.view, renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT, storage);
+    sl::Resource hitDistance = describeImage(specularHitDistanceImage.image, specularHitDistanceImage.memory,
+                                             specularHitDistanceImage.view, renderExtent, VK_FORMAT_R32_SFLOAT, storage);
+    sl::Extent renderArea{0, 0, renderExtent.width, renderExtent.height};
+    sl::Extent outputArea{0, 0, outputExtent.width, outputExtent.height};
+    const sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eValidUntilPresent;
+    sl::ResourceTag tags[] = {
+            sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, lifecycle, &renderArea),
+            sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, lifecycle, &outputArea),
+            sl::ResourceTag(&depth, sl::kBufferTypeLinearDepth, lifecycle, &renderArea),
+            sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, lifecycle, &renderArea),
+            sl::ResourceTag(&diffuse, sl::kBufferTypeAlbedo, lifecycle, &renderArea),
+            sl::ResourceTag(&specular, sl::kBufferTypeSpecularAlbedo, lifecycle, &renderArea),
+            sl::ResourceTag(&normals, sl::kBufferTypeNormalRoughness, lifecycle, &renderArea),
+            sl::ResourceTag(&hitDistance, sl::kBufferTypeSpecularHitDistance, lifecycle, &renderArea),
+    };
+    result = sl_.setTagForFrame(*frameToken, dlssViewport, tags, static_cast<uint32_t>(std::size(tags)), commandBuffer);
+    if (result != sl::Result::eOk) {
+        std::cout << "DLSS: slSetTagForFrame -> " << resultName(result) << std::endl;
+        return;
+    }
+
+    const sl::BaseStructure* inputs[] = {&dlssViewport};
+    result = sl_.evaluateFeature(sl::kFeatureDLSS_RR, *frameToken, inputs, 1, commandBuffer);
+    if (result != sl::Result::eOk) {
+        std::cout << "DLSS: slEvaluateFeature -> " << resultName(result) << std::endl;
+        return;
+    }
+    dlssResourcesInUse = true;
+    dlssReset = false;
+    // (Streamline doesn't restore our pipeline and descriptor bindings with manual hooking; the exposure and
+    // display passes bind their own anyway.)
+
+    // DLSS's output must be written before exposure and display read it
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+// The "Renderer" combo at the top of the Rendering section
+void Application::buildRenderModeUi() {
+    const char* modes[] = {"Accumulation (reference)", "DLSS RR: DLAA (full size)", "DLSS RR: Quality",
+                           "DLSS RR: Balanced", "DLSS RR: Performance", "DLSS RR: Ultra Performance"};
+    const char* models[] = {"Transformer F (newest)", "Transformer E", "Transformer D", "CNN A", "CNN B", "CNN C"};
+    ImGui::BeginDisabled(!dlssSupported);
+    ImGui::Combo("Renderer", &settings.renderMode, modes, static_cast<int>(std::size(modes)));
+    // Models the loaded DLSS version doesn't have are shown but can't be picked
+    if (ImGui::BeginCombo("DLSS model", models[settings.dlssModel])) {
+        for (int i = 0; i < static_cast<int>(std::size(models)); i++) {
+            ImGuiSelectableFlags flags = dlssModelAvailable(i) ? 0 : ImGuiSelectableFlags_Disabled;
+            if (ImGui::Selectable(models[i], settings.dlssModel == i, flags)) {
+                settings.dlssModel = i;
+            }
+            if (!dlssModelAvailable(i) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(dlssCnnVersion ? "only in the current DLSS version: start without --dlss-cnn"
+                                                 : "only in the older DLSS version: start with --dlss-cnn");
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The network DLSS Ray Reconstruction runs. Transformer: the newer models, sharper and\n"
+                          "steadier. CNN: the older models, about half the cost on a 20/30 series GPU.\n"
+                          "DLSS %s is loaded (%s).", dlssVersion.c_str(),
+                          dlssCnnVersion ? "--dlss-cnn: CNN A-C, transformer D-E"
+                                         : "transformer D-F; start with --dlss-cnn for the CNN models");
+    }
+    ImGui::EndDisabled();
+    if (!dlssSupported) {
+        ImGui::TextDisabled("DLSS unavailable: %s", dlssStatus.c_str());
+    } else if (dlssActive()) {
+        sl::DLSSDState state;
+        double megabytes = sl_.dlssdGetState(dlssViewport, state) == sl::Result::eOk
+                           ? static_cast<double>(state.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0) : 0.0;
+        ImGui::TextDisabled("render %ux%u -> %ux%u (%.0f%% per axis), DLSS memory %.0f MB",
+                            renderExtent.width, renderExtent.height, outputExtent.width, outputExtent.height,
+                            100.0 * renderExtent.width / outputExtent.width, megabytes);
+    }
+}
+
+// Before vkDestroyDevice (the GPU is idle)
 void Application::shutdownStreamline() {
     if (streamlineInitialized) {
+        freeDlssResources();
         sl::Result result = sl_.shutdown();
         std::cout << "DLSS: slShutdown -> " << resultName(result) << std::endl;
         streamlineInitialized = false;
