@@ -398,9 +398,7 @@ void Application::destroyNoiseResources() {
 }
 
 void Application::buildNoiseUi() {
-    if (!ImGui::CollapsingHeader("Noise measurement")) {
-        return;
-    }
+    ImGui::SeparatorText("Noise measurement");
     ImGui::TextDisabled("Keep the camera still. The reference is the current view, accumulated\n"
                         "for a long time; the measurement then starts over and compares every frame.");
     bool idle = noiseState == NoiseState::Idle;

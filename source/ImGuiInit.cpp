@@ -66,94 +66,43 @@ void Application::buildImGui() {
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // Always visible, whichever tab is open
     ImGui::Text("GPU: %s", physicalDeviceProperties.deviceName);
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
     ImGui::Text("GPU: cache %.2f ms, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
                 gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4]);
     ImGui::Text("%u triangles", primitiveCount);
-
-    buildSceneUi();
-
-    if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
-        ImGui::TextDisabled("hold right mouse button to look around");
-        ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
-        ImGui::DragFloat("Yaw", &camera.yaw, 0.5f);
-        ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
-        ImGui::SliderFloat("Field of view", &camera.fov, 20.0f, 120.0f);
-        ImGui::SliderFloat("Move speed", &camera.moveSpeed, 0.1f, 20.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+    if (settings.accumulate && !dlssActive()) {
+        ImGui::Text("%u frames accumulated", accumulatedFrames);
+    }
+    if (settings.debugView != 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Debug view on (Debug tab)");
     }
 
-    // ImGui needs unique IDs per widget; "##sun"/"##sky" suffixes are hidden from the labels.
-    if (ImGui::CollapsingHeader("Sun", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Checkbox("Enabled##sun", &settings.sunEnabled);
-        ImGui::SliderFloat("Azimuth", &settings.sunAzimuth, -180.0f, 180.0f);
-        ImGui::SliderFloat("Elevation", &settings.sunElevation, -10.0f, 90.0f);
-        ImGui::SliderFloat("Size (degrees)", &settings.sunAngularRadius, 0.0f, 15.0f, "%.2f");
-        ImGui::ColorEdit3("Color##sun", &settings.sunColor.x);
-        ImGui::SliderFloat("Intensity##sun", &settings.sunIntensity, 0.0f, 5.0f);
-        ImGui::Checkbox("Shadows", &settings.shadowsEnabled);
-    }
-
-    if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Combo("Environment", &settings.environment, "Sky gradient\0Black (only emissive surfaces light the scene)\0White (furnace test)\0");
-        if (settings.environment == static_cast<int>(Environment::White)) {
-            ImGui::TextDisabled("turn the sun off; white materials should vanish into the background");
+    // The window sizes itself to the open tab
+    if (ImGui::BeginTabBar("settingsTabs")) {
+        if (ImGui::BeginTabItem("Scene")) {
+            buildSceneUi();
+            ImGui::EndTabItem();
         }
-        ImGui::ColorEdit3("Zenith", &settings.skyZenithColor.x);
-        ImGui::ColorEdit3("Horizon", &settings.skyHorizonColor.x);
-        ImGui::ColorEdit3("Ground", &settings.groundColor.x);
-        ImGui::SliderFloat("Intensity##sky", &settings.skyIntensity, 0.0f, 3.0f);
-    }
-
-    if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
-        buildRenderModeUi();
-        buildExposureUi();
-        ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
-        ImGui::Combo("Debug view", &settings.debugView,
-                     "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"
-                     "Base color\0Metallic\0Roughness\0Transmission\0Emissive\0Tangents\0"
-                     "Radiance cache\0"
-                     "DLSS input: depth\0DLSS input: motion vectors\0DLSS input: diffuse albedo\0"
-                     "DLSS input: specular albedo\0DLSS input: normals\0DLSS input: roughness\0"
-                     "DLSS input: specular hit distance\0DLSS input: reprojection error\0");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Radiance cache: the indirect light the cache holds for what the camera sees, cell by cell\n"
-                              "(magenta: no cell yet, dark red: too few samples).\n"
-                              "DLSS inputs: the images DLSS will get, written during normal path tracing.\n"
-                              "Depth / hit distance: grey = near to far, light blue = sky, black = unknown.\n"
-                              "Motion vectors: grey = still, red/green = moving left/up.\n"
-                              "Reprojection error: last frame's albedo fetched through the motion vectors,\n"
-                              "minus this frame's. Should stay black while the camera or objects move,\n"
-                              "except at edges that just came into view (blue: off-screen last frame).");
+        if (ImGui::BeginTabItem("Camera")) {
+            buildCameraUi();
+            ImGui::EndTabItem();
         }
-        ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
-        ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
-        ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
-        ImGui::Combo("Emissive light", &settings.emissiveSampling,
-                     "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
-        ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
-        ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
-        ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
-                            "instead of slowly converging sparkles (fireflies)");
-        buildRadianceCacheUi();
-        ImGui::BeginDisabled(dlssActive());  // DLSS averages over time itself
-        ImGui::Checkbox("Accumulate", &settings.accumulate);
-        ImGui::EndDisabled();
-        if (settings.accumulate && !dlssActive()) {
-            ImGui::SameLine();
-            ImGui::Text("%u frames (%u samples/pixel)", accumulatedFrames, accumulatedFrames * settings.samplesPerPixel);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Restart")) {
-                resetAccumulation = true;
-            }
+        if (ImGui::BeginTabItem("Lighting")) {
+            buildLightingUi();
+            ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Rendering")) {
+            buildRenderingUi();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Debug")) {
+            buildDebugUi();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-
-    buildNoiseUi();
-
-    ImGui::Separator();
-    ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
     ImGui::End();
 
     if (showImGuiDemo) {
@@ -161,6 +110,97 @@ void Application::buildImGui() {
     }
 
     ImGui::Render();
+}
+
+void Application::buildCameraUi() {
+    ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
+    ImGui::TextDisabled("hold right mouse button to look around");
+    ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
+    ImGui::DragFloat("Yaw", &camera.yaw, 0.5f);
+    ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
+    ImGui::SliderFloat("Field of view", &camera.fov, 20.0f, 120.0f);
+    ImGui::SliderFloat("Move speed", &camera.moveSpeed, 0.1f, 20.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+}
+
+// ImGui needs unique IDs per widget; "##sun" suffixes are hidden from the labels.
+void Application::buildLightingUi() {
+    ImGui::SeparatorText("Sun");
+    ImGui::Checkbox("Enabled##sun", &settings.sunEnabled);
+    ImGui::SliderFloat("Azimuth", &settings.sunAzimuth, -180.0f, 180.0f);
+    ImGui::SliderFloat("Elevation", &settings.sunElevation, -10.0f, 90.0f);
+    ImGui::SliderFloat("Size (degrees)", &settings.sunAngularRadius, 0.0f, 15.0f, "%.2f");
+    ImGui::ColorEdit3("Color##sun", &settings.sunColor.x);
+    ImGui::SliderFloat("Intensity##sun", &settings.sunIntensity, 0.0f, 5.0f);
+    ImGui::Checkbox("Shadows", &settings.shadowsEnabled);
+
+    ImGui::SeparatorText("Sky");
+    buildEnvironmentUi();  // Environment.cpp
+
+    ImGui::SeparatorText("Lights from models");
+    buildPunctualLightSettingsUi();  // Lights.cpp
+}
+
+void Application::buildRenderingUi() {
+    ImGui::SeparatorText("Renderer");
+    buildRenderModeUi();
+    ImGui::BeginDisabled(dlssActive());  // DLSS averages over time itself
+    ImGui::Checkbox("Accumulate", &settings.accumulate);
+    ImGui::EndDisabled();
+    if (settings.accumulate && !dlssActive()) {
+        ImGui::SameLine();
+        ImGui::Text("%u frames (%u samples/pixel)", accumulatedFrames, accumulatedFrames * settings.samplesPerPixel);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Restart")) {
+            resetAccumulation = true;
+        }
+    }
+
+    ImGui::SeparatorText("Light paths");
+    ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
+    ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
+    ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
+    ImGui::Combo("Emissive light", &settings.emissiveSampling,
+                 "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
+    ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
+    ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
+    ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
+                        "instead of slowly converging sparkles (fireflies)");
+    buildRadianceCacheUi();
+
+    ImGui::SeparatorText("Image");
+    buildExposureUi();
+    ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
+}
+
+void Application::buildDebugUi() {
+    ImGui::Combo("Debug view", &settings.debugView,
+                 "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"
+                 "Base color\0Metallic\0Roughness\0Transmission\0Emissive\0Tangents\0"
+                 "Radiance cache\0"
+                 "DLSS input: depth\0DLSS input: motion vectors\0DLSS input: diffuse albedo\0"
+                 "DLSS input: specular albedo\0DLSS input: normals\0DLSS input: roughness\0"
+                 "DLSS input: specular hit distance\0DLSS input: reprojection error\0");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Radiance cache: the indirect light the cache holds for what the camera sees, cell by cell\n"
+                          "(magenta: no cell yet, dark red: too few samples).\n"
+                          "DLSS inputs: the images DLSS will get, written during normal path tracing.\n"
+                          "Depth / hit distance: grey = near to far, light blue = sky, black = unknown.\n"
+                          "Motion vectors: grey = still, red/green = moving left/up.\n"
+                          "Reprojection error: last frame's albedo fetched through the motion vectors,\n"
+                          "minus this frame's. Should stay black while the camera or objects move,\n"
+                          "except at edges that just came into view (blue: off-screen last frame).");
+    }
+    if (settings.debugView != 0) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Off")) {
+            settings.debugView = 0;
+        }
+    }
+
+    buildNoiseUi();
+
+    ImGui::Separator();
+    ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
 }
 
 // Records commands with `function`, submits them and waits until the GPU is done.

@@ -40,6 +40,7 @@ add_executable(vulkanDemo main.cpp
         source/Scene.cpp source/Materials.cpp
         source/BuiltInModels.cpp source/BuiltInModels.h
         source/Lights.cpp
+        source/Environment.cpp
         source/Exposure.cpp
         source/Noise.cpp
         source/RadianceCache.cpp

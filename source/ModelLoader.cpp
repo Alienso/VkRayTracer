@@ -3,7 +3,8 @@
 //
 // A glTF file is a tree of nodes. Each node has a transform and may point at a mesh; a mesh is a list of
 // primitives (triangles + one material). We turn every primitive into one Mesh and every node that uses
-// a mesh into instances, with the node's transform multiplied down from its parents.
+// a mesh into instances, with the node's transform multiplied down from its parents. Nodes with a light
+// (KHR_lights_punctual) become PunctualLights the same way.
 // Materials and the images they use are loaded along the way; images are decoded with stb_image.
 //
 
@@ -542,6 +543,22 @@ static void addNodeInstances(const cgltf_data* data, const cgltf_node* node, con
         for (uint32_t meshIndex : meshesOfGltfMesh[gltfMeshIndex]) {
             model.instances.push_back({meshIndex, transform});
         }
+    }
+    if (node->light && node->light->type != cgltf_light_type_invalid) {
+        const cgltf_light& gltfLight = *node->light;
+        PunctualLight light;
+        light.name = gltfLight.name ? gltfLight.name : (node->name ? node->name : "light");
+        light.type = gltfLight.type == cgltf_light_type_directional ? LightType::Directional
+                   : gltfLight.type == cgltf_light_type_spot ? LightType::Spot : LightType::Point;
+        light.color = glm::make_vec3(gltfLight.color);
+        light.intensity = gltfLight.intensity;
+        light.range = gltfLight.range;
+        if (light.type == LightType::Spot) {
+            light.innerConeAngle = gltfLight.spot_inner_cone_angle;
+            light.outerConeAngle = gltfLight.spot_outer_cone_angle;
+        }
+        light.transform = transform;
+        model.lights.push_back(light);
     }
     for (cgltf_size i = 0; i < node->children_count; i++) {
         addNodeInstances(data, node->children[i], transform, meshesOfGltfMesh, model);

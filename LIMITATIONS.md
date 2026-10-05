@@ -110,13 +110,48 @@ uploaded. Fine for thousands of triangles, slow for scenes with many glowing mes
 A sun with angular radius 0 can only be found by shadow rays: mirrors don't show it, and the camera sees a
 disc clamped to a minimum size.
 
+### Punctual lights: all of them, or one at random
+Lights from the files (KHR_lights_punctual) get a shadow ray each at every surface, up to 8 lights. With more,
+one is picked at random per surface (uniformly, not by how much it matters there), so scenes with many lamps get
+noisy, like the emissive triangles (see the light tree item in the roadmap). They have no size: sharp shadows,
+and mirrors don't show them (no ray can hit a point). When an object is scaled (or fitted to 2 units), its lights'
+intensity is scaled by the square of that, so the model stays lit the same. A point light touching geometry (a bulb
+inside its lamp) makes those surfaces extremely bright a few centimeters away: speckles everywhere, as paths find
+them only rarely. Such files need the light moved out, or a spot that keeps the fixture outside its cone.
+- Where: `samplePunctualLights` (shaders/raytrace.comp), `buildPunctualLightList` (source/Lights.cpp).
+
+### Sky sampling doesn't know what blocks the sky
+Shadow rays pick sky directions by brightness alone. For an HDR map that is what matters (its sun gets the
+samples): one-frame error vs bounce rays only, Bistro Exterior ~150x lower per ms, Bistro Interior ~3x. The
+gradient sky is brightest at the horizon and on the "ground" below it, which walls and floors usually block, so
+many of its shadow rays are wasted: Bistro Interior (windows) ~1.2x better per ms, Sponza about even (it costs
+1-1.5 ms more per frame there, the noise is the same). The "Sample the sky" checkbox switches it off.
+- Where: source/Environment.cpp (the table), `sampleEnvironment` and the "Direct skylight" part of `tracePath`.
+- Fix: also weight by the surface's cosine (a few tables per normal direction), or learn which directions are
+  open per region of the scene (path guiding).
+
+### Sky behind glass: thin panes only
+Through thin glass (windows) the sky's shadow rays and bounce rays share it by MIS. Behind solid (refracting)
+glass only the shadow rays count it, in a straight line (as for the sun and lamps, see `shadowTransmittance`),
+so a glossy surface reflecting the sky through solid glass gets fireflies. Rough thin glass bends bounce rays a
+little, so MIS there is slightly approximate.
+
+### HDR maps: one size, no filtering, two suns
+The map is kept at full size as 32-bit floats (128 MB for a 4k map) without mip levels: fine for paths, which
+average over many directions. The analytic Sun is independent of the map: a map with its own sun lights the scene
+twice unless the Sun is switched off. Only equirectangular .hdr (Radiance) files are read (stb_image).
+- Fix: estimate the map's sun (brightest cells) and offer to replace it by the analytic one; EXR via tinyexr.
+
 ## Radiance cache
 
 ### The cache is biased
 Paths stop at the first cell they reach after a diffuse or rough bounce: they light that point directly
 (shadow rays, exact) and take the cell's averaged indirect light. A cell averages its whole area (about 32 pixels
 wide on screen) and all directions, so indirect light is slightly blurred. Direct light is kept out of the cells
-on purpose: with it, cells across a sun shadow's edge made Sponza 0.2..0.3% too bright. Cells are only used by
+on purpose: with it, cells across a sun shadow's edge made Sponza 0.2..0.3% too bright. Skylight is split by its
+MIS weights: the shadow rays' share stays out, the bounce rays' share goes in (a smooth sky is mostly that share,
+and taking it from the cell is much less noisy than one shadow ray; a map's sun is almost all the shadow rays'
+share, so its shadows stay sharp). Cells are only used by
 rays longer than 2 cells (inside a corner the paths trace on). Measured against the plain path tracer (HDR):
 Sponza within 0.1%, the dark corner by the basin within the measurement's ±2-3%, Cornell box -0.2%, helmet
 -0.1%. Cached values come from update paths that hit the cell at any depth, so they don't carry exactly
@@ -132,7 +167,7 @@ corner looks darker than it is. Its HDR average matches the cache's (see above).
 more without the cache (see "DLSS RR darkens Sponza's shade a little").
 
 ### The cache follows changes with a delay
-Old samples fade out over ~32 frames ("History"). The cache is cleared when the sun, sky, bounce count, light
+Old samples fade out over ~32 frames ("History"). The cache is cleared when the sun, sky (or HDR map), bounce count, light
 sampling settings or cell size change, when a model is loaded and when a material is edited; moving objects are
 only followed by the fading (their old light lingers for a moment, in DLSS modes as a short glow or shadow trail).
 - Where: `buildSceneUniforms` (`lightingChanged`), `recordMaterialUpdate`, `uploadSceneGeometry`.
@@ -180,10 +215,15 @@ emissive constant alone (noisier when only small parts glow); the Bistro convert
 ### Bistro conversion is approximate
 `tools/bistro/convert_bistro.py` turns the FBX + DDS release into glTF. Falcor sets parts of the materials in its
 own scene files, so the converter guesses: every material named "glass" becomes clear glass, roughness 0 except
-frosted (the files' dark base colors are made for raster blending and would turn glass black). Normal maps are
+frosted (the files' dark base colors are made for raster blending and would turn glass black). The exception is
+the Exterior's windows and doors (MASTER_Glass*): its buildings are hollow shells, so they stay opaque with their
+dark base color and roughness 0, a reflection over a dark room (as in Falcor). Normal maps are
 mostly DirectX (Y down); each one is tested (a real normal map has no curl) and flipped only if it isn't Y up
 already. Leaves and flowers get diffuse transmission 0.5, curtains and awnings 0.3, tinted by their base color
-(by name, a guess like the glass). The FBX point lights and directional light are dropped; emissive strength is 1 unless given.
+(by name, a guess like the glass). The Interior's 4 point lights become spots pointing down
+3 cm below their pendant lamps (as points inside the lamps they made speckles), at intensity 35 chosen by eye
+against the app's daylight (Blender's export gave 21740 cd); the Exterior's directional light is dropped (the app
+has its own sun). Emissive strength is 1 unless given.
 In the Wine scene, liquids touch or sit inside their glasses (Falcor uses nested priorities), see "Volumes assume closed meshes".
 
 ### Unsupported glTF features
@@ -192,6 +232,7 @@ In the Wine scene, liquids touch or sit inside their glasses (Falcor uses nested
 - Specular/glossiness workflow: only the diffuse color is kept.
 - Ambient occlusion and height maps are ignored on purpose (AO comes from ray tracing).
 - Other material extensions (clearcoat, sheen, specular, iridescence, anisotropy, ...) are ignored.
+- Cameras in the file are ignored (lights are read: KHR_lights_punctual).
 - Where: source/ModelLoader.cpp.
 
 ### No OBJ or FBX loader

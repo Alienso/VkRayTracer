@@ -153,6 +153,7 @@ int Application::findOrLoadModel(const std::string& fileName) {
     for (TextureData& texture : model.textures) {
         sceneTextures.push_back(std::move(texture));
     }
+    sceneModel.lights = model.lights;
     sceneModel.firstMaterial = firstMaterial;
     sceneModel.materialCount = static_cast<uint32_t>(model.materials.size());
     for (const MeshInstance& instance : model.instances) {
@@ -306,7 +307,27 @@ void Application::updateScene() {
         tlasDirty = true;
     }
 
-    // 5: glowing triangles moved, appeared, or a material's emission changed -> new light list.
+    // 5: punctual lights, every frame (a handful). Uploaded in this frame's command buffer when they changed; the
+    //    accumulated image and the radiance cache are outdated then (the uniforms don't show it).
+    buildPunctualLightList();
+    if (framePunctualLights.size() != uploadedPunctualLights.size() ||
+        std::memcmp(framePunctualLights.data(), uploadedPunctualLights.data(),
+                    framePunctualLights.size() * sizeof(GpuPunctualLight)) != 0) {
+        uploadedPunctualLights = framePunctualLights;
+        punctualLightsUploadPending = true;
+        resetAccumulation = true;
+        cacheClearPending = true;
+        VkDeviceSize size = sizeof(GpuPunctualLight) * uploadedPunctualLights.size();
+        if (size > punctualLightBuffer.capacity) {
+            vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+            ensureStreamedCapacity(punctualLightBuffer, size);
+            if (rtDescriptorSet != VK_NULL_HANDLE) {
+                updateRayTracingDescriptorSet();
+            }
+        }
+    }
+
+    // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list.
     if (tlasDirty || materialsDirty) {
         buildLightList();  // uploaded in this frame's command buffer
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
@@ -384,10 +405,6 @@ void Application::destroySceneGeometry() {
 }
 
 void Application::buildSceneUi() {
-    if (!ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
-        return;
-    }
-
     // Add a model from the models folder
     const char* preview = availableModels.empty() ? "(no models found)" : availableModels[modelToAdd].c_str();
     if (ImGui::BeginCombo("##modelToAdd", preview)) {
@@ -486,6 +503,7 @@ void Application::buildSceneUi() {
             ImGui::TreePop();
         }
         buildMaterialUi(model);
+        buildPunctualLightUi(sceneModels[object.modelIndex]);
 
         if (ImGui::Button("Reset transform")) {
             object.rotation = glm::vec3(0.0f);

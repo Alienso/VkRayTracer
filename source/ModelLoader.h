@@ -107,10 +107,26 @@ struct MeshInstance {
     bool hiddenByDefault = false;  // new objects start with this part switched off (e.g. the Cornell box's front wall)
 };
 
+// KHR_lights_punctual: a light without size, placed by a node. It shines from the node's position (point,
+// spot) or along its direction (directional), down the node's -Z axis. Only shadow rays can find such a light.
+enum class LightType : uint32_t { Directional = 0, Point = 1, Spot = 2 };
+struct PunctualLight {
+    std::string name;
+    LightType type = LightType::Point;
+    glm::vec3 color = glm::vec3(1.0f);  // linear RGB
+    float intensity = 1.0f;          // point and spot: candela (lm/sr), directional: lux (lm/m^2)
+    float range = 0.0f;              // distance where the light fades out completely; 0 = no limit
+    float innerConeAngle = 0.0f;     // spot: full brightness inside this angle from the axis (radians)
+    float outerConeAngle = 0.7853982f;  // spot: dark outside it
+    glm::mat4 transform = glm::mat4(1.0f);  // the node's transform in the model (only position and rotation count)
+    bool enabled = true;             // UI
+};
+
 struct Model {
     std::string name;
     std::vector<Mesh> meshes;
     std::vector<MeshInstance> instances;
+    std::vector<PunctualLight> lights;
     std::vector<Material> materials;
     std::vector<TextureData> textures;      // material texture indices point in here
     glm::vec3 boundsMin = glm::vec3(0.0f);  // world space, over all instances

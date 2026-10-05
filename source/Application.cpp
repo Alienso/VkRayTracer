@@ -48,9 +48,12 @@ void Application::initVulkan() {
     createUniformBuffer();
     createSpecularAlbedoTable();
     findAvailableModels();
+    findAvailableEnvironments();
     createDefaultScene();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
     createLightBuffers();
+    createEnvironment();
+    updateEnvironment();  // the sky's sampling table, uploaded with the first frame
     updateScene();  // uploads the geometry, builds the BLASes and collects the instances
     chooseExtents();
     createRayTracingImages();
@@ -80,6 +83,7 @@ void Application::mainLoop() {
         ImGuiIO& io = ImGui::GetIO();
         camera.update(window, deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
         updateScene();  // apply object/model changes made in the UI
+        updateEnvironment();  // a new HDR map, or new sky colors to sample by
         applyRenderMode();  // accumulation <-> DLSS modes: new render size
 
         drawFrame();

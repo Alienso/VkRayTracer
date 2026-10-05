@@ -39,6 +39,13 @@ struct SceneUniforms {
     glm::vec4 skyZenithColor;
     glm::vec4 skyHorizonColor;
     glm::vec4 groundColor;
+    uint32_t environmentMap;         // 1 = the sky is the HDR map (binding 21), 0 = the gradient above
+    uint32_t environmentSampling;    // 1 = shadow rays are aimed at the sky too (distribution in binding 22)
+    uint32_t environmentWidth;       // cells of that distribution
+    uint32_t environmentHeight;
+    float environmentRotation;       // radians around the vertical axis
+    float environmentIntensity;      // multiplies the HDR map
+    uint32_t punctualLightCount;     // entries in the punctual light list (binding 23)
     uint32_t samplesPerPixel;
     uint32_t maxBounces;
     uint32_t frameIndex;
@@ -246,6 +253,7 @@ inline bool isGuideView(int view) { return view >= static_cast<int>(DebugView::G
 struct SceneModel {
     std::string name;                 // file name, or "Floor" for the built-in floor
     std::vector<MeshInstance> parts;  // meshIndex into Application::sceneMeshes, transform from the file's node tree
+    std::vector<PunctualLight> lights;  // KHR_lights_punctual, placed like the parts; edited in the UI
     glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0 (unless originalSize)
     uint32_t firstMaterial = 0;       // the model's materials are sceneMaterials[firstMaterial .. + materialCount)
     uint32_t materialCount = 0;
@@ -269,9 +277,10 @@ struct SceneObject {
 };
 
 // Values edited through ImGui
+// Map: an HDR photo of the surroundings (equirectangular .hdr from the environments folder).
 // White: uniform radiance 1 from every direction ("white furnace"). A white material that neither creates nor
 // loses energy then looks exactly as bright as the background; anything darker shows where energy is lost.
-enum class Environment : int { Sky = 0, Black = 1, White = 2 };
+enum class Environment : int { Sky = 0, Map = 1, Black = 2, White = 3 };
 
 // How light from glowing (emissive) surfaces is found. All three converge to the same image; they differ in noise.
 enum class EmissiveSampling : int {
@@ -289,6 +298,18 @@ struct EmissiveTriangle {
     float probability;  // chance of picking this triangle: proportional to area * brightness
     float cdf;          // sum of the probabilities up to and including this one (for picking with a binary search)
     float area;
+};
+
+// Must match PunctualLight in shaders/raytrace.comp (scalar layout). One per enabled light of every visible object,
+// in world space, rebuilt every frame (see updateScene).
+struct GpuPunctualLight {
+    glm::vec3 position;
+    uint32_t type;           // LightType
+    glm::vec3 direction;     // normalized, the way the light shines (spot axis, directional light's rays)
+    float range;             // 0 = no limit
+    glm::vec3 intensity;     // color * intensity * the UI's scale: candela (point, spot) or lux (directional)
+    float cosOuterCone;      // spot: cos of the outer and inner cone angles
+    float cosInnerCone;
 };
 
 // A device-local buffer the CPU refills from time to time. The CPU writes into a staging buffer of the
@@ -317,6 +338,12 @@ struct RenderSettings {
     glm::vec3 skyHorizonColor = {1.0f, 1.0f, 1.0f};
     glm::vec3 groundColor = {0.35f, 0.3f, 0.35f};
     float skyIntensity = 0.6f;
+    int environmentMap = 0;            // index into Application::availableEnvironments
+    float environmentRotation = 0.0f;  // degrees around the vertical axis
+    float environmentIntensity = 1.0f;
+    bool skySampling = true;           // shadow rays towards the sky (see Environment.cpp)
+    bool punctualLights = true;        // the lights that came with the models (KHR_lights_punctual)
+    float punctualLightScale = 1.0f;   // multiplies them all
 
     int samplesPerPixel = 1;
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
@@ -449,6 +476,26 @@ private:
     StreamedBuffer emissiveTriangleBuffer;
     StreamedBuffer instanceLightBuffer;
     bool lightsUploadPending = false;
+    // Punctual lights (Lights.cpp): this frame's, and what the GPU has (uploaded only when they differ)
+    std::vector<GpuPunctualLight> framePunctualLights;
+    std::vector<GpuPunctualLight> uploadedPunctualLights;
+    StreamedBuffer punctualLightBuffer;
+    bool punctualLightsUploadPending = false;
+
+    // Environment (Environment.cpp): the HDR map, and the table the shader picks sky directions from
+    std::vector<std::string> availableEnvironments;  // .hdr files in the environments/ folder
+    int loadedEnvironmentMap = -1;     // index into availableEnvironments of what environmentTexture holds
+    GpuTexture environmentTexture;     // RGBA32F; a black 1x1 placeholder until a map is loaded
+    VkSampler environmentSampler = VK_NULL_HANDLE;
+    glm::uvec2 environmentMapSize = glm::uvec2(0);
+    std::vector<float> environmentMapLuminance;  // the map's brightness in cells (see buildEnvironmentDistribution)
+    glm::uvec2 environmentMapCells = glm::uvec2(0);
+    std::vector<float> environmentDistribution;  // what binding 22 holds: row CDF, then each row's column CDF
+    glm::uvec2 environmentCells = glm::uvec2(0);  // columns, rows of environmentDistribution (0 = no sampling)
+    std::vector<float> environmentDistributionKey;  // the settings it was built for
+    StreamedBuffer environmentDistributionBuffer;
+    bool environmentUploadPending = false;
+    std::string environmentError;
 
     // Models found in the models/ folder next to the executable
     std::vector<std::string> availableModels;
@@ -685,6 +732,21 @@ private:
     void destroyLightBuffers();
     void buildLightList();
     void recordLightUpload(VkCommandBuffer commandBuffer);
+    void buildPunctualLightList();
+    void recordPunctualLightUpload(VkCommandBuffer commandBuffer);
+    void buildPunctualLightUi(SceneModel& model);
+    void buildPunctualLightSettingsUi();
+
+    // Environment.cpp
+    void findAvailableEnvironments();
+    void createEnvironment();
+    void destroyEnvironment();
+    void uploadEnvironmentImage(uint32_t width, uint32_t height, const float* rgba);
+    void destroyEnvironmentImage();
+    void loadEnvironmentMap(int index);
+    void updateEnvironment();
+    void recordEnvironmentUpload(VkCommandBuffer commandBuffer);
+    void buildEnvironmentUi();
 
     // Materials.cpp
     VkSampler getSampler(const TextureData& texture);
@@ -760,6 +822,12 @@ private:
 
     void initImGui();
     void buildImGui();
+    // The tabs of the settings window (ImGuiInit.cpp); the scene, DLSS, exposure, cache and noise parts live
+    // with their features (build*Ui above)
+    void buildCameraUi();
+    void buildLightingUi();
+    void buildRenderingUi();
+    void buildDebugUi();
     void cleanupImGui();
     void immediateSubmit(std::function<void(VkCommandBuffer)> &&function);
 };

@@ -40,6 +40,13 @@ layout(binding = 3) uniform SceneUniforms {
     vec4 skyZenithColor;    // rgb, already multiplied by the sky intensity
     vec4 skyHorizonColor;
     vec4 groundColor;       // environment below the horizon
+    uint environmentMap;    // 1 = the environment is the HDR map (environmentMap below) instead of the gradient
+    uint environmentSampling;  // 1 = shadow rays are aimed at the sky too (environmentCdf below)
+    uint environmentWidth;  // cells of environmentCdf
+    uint environmentHeight;
+    float environmentRotation;   // radians around the vertical axis
+    float environmentIntensity;  // multiplies the HDR map
+    uint punctualLightCount;     // entries in punctualLights
     uint samplesPerPixel;
     uint maxBounces;        // number of surfaces a path may hit
     uint frameIndex;        // changes every frame, seeds the random numbers
@@ -158,7 +165,30 @@ const uint EMISSIVE_MIS = 2;
 // index differs between the threads of a warp: nonuniformEXT tells the compiler to handle that.
 layout(binding = 7) uniform sampler2D textures[];
 
+// The HDR environment map: equirectangular (u: around the horizon, v: from straight up to straight down)
+layout(binding = 21) uniform sampler2D environmentMap;
+// For picking sky directions in proportion to their brightness (Environment.cpp): the running sums (CDF) over the
+// environmentHeight rows, then for each row the running sums over its environmentWidth columns.
+layout(binding = 22, scalar) readonly buffer EnvironmentDistribution { float environmentCdf[]; };
+
+// Must match GpuPunctualLight in Application.h. The lights that came with the models (KHR_lights_punctual), in
+// world space: points, spots and directional lights without size, so only shadow rays reach them.
+struct PunctualLight {
+    vec3 position;
+    uint type;              // LIGHT_* below
+    vec3 direction;         // the way it shines
+    float range;            // 0 = no limit
+    vec3 intensity;         // candela (point, spot), lux (directional)
+    float cosOuterCone;
+    float cosInnerCone;
+};
+layout(binding = 23, scalar) readonly buffer PunctualLights { PunctualLight punctualLights[]; };
+const uint LIGHT_DIRECTIONAL = 0;
+const uint LIGHT_POINT = 1;
+const uint LIGHT_SPOT = 2;
+
 const float PI = 3.14159265359;
+const float SKY_DISTANCE = 1e5;  // shadow rays towards the sun or the sky: anything closer blocks them
 
 // ---------------------------------------------------------------------------------------------
 // Random numbers (PCG hash)
@@ -426,9 +456,25 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
     return hit;
 }
 
-// Light coming from the environment in a direction: a sky gradient above the horizon, ground below.
-// The sun is NOT part of it, it is handled separately with shadow rays (see main).
+// Where a direction lands on the environment map, and back. u goes around the horizon (the same way as in
+// Blender, so a map looks the same there), v from straight up (0) to straight down (1).
+vec2 environmentUv(vec3 direction) {
+    float angle = atan(-direction.z, -direction.x) + scene.environmentRotation;
+    return vec2(fract(angle / (2.0 * PI) + 0.5), acos(clamp(direction.y, -1.0, 1.0)) / PI);
+}
+
+vec3 environmentDirection(float u, float cosTheta) {
+    float angle = 2.0 * PI * (u - 0.5) - scene.environmentRotation;
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    return vec3(-sinTheta * cos(angle), cosTheta, -sinTheta * sin(angle));
+}
+
+// Light coming from the environment in a direction: the HDR map, or a sky gradient above the horizon and
+// ground below. The sun is NOT part of it, it is handled separately with shadow rays (see tracePath).
 vec3 environmentLight(vec3 direction) {
+    if (scene.environmentMap != 0) {
+        return textureLod(environmentMap, environmentUv(direction), 0.0).rgb * scene.environmentIntensity;
+    }
     float skyT = pow(smoothstep(0.0, 0.4, direction.y), 0.35);
     vec3 sky = mix(scene.skyHorizonColor.rgb, scene.skyZenithColor.rgb, skyT);
     float groundToSky = smoothstep(-0.01, 0.0, direction.y);
@@ -771,12 +817,16 @@ bool sampleGlassExit(Hit hit, vec3 v, inout uint seed, out vec3 l) {
 // otherwise the tint of the glass on the way. Glass is passed in a straight line, without bending: following
 // the bent path to a light is what caustics would need, which we skip on purpose. crossedGlass tells the caller
 // that this light can't also be found by a bounce ray (those are bent by the glass), so no MIS for it.
+// crossedSolidGlass: some of it was solid. Thin panes don't bend rays, so for the sky the bounce rays through
+// them do find the same light, and MIS stays on (see tracePath).
 //
 // Candidates on glass come in no particular order. Absorption inside a solid depends on the length inside,
 // which is (sum of the distances where the ray leaves) - (sum where it enters) for any number of crossings,
 // so it can be summed in any order.
-vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout uint seed, out bool crossedGlass) {
+vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout uint seed, out bool crossedGlass,
+                         out bool crossedSolidGlass) {
     crossedGlass = false;
+    crossedSolidGlass = false;
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
                           origin, 0.001, direction, maxDistance);
@@ -835,6 +885,7 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout u
             tint *= color;
         }
         if (material.solid != 0) {
+            crossedSolidGlass = true;
             float distance = rayQueryGetIntersectionTEXT(rayQuery, false) * length(worldToObject * direction) * mesh.unitScale;
             opticalDepth += material.absorption * (entering ? -distance : distance);
         }
@@ -878,6 +929,57 @@ float misWeight(float pdfThis, float pdfOther) {
 float lightPdf(int lightIndex, float distance, float cosLight) {
     EmissiveTriangle light = emissiveTriangles[lightIndex];
     return light.probability / max(light.area, 1e-12) * distance * distance / max(cosLight, 1e-6);
+}
+
+// Light sampling for the sky (see Environment.cpp): the sphere of directions in cells, rows from straight up to
+// straight down, each row cut into columns. A cell is picked with a chance proportional to its brightness times
+// its solid angle, then a direction evenly inside it.
+
+// The first entry of environmentCdf[first .. first + count) that reaches u
+uint searchEnvironmentCdf(uint first, uint count, float u) {
+    uint low = 0, high = count - 1;
+    while (low < high) {
+        uint middle = (low + high) / 2;
+        if (environmentCdf[first + middle] < u) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+// pdf (per solid angle) of a direction in this cell
+float environmentCellPdf(uint row, uint column) {
+    uint width = scene.environmentWidth, height = scene.environmentHeight;
+    uint rowStart = height + row * width;
+    float rowChance = environmentCdf[row] - (row > 0 ? environmentCdf[row - 1] : 0.0);
+    float columnChance = environmentCdf[rowStart + column] - (column > 0 ? environmentCdf[rowStart + column - 1] : 0.0);
+    float cos0 = cos(PI * float(row) / float(height));
+    float cos1 = cos(PI * float(row + 1) / float(height));
+    float solidAngle = 2.0 * PI / float(width) * (cos0 - cos1);
+    return rowChance * columnChance / max(solidAngle, 1e-12);
+}
+
+// How likely sampleEnvironment is to pick this direction (for MIS)
+float environmentPdf(vec3 direction) {
+    vec2 uv = environmentUv(direction);
+    uint row = min(uint(uv.y * float(scene.environmentHeight)), scene.environmentHeight - 1);
+    uint column = min(uint(uv.x * float(scene.environmentWidth)), scene.environmentWidth - 1);
+    return environmentCellPdf(row, column);
+}
+
+vec3 sampleEnvironment(inout uint seed, out float pdf) {
+    uint height = scene.environmentHeight, width = scene.environmentWidth;
+    uint row = searchEnvironmentCdf(0, height, randomFloat(seed));
+    uint column = searchEnvironmentCdf(height + row * width, width, randomFloat(seed));
+    // Evenly over the cell's solid angle: evenly in cos(angle from straight up) and around
+    float cos0 = cos(PI * float(row) / float(height));
+    float cos1 = cos(PI * float(row + 1) / float(height));
+    float cosTheta = mix(cos0, cos1, randomFloat(seed));
+    float u = (float(column) + randomFloat(seed)) / float(width);
+    pdf = environmentCellPdf(row, column);  // 0 for a black cell hit by a random number exactly on its boundary
+    return environmentDirection(u, cosTheta);
 }
 
 // Light given off at a point of a glowing triangle. A hole in a cut-out doesn't glow, and a see-through
@@ -946,8 +1048,8 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
         return vec3(0.0);  // a dark spot of an emissive texture, or a direction the surface doesn't reflect into
     }
     // Stop just short of the light itself, it would count as a blocker otherwise.
-    bool crossedGlass;
-    vec3 transmittance = shadowTransmittance(surfacePoint, direction, distance * 0.999, seed, crossedGlass);
+    bool crossedGlass, crossedSolidGlass;
+    vec3 transmittance = shadowTransmittance(surfacePoint, direction, distance * 0.999, seed, crossedGlass, crossedSolidGlass);
     if (all(equal(transmittance, vec3(0.0)))) {
         return vec3(0.0);
     }
@@ -958,6 +1060,82 @@ vec3 sampleEmissiveLight(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint,
                    ? misWeight(pdfLight, pdfBounce) : 1.0;
     // Monte Carlo: (what arrives * how the surface reflects it) / how likely we were to pick this sample
     return emission * transmittance * brdf * abs(l.z) / pdfLight * weight;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Punctual lights
+//
+// A point light of intensity I (candela) lights a surface facing it from distance d with I / d^2 (lux): the light
+// spreads over a sphere. A spot does the same inside its cone, fading out between the inner and the outer cone; a
+// directional light gives its intensity (lux) everywhere, like the sun. They have no size: bounce rays never hit
+// them (no MIS needed), and their shadows are sharp.
+
+vec3 punctualLightAt(PunctualLight light, Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint, inout uint seed) {
+    vec3 direction;
+    float distance;
+    vec3 arriving;  // light arriving at a surface facing it (lux)
+    if (light.type == LIGHT_DIRECTIONAL) {
+        direction = -light.direction;
+        distance = SKY_DISTANCE;
+        arriving = light.intensity;
+    } else {
+        vec3 toLight = light.position - hit.position;
+        float distanceSquared = dot(toLight, toLight);
+        distance = sqrt(distanceSquared);
+        if (distance < 1e-4) {
+            return vec3(0.0);
+        }
+        direction = toLight / distance;
+        arriving = light.intensity / distanceSquared;
+        if (light.range > 0.0) {
+            // glTF's recommended fade-out: smooth, and exactly 0 at the range
+            float ratio = distance / light.range;
+            float window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
+            arriving *= window * window;
+        }
+        if (light.type == LIGHT_SPOT) {
+            float cosAxis = dot(-direction, light.direction);
+            float t = clamp((cosAxis - light.cosOuterCone) / (light.cosInnerCone - light.cosOuterCone), 0.0, 1.0);
+            arriving *= t * t;
+        }
+    }
+    if (all(equal(arriving, vec3(0.0)))) {
+        return vec3(0.0);
+    }
+
+    // In front of the surface, or behind a thin one that lets light through (diffuse transmission)
+    vec3 l = toLocal(frame, direction);
+    float side = dot(hit.geometricNormal, direction);
+    bool behind = l.z < 0.0 && side < 0.0 && hit.diffuseTransmission > 0.0;
+    if (!((l.z > 0.0 && side > 0.0) || behind)) {
+        return vec3(0.0);
+    }
+    float pdfBounce;
+    vec3 brdf = evaluateBrdf(hit, v, l, pdfBounce);
+    if (all(equal(brdf, vec3(0.0)))) {
+        return vec3(0.0);
+    }
+    vec3 origin = behind ? hit.position - hit.geometricNormal * 0.001 : surfacePoint;
+    bool crossedGlass, crossedSolidGlass;
+    vec3 transmittance = shadowTransmittance(origin, direction, distance * 0.999, seed, crossedGlass, crossedSolidGlass);
+    return arriving * transmittance * brdf * abs(l.z);
+}
+
+// Direct light from the punctual lights at a surface point, already multiplied by the surface's response.
+// Up to MAX_PUNCTUAL_LIGHTS_PER_HIT lights: a shadow ray to each (exact). More: one picked at random, counted
+// punctualLightCount times (correct on average, noisy with many lights; a light tree would pick better).
+const uint MAX_PUNCTUAL_LIGHTS_PER_HIT = 8;
+vec3 samplePunctualLights(Hit hit, ShadingFrame frame, vec3 v, vec3 surfacePoint, inout uint seed) {
+    uint count = scene.punctualLightCount;
+    if (count <= MAX_PUNCTUAL_LIGHTS_PER_HIT) {
+        vec3 sum = vec3(0.0);
+        for (uint i = 0; i < count; i++) {
+            sum += punctualLightAt(punctualLights[i], hit, frame, v, surfacePoint, seed);
+        }
+        return sum;
+    }
+    uint picked = min(uint(randomFloat(seed) * float(count)), count - 1);
+    return float(count) * punctualLightAt(punctualLights[picked], hit, frame, v, surfacePoint, seed);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1097,6 +1275,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
     bool sunMis = sunOn && sunSolidAngle > 1e-6 && scene.shadowsEnabled != 0;
     float sunPdf = 1.0 / max(sunSolidAngle, 1e-6);  // shadow rays pick a uniformly random direction on the disc
     vec3 sunRadiance = PI * scene.sunColor.rgb / max(sunSolidAngle, 1e-4);
+    // The sky: found by bounce rays that leave the scene, and (if on) by shadow rays aimed at it, again with MIS
+    bool sampleSky = scene.environmentSampling != 0;
 
     vec3 radiance = vec3(0.0);    // light collected along this path
     vec3 throughput = vec3(1.0);  // fraction of light found further along that still reaches the camera
@@ -1135,7 +1315,13 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
     bool throughGlass = false;    // went through glass since the last reflection
     bool reflectedOnce = false;   // there was a reflection, i.e. a surface that did light sampling
     // Seen without any reflection before (the camera looking through a window at the sun or a lamp), nothing
-    // counted it yet: then it counts fully. The sky is never light-sampled, so it always counts.
+    // counted it yet: then it counts fully.
+    // The sky (when light-sampled) is the exception for thin panes: they don't bend the ray, so the bounce ray
+    // through a window and the shadow ray through it find the same light, and share it by MIS like without glass.
+    // Otherwise a glossy table reflecting the window would only get the shadow rays, which rarely hit its narrow
+    // reflection: fireflies. So the sky needs to know about solid glass, and the last reflection's pdf.
+    bool throughSolidGlass = false;  // went through solid glass since the last reflection
+    float reflectionPdf = 0.0;       // bouncePdf of the last reflection (glass passes don't change it)
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
@@ -1150,7 +1336,17 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
         }
 
         if (!hit.found) {
-            ADD_LIGHT(throughput * environmentLight(direction));
+            vec3 skyLight = throughput * environmentLight(direction);
+            if (!sampleSky || !reflectedOnce) {
+                ADD_LIGHT(skyLight);  // nothing else finds it (the camera sees the sky, maybe through glass)
+            } else if (!throughSolidGlass) {
+                // The bounce-sampling share of the last surface's direct skylight, also through thin panes. Unlike
+                // the sun's, it goes into that surface's cache cell as well: a path ending there takes it from the
+                // cache (see the shadow ray below). A smooth sky is mostly found this way, so its light comes
+                // averaged; a bright spot (a map's sun) is almost entirely the shadow rays' share, so its shadows
+                // stay sharp.
+                ADD_LIGHT(skyLight * misWeight(reflectionPdf, environmentPdf(direction)));
+            }
             // The sun's disc: always visible to the camera; for bounce rays, the MIS share of the bounce method
             if (sunOn && dot(direction, sunDirection) >= sunCosRadius) {
                 if (!reflectedOnce) {
@@ -1295,16 +1491,47 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
                     float pdfBounce;
                     vec3 brdf = evaluateBrdf(hit, v, sunL, pdfBounce);
                     if (any(greaterThan(brdf, vec3(0.0)))) {
-                        bool crossedGlass = false;
+                        bool crossedGlass = false, crossedSolidGlass;
                         vec3 transmittance = scene.shadowsEnabled != 0
                                 ? shadowTransmittance(sunBehind ? hit.position - hit.geometricNormal * 0.001 : surfacePoint,
-                                                      towardsSun, 1000.0, seed, crossedGlass) : vec3(1.0);
+                                                      towardsSun, SKY_DISTANCE, seed, crossedGlass, crossedSolidGlass) : vec3(1.0);
                         // Ending in the cache, no bounce ray will look for the sun: the shadow ray counts fully
                         float sunWeight = sunMis && !crossedGlass && !endInCache ? misWeight(sunPdf, pdfBounce) : 1.0;
                         ADD_LIGHT_EXCEPT(throughput * transmittance * brdf * PI * scene.sunColor.rgb * abs(sunL.z) * sunWeight,
                                          currentVertex);
                     }
                 }
+            }
+
+            // Direct skylight: aim at a direction picked by the sky's brightness. Unlike the sun, always with a shadow
+            // ray: indoors the sky is mostly blocked, and "Shadows" is about the sun.
+            if (sampleSky) {
+                float skyPdf;
+                vec3 towardsSky = sampleEnvironment(seed, skyPdf);
+                vec3 skyL = toLocal(frame, towardsSky);
+                float skySide = dot(hit.geometricNormal, towardsSky);
+                bool skyBehind = skyL.z < 0.0 && skySide < 0.0 && hit.diffuseTransmission > 0.0;
+                if (skyPdf > 0.0 && ((skyL.z > 0.0 && skySide > 0.0) || skyBehind)) {
+                    float pdfBounce;
+                    vec3 brdf = evaluateBrdf(hit, v, skyL, pdfBounce);
+                    vec3 sky = environmentLight(towardsSky);
+                    if (any(greaterThan(brdf * sky, vec3(0.0)))) {
+                        bool crossedGlass, crossedSolidGlass;
+                        vec3 transmittance = shadowTransmittance(skyBehind ? hit.position - hit.geometricNormal * 0.001 : surfacePoint,
+                                                                 towardsSky, SKY_DISTANCE, seed, crossedGlass, crossedSolidGlass);
+                        // Behind solid glass no bounce ray counts it (as for the sun); behind thin panes they do.
+                        // Ending in the cache, the cache has the bounce rays' share (see the miss above), so this
+                        // stays the MIS share.
+                        float skyWeight = !crossedSolidGlass ? misWeight(skyPdf, pdfBounce) : 1.0;
+                        ADD_LIGHT_EXCEPT(throughput * transmittance * brdf * sky * abs(skyL.z) / skyPdf * skyWeight,
+                                         currentVertex);
+                    }
+                }
+            }
+
+            // Direct light from the lights that came with the models (points, spots, directional)
+            if (scene.punctualLightCount > 0) {
+                ADD_LIGHT_EXCEPT(throughput * samplePunctualLights(hit, frame, v, surfacePoint, seed), currentVertex);
             }
 
             // Direct light from glowing surfaces: the same idea, aimed at a random point on a random glowing triangle.
@@ -1342,9 +1569,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, out Guides guides) 
         origin = hit.position + hit.geometricNormal * (throughSurface ? -0.001 : 0.001);
         if (transmitted) {
             throughGlass = true;
+            throughSolidGlass = throughSolidGlass || hit.solid;
         } else {
             throughGlass = false;
+            throughSolidGlass = false;
             reflectedOnce = true;
+            reflectionPdf = bouncePdf;
         }
 
         // Russian roulette: after a few bounces, randomly stop paths that carry little light and

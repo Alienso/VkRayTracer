@@ -6,6 +6,8 @@
 //
 // Ours is 4 x 4 x 4 units, open at the front (+Z) like the original. The front wall is a part of the
 // model that starts hidden; show it under "Parts" to close the box and fly inside.
+// The point light variant replaces the ceiling panel by a point light (KHR_lights_punctual's kind) just below
+// it, as bright straight down as the panel: the same room with sharp shadows and a lit ceiling.
 //
 
 #include "BuiltInModels.h"
@@ -16,9 +18,10 @@
 
 static const char* cornellBoxName = "Cornell box";
 static const char* cornellBoxWithBlocksName = "Cornell box (classic, with blocks)";
+static const char* cornellBoxPointLightName = "Cornell box (blocks, point light)";
 
 const std::vector<std::string>& builtInModelNames() {
-    static const std::vector<std::string> names = {cornellBoxName, cornellBoxWithBlocksName};
+    static const std::vector<std::string> names = {cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName};
     return names;
 }
 
@@ -86,9 +89,9 @@ static Mesh blockMesh(const std::string& name, uint32_t material, glm::vec3 cent
     return mesh;
 }
 
-static Model createCornellBox(bool withBlocks) {
+static Model createCornellBox(bool withBlocks, bool pointLight) {
     Model model;
-    model.name = withBlocks ? cornellBoxWithBlocksName : cornellBoxName;
+    model.name = pointLight ? cornellBoxPointLightName : withBlocks ? cornellBoxWithBlocksName : cornellBoxName;
 
     // Colors close to the measured paints of the original box (converted to RGB)
     enum { White, Red, Green, Light };
@@ -116,7 +119,19 @@ static Model createCornellBox(bool withBlocks) {
 
     // The light: about a quarter of the ceiling's width, hanging a hair below it and facing down.
     const float lw = 0.5f, ld = 0.4f, ly = top - 0.002f;
-    model.meshes.push_back(quadMesh("light", Light, {-lw, ly, -ld}, {lw, ly, -ld}, {lw, ly, ld}, {-lw, ly, ld}));
+    if (pointLight) {
+        // The panel sends emission * area candela straight down (a flat glowing surface: less to the sides);
+        // the point light sends that in every direction.
+        PunctualLight point;
+        point.name = "point light";
+        point.type = LightType::Point;
+        point.color = light.emissiveColor;
+        point.intensity = light.emissiveStrength * (2.0f * lw) * (2.0f * ld);
+        point.transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, top - 0.1f, 0.0f));
+        model.lights.push_back(point);
+    } else {
+        model.meshes.push_back(quadMesh("light", Light, {-lw, ly, -ld}, {lw, ly, -ld}, {lw, ly, ld}, {-lw, ly, ld}));
+    }
 
     if (withBlocks) {
         // Positions and angles as in the original: a short cube front right, a tall block back left.
@@ -137,10 +152,13 @@ static Model createCornellBox(bool withBlocks) {
 
 Model createBuiltInModel(const std::string& name) {
     if (name == cornellBoxName) {
-        return createCornellBox(false);
+        return createCornellBox(false, false);
     }
     if (name == cornellBoxWithBlocksName) {
-        return createCornellBox(true);
+        return createCornellBox(true, false);
+    }
+    if (name == cornellBoxPointLightName) {
+        return createCornellBox(true, true);
     }
     throw std::runtime_error("unknown built-in model: " + name);
 }

@@ -5,12 +5,16 @@
 // every triangle with an emissive material goes into a list (in world space), and at every hit the shader
 // picks one at random, picks a random point on it and checks with a shadow ray whether that point is visible.
 // Brighter and larger triangles are picked more often, so the samples go where most light comes from.
+// The lights that come with the models (KHR_lights_punctual) are collected here too, see the end.
 //
 
 #include <vulkan/vulkan.h>
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
+#include <glm/gtc/constants.hpp>
+#include "../include/imgui/imgui.h"
 #include "Application.h"
 #include "Configuration.h"
 
@@ -86,11 +90,13 @@ void Application::createLightBuffers() {
     // Start small, they grow when needed. Never empty: descriptors can't point at nothing.
     createStreamedBuffer(emissiveTriangleBuffer, 1024 * sizeof(EmissiveTriangle));
     createStreamedBuffer(instanceLightBuffer, 256 * sizeof(int32_t));
+    createStreamedBuffer(punctualLightBuffer, 64 * sizeof(GpuPunctualLight));
 }
 
 void Application::destroyLightBuffers() {
     destroyStreamedBuffer(emissiveTriangleBuffer);
     destroyStreamedBuffer(instanceLightBuffer);
+    destroyStreamedBuffer(punctualLightBuffer);
 }
 
 static float luminance(glm::vec3 color) {
@@ -170,4 +176,98 @@ void Application::recordLightUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, instanceLightBuffer, instanceFirstLight.data(),
                          sizeof(int32_t) * instanceFirstLight.size());
     lightsUploadPending = false;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Punctual lights (KHR_lights_punctual): point, spot and directional lights that come with a model. They have no
+// size, so no ray can hit them: the shader only reaches them with shadow rays, one per light (see
+// samplePunctualLights). Few lights per scene is the usual case, so there is no light picking here.
+
+// This frame's lights in world space, from the visible objects. Cheap, so every frame; uploaded only on changes.
+void Application::buildPunctualLightList() {
+    framePunctualLights.clear();
+    if (!settings.punctualLights) {
+        return;
+    }
+    for (const SceneObject& object : sceneObjects) {
+        if (!object.visible) {
+            continue;
+        }
+        const SceneModel& model = sceneModels[object.modelIndex];
+        glm::mat4 objectTransform = object.transform() * (object.originalSize ? glm::mat4(1.0f) : model.fit);
+        // The file's distances (falloff, range) are scaled with the object; keeping the brightness at the same
+        // place in the model means intensity * scale^2 (light falls off with the distance squared). The file's
+        // own node scales don't count (glTF: they don't affect lights).
+        float scale = std::cbrt(std::abs(glm::determinant(glm::mat3(objectTransform))));
+        for (const PunctualLight& light : model.lights) {
+            if (!light.enabled) {
+                continue;
+            }
+            glm::mat4 world = objectTransform * light.transform;
+            GpuPunctualLight gpu{};
+            gpu.type = static_cast<uint32_t>(light.type);
+            gpu.position = glm::vec3(world[3]);
+            glm::vec3 axis = glm::vec3(world * glm::vec4(0.0f, 0.0f, -1.0f, 0.0f));  // lights shine down -Z
+            gpu.direction = glm::length(axis) > 0.0f ? glm::normalize(axis) : glm::vec3(0.0f, -1.0f, 0.0f);
+            bool directional = light.type == LightType::Directional;
+            gpu.intensity = light.color * light.intensity * settings.punctualLightScale * (directional ? 1.0f : scale * scale);
+            gpu.range = light.range * scale;
+            float outer = std::clamp(light.outerConeAngle, 1e-4f, glm::half_pi<float>());
+            float inner = std::clamp(light.innerConeAngle, 0.0f, outer);
+            gpu.cosOuterCone = std::cos(outer);
+            gpu.cosInnerCone = std::max(std::cos(inner), gpu.cosOuterCone + 1e-4f);  // no division by 0 in the shader
+            if (luminance(gpu.intensity) > 0.0f) {
+                framePunctualLights.push_back(gpu);
+            }
+        }
+    }
+}
+
+void Application::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
+    recordStreamedUpload(commandBuffer, punctualLightBuffer, uploadedPunctualLights.data(),
+                         sizeof(GpuPunctualLight) * uploadedPunctualLights.size());
+    punctualLightsUploadPending = false;
+}
+
+// Lights belong to the model like materials, so editing one changes every object that shows that model.
+void Application::buildPunctualLightUi(SceneModel& model) {
+    if (model.lights.empty() ||
+        !ImGui::TreeNode("lights", "Lights (%zu, shared by all %s objects)", model.lights.size(), model.name.c_str())) {
+        return;
+    }
+    static const char* typeNames[] = {"directional", "point", "spot"};
+    for (size_t i = 0; i < model.lights.size(); i++) {
+        PunctualLight& light = model.lights[i];
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::Checkbox("##enabled", &light.enabled);
+        ImGui::SameLine();
+        if (ImGui::TreeNode("light", "%s (%s)", light.name.c_str(), typeNames[static_cast<uint32_t>(light.type)])) {
+            ImGui::ColorEdit3("Color", &light.color.x);
+            ImGui::DragFloat(light.type == LightType::Directional ? "Intensity (lux)" : "Intensity (candela)",
+                             &light.intensity, std::max(light.intensity * 0.01f, 0.001f), 0.0f, 1e6f, "%.3f");
+            if (light.type != LightType::Directional) {
+                ImGui::DragFloat("Range (0 = none)", &light.range, 0.05f, 0.0f, 1e4f);
+            }
+            if (light.type == LightType::Spot) {
+                ImGui::SliderAngle("Inner cone", &light.innerConeAngle, 0.0f, 90.0f);
+                ImGui::SliderAngle("Outer cone", &light.outerConeAngle, 0.0f, 90.0f);
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    ImGui::TreePop();
+}
+
+// The "Lights from models" part of the Lighting tab
+void Application::buildPunctualLightSettingsUi() {
+    ImGui::Checkbox("Enabled##punctual", &settings.punctualLights);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu lights", framePunctualLights.size());
+    ImGui::SliderFloat("Scale##punctual", &settings.punctualLightScale, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Multiplies every light from the files (KHR_lights_punctual). They come in candela (point,\n"
+                          "spot) and lux (directional). For comparison: the Sun at intensity 1 gives pi lux, a 100 cd\n"
+                          "lamp 2 m away gives 25 lux. Edit single lights under Scene > object > Lights.");
+    }
 }
