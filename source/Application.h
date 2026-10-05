@@ -70,6 +70,8 @@ struct SceneUniforms {
     uint32_t sunMis;                 // 1 = the sun has a size, so bounce rays find it too (MIS with its shadow rays)
     float sunPdf;                    // 1 / the disc's solid angle: the pdf of a shadow ray towards it
     float sunRadianceScale;          // sunColor times this = the light of one point of the disc (PI / solid angle)
+    uint32_t textureMipmaps;         // 1 = textures are read at the mip level that fits the hit (ray cones)
+    float pixelSpreadAngle;          // radians between neighboring camera rays (render resolution)
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -380,6 +382,7 @@ struct RenderSettings {
     int samplesPerPixel = 1;
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
+    bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
     bool radianceCache = true;      // paths stop after a diffuse bounce and read the light from the cache
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
@@ -737,7 +740,7 @@ private:
     void createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
     VkDeviceAddress getBufferDeviceAddress(VkBuffer buffer);
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
-    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory, VkImageView& imageView);
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory, VkImageView& imageView, uint32_t mipLevels = 1);
     void createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image);
     void destroyImage(RenderImage& image);
 

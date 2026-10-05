@@ -25,11 +25,15 @@ enum class TextureWrap : int { Repeat = 0, ClampToEdge = 1, MirroredRepeat = 2 }
 // 4x4 texels per block of 8 (BC1) or 16 bytes. BC5 has two channels only (normal maps: X and Y, Z is rebuilt).
 enum class TextureFormat : int { RGBA8 = 0, BC1, BC2, BC3, BC5, BC7 };
 
-// An image as it goes to the GPU: 8-bit RGBA, or the blocks of a compressed format (first mip level only).
+// An image as it goes to the GPU: 8-bit RGBA, or the blocks of a compressed format.
+// Mip levels: each half the size of the one before (rounded down, at least 1), down to 1x1, for distant or blurry
+// hits (see the shader's ray cones). pixels holds them one after the other, the full-size level first. A .dds file
+// brings its own; for 8-bit images uploadNewTextures makes them.
 struct TextureData {
     std::string name;
-    uint32_t width = 0;
+    uint32_t width = 0;   // of level 0
     uint32_t height = 0;
+    uint32_t mipLevels = 1;
     TextureFormat format = TextureFormat::RGBA8;
     std::vector<uint8_t> pixels;
     bool srgb = false;     // colors (base color, emissive) are stored sRGB-encoded; data (roughness, ...) is linear

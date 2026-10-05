@@ -98,22 +98,43 @@ def y_up_score(path):
     dy_dx = y[:-1, 1:] - y[:-1, :-1]
     return float((dx_dyup * dy_dx).mean() / (np.sqrt((dx_dyup ** 2).mean() * (dy_dx ** 2).mean()) + 1e-12))
 
+def level_blocks(path, info):
+    """All mip levels the file has, as block arrays (level 0 first). A level that doesn't fit ends the chain."""
+    bs = block_size(info['format'])
+    with open(path, 'rb') as f:
+        f.seek(info['offset'])
+        data = f.read()
+    levels, offset = [], 0
+    for level in range(info['mips']):
+        w, h = max(info['width'] >> level, 1), max(info['height'] >> level, 1)
+        bw, bh = (w + 3) // 4, (h + 3) // 4
+        n = bw * bh * bs
+        if offset + n > len(data):
+            break
+        levels.append(np.frombuffer(data[offset:offset + n], np.uint8).reshape(bh, bw, bs))
+        offset += n
+    return levels
+
 def write_bc5(src, dst, flip_green):
-    """Copy a BC5 normal map (level 0 only), optionally with its green channel inverted (DirectX -> OpenGL)."""
+    """Copy a BC5 normal map with all its mip levels, optionally with its green channel inverted (DirectX -> OpenGL).
+    The flip is exact per block, so every level is flipped on its own, no re-filtering."""
     info = read_header(src)
     assert info['format'] == 'ATI2', (src, info['format'])
-    blocks = level0_blocks(src, info).copy()
+    levels = [b.copy() for b in level_blocks(src, info)]
     if flip_green:
-        blocks[..., 8:16] = flip_channel_blocks(blocks[..., 8:16])
+        for blocks in levels:
+            blocks[..., 8:16] = flip_channel_blocks(blocks[..., 8:16])
     header = bytearray(128)
     header[0:4] = b'DDS '
-    flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000   # caps, height, width, pixelformat, linearsize
-    struct.pack_into('<IIIIIII', header, 4, 124, flags, info['height'], info['width'], blocks.size, 0, 1)
+    flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | (0x20000 if len(levels) > 1 else 0)  # + mipmapcount
+    struct.pack_into('<IIIIIII', header, 4, 124, flags, info['height'], info['width'], levels[0].size, 0, len(levels))
     struct.pack_into('<II4s', header, 76, 32, 0x4, b'ATI2')   # pixel format: size, FOURCC
-    struct.pack_into('<I', header, 108, 0x1000)               # caps: texture
+    caps = 0x1000 | (0x8 | 0x400000 if len(levels) > 1 else 0)  # texture (+ complex, mipmap)
+    struct.pack_into('<I', header, 108, caps)
     with open(dst, 'wb') as f:
         f.write(header)
-        f.write(blocks.tobytes())
+        for blocks in levels:
+            f.write(blocks.tobytes())
 
 def self_test():
     rng = np.random.default_rng(1)

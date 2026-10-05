@@ -701,6 +701,12 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
     uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !lightTree.empty() ? 1 : 0;
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
+    uniforms.textureMipmaps = settings.textureMipmaps ? 1 : 0;
+    // How much of the scene one ray stands for (the start of its ray cone, see uvFootprint in the shader): half an
+    // output pixel, vertically (pixels are square). The image ends up sharper than one render pixel: accumulation
+    // averages many offsets within each pixel, and DLSS adds detail up to the output resolution (NVIDIA's guide
+    // asks for a mip bias of log2(render / output size) - 1, which is this). A whole render pixel looks soft.
+    uniforms.pixelSpreadAngle = 0.5f * std::atan(2.0f * uniforms.tanHalfFov / static_cast<float>(outputExtent.height));
     // DLSS mode: every frame on its own (DLSS does the averaging over time), plus the guides it needs
     uniforms.accumulate = settings.accumulate && !dlssActive() ? 1 : 0;
     // Hit debug views overwrite the radiance image. Guide views are drawn by the display pass from the guide

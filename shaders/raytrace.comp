@@ -70,6 +70,8 @@ layout(binding = 3) uniform SceneUniforms {
     uint sunMis;            // 1 = the sun has a size: bounce rays find it too, shared with its shadow rays by MIS
     float sunPdf;           // pdf of a shadow ray towards the sun: 1 / the disc's solid angle
     float sunRadianceScale; // sunColor * this = the light of one point of the disc
+    uint textureMipmaps;    // 1 = textures are read at the level that fits the hit's footprint (ray cones, see traceClosest)
+    float pixelSpreadAngle; // angle between neighboring camera rays (radians): how fast a pixel's footprint grows
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -249,6 +251,8 @@ struct Hit {
     vec3 geometricNormal;   // world space, facing the ray. The triangle's real plane: use to offset new rays.
     vec3 tangent;           // world space, only for the debug view
     vec2 uv;
+    vec2 uvFootprintX;      // the hit's footprint in UV space: two axes of the ellipse (see uvFootprint)
+    vec2 uvFootprintY;
     uint meshIndex;
     uint instanceIndex;     // which TLAS instance (for its motion)
     uint materialIndex;
@@ -270,9 +274,21 @@ struct Hit {
     vec3 emissive;
 };
 
-// A compute shader has no screen-space derivatives to choose a mip level, so always read the full-resolution
-// level. Distant textures would alias, but the random pixel offsets + accumulation average that out.
-vec4 sampleTexture(int index, mat3x2 uvTransform, vec2 uv) {
+// Texture reads at a hit, filtered over the hit's footprint (see uvFootprint): the GPU picks the mip level and
+// filters along the footprint's long axis (anisotropic filtering). A footprint of 0 reads the full-size level.
+// The texture transform scales and rotates the footprint like the UVs.
+vec4 sampleTexture(int index, mat3x2 uvTransform, vec2 uv, vec2 footprintX, vec2 footprintY) {
+    mat2 linear = mat2(uvTransform[0], uvTransform[1]);
+    return textureGrad(textures[nonuniformEXT(index)], uvTransform * vec3(uv, 1.0), linear * footprintX, linear * footprintY);
+}
+
+vec4 sampleTexture(int index, mat3x2 uvTransform, Hit hit) {
+    return sampleTexture(index, uvTransform, hit.uv, hit.uvFootprintX, hit.uvFootprintY);
+}
+
+// The full-size level, for points that are tested rather than seen: the cut-out test during traversal (averaged
+// mip levels would let leaves fade into holes at a distance), and points picked on glowing triangles.
+vec4 sampleTextureFull(int index, mat3x2 uvTransform, vec2 uv) {
     return textureLod(textures[nonuniformEXT(index)], uvTransform * vec3(uv, 1.0), 0.0);
 }
 
@@ -281,7 +297,7 @@ void evaluateMaterial(inout Hit hit) {
 
     vec4 baseColor = material.baseColor;
     if (material.baseColorTexture >= 0) {
-        baseColor *= sampleTexture(material.baseColorTexture, material.baseColorUvTransform, hit.uv);
+        baseColor *= sampleTexture(material.baseColorTexture, material.baseColorUvTransform, hit);
     }
     hit.albedo = baseColor.rgb;
     hit.alpha = baseColor.a;
@@ -289,14 +305,14 @@ void evaluateMaterial(inout Hit hit) {
     hit.metallic = material.metallic;
     hit.roughness = material.roughness;
     if (material.metallicRoughnessTexture >= 0) {
-        vec4 metallicRoughness = sampleTexture(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, hit.uv);
+        vec4 metallicRoughness = sampleTexture(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, hit);
         hit.roughness *= metallicRoughness.g;
         hit.metallic *= metallicRoughness.b;
     }
 
     hit.transmission = material.transmission;
     if (material.transmissionTexture >= 0) {
-        hit.transmission *= sampleTexture(material.transmissionTexture, material.transmissionUvTransform, hit.uv).r;
+        hit.transmission *= sampleTexture(material.transmissionTexture, material.transmissionUvTransform, hit).r;
     }
     hit.ior = material.ior;
     hit.solid = material.solid != 0;
@@ -304,17 +320,17 @@ void evaluateMaterial(inout Hit hit) {
 
     hit.diffuseTransmission = material.diffuseTransmission;
     if (material.diffuseTransmissionTexture >= 0) {
-        hit.diffuseTransmission *= sampleTexture(material.diffuseTransmissionTexture, material.diffuseTransmissionUvTransform, hit.uv).a;
+        hit.diffuseTransmission *= sampleTexture(material.diffuseTransmissionTexture, material.diffuseTransmissionUvTransform, hit).a;
     }
     hit.diffuseTransmissionColor = material.diffuseTransmissionColor;
     if (hit.diffuseTransmission > 0.0 && material.diffuseTransmissionColorTexture >= 0) {
         hit.diffuseTransmissionColor *= sampleTexture(material.diffuseTransmissionColorTexture,
-                                                      material.diffuseTransmissionColorUvTransform, hit.uv).rgb;
+                                                      material.diffuseTransmissionColorUvTransform, hit).rgb;
     }
 
     hit.emissive = material.emissive;
     if (material.emissiveTexture >= 0) {
-        hit.emissive *= sampleTexture(material.emissiveTexture, material.emissiveUvTransform, hit.uv).rgb;
+        hit.emissive *= sampleTexture(material.emissiveTexture, material.emissiveUvTransform, hit).rgb;
     }
 }
 
@@ -327,7 +343,7 @@ float opacityAt(uint materialIndex, vec2 uv) {
     }
     float alpha = material.baseColor.a;
     if (material.baseColorTexture >= 0) {
-        alpha *= sampleTexture(material.baseColorTexture, material.baseColorUvTransform, uv).a;
+        alpha *= sampleTextureFull(material.baseColorTexture, material.baseColorUvTransform, uv).a;
     }
     if (material.alphaMode == ALPHA_MASK) {
         return alpha >= material.alphaCutoff ? 1.0 : 0.0;
@@ -365,7 +381,39 @@ void traverse(rayQueryEXT rayQuery, inout uint seed) {
     }
 }
 
-Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
+// Ray cones (Akenine-Moller et al. 2021, "Improved Shader and Texture Level of Detail Using Ray Cones"): every
+// ray stands for a thin cone, the part of the scene one pixel sees through it. Its width grows with the distance
+// (by the spread angle per unit) and with every bounce (a rough reflection spreads it, see tracePath). Where it
+// meets a surface it leaves an ellipse: as wide as the cone across the ray's slant, 1 / cos longer along it.
+// Mapped to UV space through the triangle, the ellipse's two axes are what textureGrad needs to pick the mip
+// level: a distant or blurry hit reads a small level (fewer texels, which stay in the cache; no shimmering), a
+// close one the full size. Ignores how a curved mirror or lens widens or narrows the cone.
+// e1, e2: the triangle's edges in world space, uv1, uv2: the same edges in UV space.
+void uvFootprint(vec3 e1, vec3 e2, vec2 uv1, vec2 uv2, vec3 direction, float width, out vec2 alongX, out vec2 alongY) {
+    alongX = vec2(0.0);
+    alongY = vec2(0.0);
+    vec3 n = cross(e1, e2);
+    float areaSquared = dot(n, n);  // (2 * area)^2
+    if (areaSquared < 1e-30 || width <= 0.0) {
+        return;
+    }
+    n *= inversesqrt(areaSquared);
+    vec3 across = cross(n, direction);  // on the surface, square to the slant: the ellipse's short axis
+    float acrossLength = length(across);
+    vec3 a = acrossLength > 1e-6 ? across / acrossLength : normalize(e1);  // straight on: any direction
+    vec3 b = cross(n, a);
+    vec3 axisA = a * width;
+    vec3 axisB = b * (width / max(abs(dot(n, direction)), 0.01));
+    // A vector on the triangle as s * e1 + t * e2 (solved with the edges' dot products), then in UV space
+    float g11 = dot(e1, e1), g12 = dot(e1, e2), g22 = dot(e2, e2);
+    vec2 stA = vec2(g22 * dot(axisA, e1) - g12 * dot(axisA, e2), g11 * dot(axisA, e2) - g12 * dot(axisA, e1)) / areaSquared;
+    vec2 stB = vec2(g22 * dot(axisB, e1) - g12 * dot(axisB, e2), g11 * dot(axisB, e2) - g12 * dot(axisB, e1)) / areaSquared;
+    alongX = uv1 * stA.x + uv2 * stA.y;
+    alongY = uv1 * stB.x + uv2 * stB.y;
+}
+
+// coneWidth, coneSpread: the ray's cone at its origin (see uvFootprint); 0, 0 reads every texture at full size.
+Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, float coneSpread) {
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.001, direction, 1000.0);
     traverse(rayQuery, seed);
@@ -385,8 +433,8 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
     uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
     int firstLight = instanceFirstLight[rayQueryGetIntersectionInstanceIdEXT(rayQuery, true)];
     hit.lightIndex = firstLight >= 0 ? firstLight + primitive : -1;
-    // The corners' attributes are read where they are needed, not all at once: the material's texture reads come
-    // first, and positions, normals and tangents read before them would sit in registers meanwhile.
+    // The corners' attributes are read where they are needed, not all at once: normals and tangents read before
+    // the material's texture reads would sit in registers meanwhile.
     uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
 
     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
@@ -394,18 +442,27 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
 
     hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
     hit.position = origin + direction * hit.t;
-    hit.uv = vertices[corner.x].uv * weights.x + vertices[corner.y].uv * weights.y + vertices[corner.z].uv * weights.z;
+    vec2 uv0 = vertices[corner.x].uv;
+    vec2 uv1 = vertices[corner.y].uv;
+    vec2 uv2 = vertices[corner.z].uv;
+    hit.uv = uv0 * weights.x + uv1 * weights.y + uv2 * weights.z;
     hit.materialIndex = mesh.materialIndex;
-    evaluateMaterial(hit);
 
     // Normals are transformed with the inverse transpose of the object's matrix;
     // n * M == transpose(M) * n, and M (world -> object) is already the inverse.
     mat3 worldToObject = mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true));
+    mat3 objectToWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true));
 
     // Flat normal from the triangle's edges
     vec3 p0 = vertices[corner.x].position;
-    vec3 objectNormal = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0);
-    hit.geometricNormal = normalize(objectNormal * worldToObject);
+    vec3 edge1 = vertices[corner.y].position - p0;
+    vec3 edge2 = vertices[corner.z].position - p0;
+    hit.geometricNormal = normalize(cross(edge1, edge2) * worldToObject);
+
+    float footprintWidth = scene.textureMipmaps != 0 ? coneWidth + coneSpread * hit.t : 0.0;
+    uvFootprint(objectToWorld * edge1, objectToWorld * edge2, uv1 - uv0, uv2 - uv0, direction, footprintWidth,
+                hit.uvFootprintX, hit.uvFootprintY);
+    evaluateMaterial(hit);
 
     // Smooth normal: the per-vertex normals from the file, blended across the triangle. Makes a coarse
     // mesh look round. Without them, fall back to the flat one.
@@ -422,7 +479,6 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
         if (mesh.hasTangents != 0) {
             vec4 tangent = vertices[corner.x].tangent * weights.x + vertices[corner.y].tangent * weights.y
                            + vertices[corner.z].tangent * weights.z;
-            mat3 objectToWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true));
             vec3 t = objectToWorld * tangent.xyz;
             t -= hit.normal * dot(hit.normal, t);  // interpolation bends it slightly off the surface
             // Broken tangents in the file (along the normal, or corners pointing opposite ways so the blend
@@ -438,7 +494,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed) {
                 // A mirrored instance (negative scale) flips the bitangent as well
                 float sign = (tangent.w < 0.0 ? -1.0 : 1.0) * (determinant(objectToWorld) < 0.0 ? -1.0 : 1.0);
                 vec3 b = cross(hit.normal, t) * sign;
-                vec3 mapped = sampleTexture(material.normalTexture, material.normalUvTransform, hit.uv).rgb * 2.0 - 1.0;  // [0,1] -> [-1,1]
+                vec3 mapped = sampleTexture(material.normalTexture, material.normalUvTransform, hit).rgb * 2.0 - 1.0;  // [0,1] -> [-1,1]
                 if (material.normalTwoChannel != 0) {
                     mapped.z = sqrt(max(1.0 - dot(mapped.xy, mapped.xy), 0.0));
                 }
@@ -888,11 +944,11 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout u
         Material material = materials[mesh.materialIndex];
         float transmission = material.transmission;
         if (transmission > 0.0 && material.transmissionTexture >= 0) {
-            transmission *= sampleTexture(material.transmissionTexture, material.transmissionUvTransform, uv).r;
+            transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
         }
         float metallic = material.metallic;
         if (transmission > 0.0 && material.metallicRoughnessTexture >= 0) {
-            metallic *= sampleTexture(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
+            metallic *= sampleTextureFull(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
         }
         if (transmission <= 0.0 || metallic >= 1.0) {
             rayQueryConfirmIntersectionEXT(rayQuery);  // opaque: in shadow (and with TerminateOnFirstHit, done)
@@ -916,7 +972,7 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout u
         bool entering = cosTheta < 0.0;
         vec3 color = material.baseColor.rgb;
         if (material.baseColorTexture >= 0) {
-            color *= sampleTexture(material.baseColorTexture, material.baseColorUvTransform, uv).rgb;
+            color *= sampleTextureFull(material.baseColorTexture, material.baseColorUvTransform, uv).rgb;
         }
         float fresnel = fresnelSchlick(dielectricF0(material.ior), abs(cosTheta));
         tint *= (1.0 - metallic) * transmission * (1.0 - fresnel);
@@ -1120,7 +1176,7 @@ vec3 emissionAt(uint materialIndex, vec2 uv) {
     Material material = materials[materialIndex];
     vec3 emission = material.emissive;
     if (material.emissiveTexture >= 0) {
-        emission *= sampleTexture(material.emissiveTexture, material.emissiveUvTransform, uv).rgb;
+        emission *= sampleTextureFull(material.emissiveTexture, material.emissiveUvTransform, uv).rgb;
     }
     return emission * opacityAt(materialIndex, uv);
 }
@@ -1448,6 +1504,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
     bool firstBounceSpecular = false;  // the bounce ray leaving the first hit came from a reflection/transmission
     float bouncePdf = 0.0;        // pdf of the bounce direction that led to the current hit (for MIS)
     float pathRoughness = 0.0;    // roughest reflection along the path so far (for blurCaustics)
+    // The ray cone (see uvFootprint): its width where the current ray starts, and how fast it grows per unit
+    float coneWidth = 0.0;
+    float coneSpread = scene.pixelSpreadAngle;
     bool sampleLights = scene.emissiveTriangleCount > 0 && scene.emissiveSampling != EMISSIVE_BOUNCES_ONLY;
 
     // Light behind glass. Shadow rays pass glass in a straight line (tinted), so the light sampling at a surface
@@ -1473,7 +1532,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
     // by bouncing would be one bounce short, and the methods wouldn't agree.
     for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
-        Hit hit = traceClosest(origin, direction, seed);
+        Hit hit = traceClosest(origin, direction, seed, coneWidth, coneSpread);
         previousVertex = currentVertex;
         currentVertex = -1;
         if (bounce == 1 && firstBounceSpecular) {
@@ -1698,6 +1757,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
             }
         }
         pathRoughness = max(pathRoughness, lobeRoughness);
+        // The cone at the new ray's start: as wide as it was when it got here; a rough lobe spreads it by about
+        // its width (2 * GGX alpha; the diffuse layer counts as roughness 1, so after it textures read small levels)
+        coneWidth += coneSpread * hit.t;
+        coneSpread += 2.0 * ggxAlpha(lobeRoughness);
         previousLobeRough = !transmitted && lobeRoughness >= CACHE_ROUGHNESS;
         if (bounce == 0 && wantGuides) {
             firstBounceSpecular = specularLobe;
@@ -1773,7 +1836,7 @@ vec3 randomColor(uint value) {
 
 // Shows one property of the first surface hit, to check that the mesh and material data arrive correctly.
 vec3 debugColor(vec3 direction, inout uint seed) {
-    Hit hit = traceClosest(scene.cameraPosition.xyz, direction, seed);
+    Hit hit = traceClosest(scene.cameraPosition.xyz, direction, seed, 0.0, scene.pixelSpreadAngle);
     if (!hit.found) {
         return vec3(0.0);
     }

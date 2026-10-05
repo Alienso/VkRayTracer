@@ -33,11 +33,16 @@ VkSampler Application::getSampler(const TextureData& texture) {
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = texture.nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     samplerInfo.minFilter = samplerInfo.magFilter;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;  // only level 0 for now (see the shader)
+    // Between mip levels always linear: the shader picks the level from the hit's footprint (ray cones), and a
+    // jump from one level to the next would show as a seam. Anisotropic: a surface seen at a slant covers a long
+    // thin footprint, filtered along its length instead of blurring it to the length in both directions.
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.addressModeU = toVulkan(texture.wrapU);
     samplerInfo.addressModeV = toVulkan(texture.wrapV);
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.maxLod = 0.0f;
+    samplerInfo.anisotropyEnable = VK_TRUE;
+    samplerInfo.maxAnisotropy = 16.0f;
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
     VkSampler sampler;
     if (vkCreateSampler(device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) {
@@ -60,6 +65,68 @@ static VkFormat toVulkan(const TextureData& texture) {
     }
 }
 
+// The mip levels of an 8-bit RGBA image (files bring none), appended to texture.pixels: each texel the average of
+// the 2x2 below it (the last row / column of an odd size is dropped, a slight shift that doesn't show). sRGB
+// colors are averaged as light, i.e. linear: averaged as stored, a fine black-and-white pattern would turn darker
+// than the grey it looks like from afar. Alpha is coverage, averaged as it is.
+static void generateMipLevels(TextureData& texture) {
+    if (texture.format != TextureFormat::RGBA8 || texture.mipLevels > 1) {
+        return;
+    }
+    float toLinear[256];
+    for (int i = 0; i < 256; i++) {
+        float c = i / 255.0f;
+        toLinear[i] = texture.srgb ? (c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f)) : c;
+    }
+    auto toStored = [&](float linear) {
+        float c = texture.srgb ? (linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f)
+                               : linear;
+        return static_cast<uint8_t>(std::clamp(c * 255.0f + 0.5f, 0.0f, 255.0f));
+    };
+
+    uint32_t width = texture.width, height = texture.height;
+    size_t source = 0;  // where the level being halved starts in pixels
+    while (width > 1 || height > 1) {
+        uint32_t newWidth = std::max(width / 2, 1u), newHeight = std::max(height / 2, 1u);
+        size_t target = texture.pixels.size();
+        texture.pixels.resize(target + static_cast<size_t>(newWidth) * newHeight * 4);
+        for (uint32_t y = 0; y < newHeight; y++) {
+            for (uint32_t x = 0; x < newWidth; x++) {
+                float sum[4] = {};
+                for (uint32_t dy = 0; dy < 2; dy++) {
+                    for (uint32_t dx = 0; dx < 2; dx++) {
+                        uint32_t sx = std::min(x * 2 + dx, width - 1), sy = std::min(y * 2 + dy, height - 1);
+                        const uint8_t* p = &texture.pixels[source + (static_cast<size_t>(sy) * width + sx) * 4];
+                        for (int c = 0; c < 3; c++) {
+                            sum[c] += toLinear[p[c]];
+                        }
+                        sum[3] += p[3] / 255.0f;
+                    }
+                }
+                uint8_t* out = &texture.pixels[target + (static_cast<size_t>(y) * newWidth + x) * 4];
+                for (int c = 0; c < 3; c++) {
+                    out[c] = toStored(sum[c] * 0.25f);
+                }
+                out[3] = static_cast<uint8_t>(std::clamp(sum[3] * 0.25f * 255.0f + 0.5f, 0.0f, 255.0f));
+            }
+        }
+        source = target;
+        width = newWidth;
+        height = newHeight;
+        texture.mipLevels++;
+    }
+}
+
+// Bytes of one mip level
+static size_t levelSize(const TextureData& texture, uint32_t level) {
+    uint32_t width = std::max(texture.width >> level, 1u), height = std::max(texture.height >> level, 1u);
+    if (texture.format == TextureFormat::RGBA8) {
+        return static_cast<size_t>(width) * height * 4;
+    }
+    size_t blockBytes = texture.format == TextureFormat::BC1 ? 8 : 16;
+    return static_cast<size_t>((width + 3) / 4) * ((height + 3) / 4) * blockBytes;
+}
+
 // Uploads the textures loaded since the last call. Textures are never removed, so earlier indices stay valid.
 void Application::uploadNewTextures() {
     if (sceneTextures.size() > maxTextures) {
@@ -69,10 +136,11 @@ void Application::uploadNewTextures() {
     for (size_t i = gpuTextures.size(); i < sceneTextures.size(); i++) {
         TextureData& texture = sceneTextures[i];
         GpuTexture gpu;
+        generateMipLevels(texture);
 
         VkFormat format = toVulkan(texture);
         createImage(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    gpu.image, gpu.memory, gpu.view);
+                    gpu.image, gpu.memory, gpu.view, texture.mipLevels);
         gpu.sampler = getSampler(texture);
 
         VkDeviceSize size = texture.pixels.size();
@@ -94,16 +162,22 @@ void Application::uploadNewTextures() {
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = gpu.image;
-            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.mipLevels, 0, 1};
             barrier.srcAccessMask = 0;
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-            VkBufferImageCopy region{};
-            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            region.imageExtent = {texture.width, texture.height, 1};
-            vkCmdCopyBufferToImage(cmd, stagingBuffer, gpu.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            std::vector<VkBufferImageCopy> regions(texture.mipLevels);
+            VkDeviceSize offset = 0;
+            for (uint32_t level = 0; level < texture.mipLevels; level++) {
+                regions[level].bufferOffset = offset;
+                regions[level].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                regions[level].imageExtent = {std::max(texture.width >> level, 1u), std::max(texture.height >> level, 1u), 1};
+                offset += levelSize(texture, level);
+            }
+            vkCmdCopyBufferToImage(cmd, stagingBuffer, gpu.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   static_cast<uint32_t>(regions.size()), regions.data());
 
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

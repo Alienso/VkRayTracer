@@ -213,17 +213,27 @@ See-through (blend) surfaces stop each ray with chance alpha. Correct on average
 
 ## Textures and models
 
-### No mipmaps
-Textures are always read at full resolution (a compute shader has no screen derivatives). Distant textures
-alias; accumulation averages it out, single frames shimmer.
-- Where: `sampleTexture` (shader), `uploadNewTextures` (source/Materials.cpp).
-- Fix: generate mipmaps + ray cones (or ray differentials) to pick a level.
-- Phase 7: the DLSS albedo guides alias the same way (visible in the "DLSS input: reprojection error" view
-  as noise on textured surfaces whenever the sample position moves by a fraction of a pixel).
+### Mipmaps: isotropic cones, flat bounces, cut-outs at full size
+Textures have mip levels (from the .dds file, or made on the CPU for PNG/JPEG) and each hit picks its level with a
+ray cone (`uvFootprint`), filtered anisotropically. Simplifications:
+- The cone starts at half an output pixel (sharp enough for accumulation and DLSS; a whole render pixel looked
+  soft) and widens by 2 x GGX alpha per bounce (the diffuse layer as roughness 1). Curved surfaces don't widen or
+  narrow it, so a curved mirror or a glass ball reads textures behind it at the wrong level.
+- Cut-out tests (traversal, shadow rays), glass tints in shadow rays and points on glowing triangles still read
+  the full-size level: averaged alpha would make leaves fade at a distance (fixable with alpha-coverage-preserving
+  mips), the others are rare.
+- Normal maps get flatter at small levels (averaged bumps), so distant bumpy surfaces look a bit too smooth
+  (Toksvig: fold the lost bumpiness into roughness).
+- Odd-sized 8-bit images drop their last row / column when halved (a tiny shift).
+- Measured: Sponza trace -15 to -30 %, Bistro Exterior ~-2 % (its cost is the geometry and the cut-out foliage),
+  the helmet unchanged. Texture memory +33 % (Bistro Exterior 774 -> 1043 MB).
+- Where: `uvFootprint`, `traceClosest`, `sampleTexture` (shader), `generateMipLevels`, `getSampler`
+  (source/Materials.cpp), `pixelSpreadAngle` (source/RayTracer.cpp), Rendering tab "Texture mipmaps".
 
-### DDS textures: first mip level, no CPU copy
-DDS files (`MSFT_texture_dds`) in BC1/BC2/BC3/BC5/BC7 go to the GPU still compressed, first mip level only
-(the others are dropped, see "No mipmaps"). BC5 normal maps have X and Y only; the shader rebuilds Z.
+### DDS textures: no CPU copy
+DDS files (`MSFT_texture_dds`) in BC1/BC2/BC3/BC5/BC7 go to the GPU still compressed, with the mip levels the file
+has (a DDS without them gets none: compressed blocks can't be averaged without decoding). BC5 normal maps have X
+and Y only; the shader rebuilds Z.
 Compressed emissive textures are not decoded on the CPU, so light sampling weights their triangles by the
 emissive constant alone (noisier when only small parts glow); the Bistro converter writes PNG emissives for this reason.
 - Where: `readDds` (source/ModelLoader.cpp), `toVulkan` (source/Materials.cpp), `normalTwoChannel` (shader).

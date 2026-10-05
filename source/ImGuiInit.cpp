@@ -170,6 +170,12 @@ void Application::buildRenderingUi() {
     }
     ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", sampledEmissiveTriangles, lightTree.size(),
                         lightTreeDepth);
+    ImGui::Checkbox("Texture mipmaps", &settings.textureMipmaps);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("On: each hit reads textures at the size that fits how much of the surface one pixel sees\n"
+                          "(smaller copies for distant or blurry hits): faster, no shimmering in the distance.\n"
+                          "Off: always the full-size texture.");
+    }
     ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
     ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                         "instead of slowly converging sparkles (fireflies)");

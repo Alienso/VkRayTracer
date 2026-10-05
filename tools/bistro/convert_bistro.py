@@ -1,7 +1,11 @@
 # Converts an Amazon Lumberyard Bistro FBX (developer.nvidia.com/orca/amazon-lumberyard-bistro) to glTF.
 #   blender -b --factory-startup --python tools/bistro/convert_bistro.py -- <Bistro_v5_2>/BistroExterior.fbx
-#           resource/models/Bistro [emissive strength]
+#           resource/models/Bistro [emissive strength] [frame]
 # The same for BistroInterior.fbx and BistroInterior_Wine.fbx; they share the Textures folder (about 1.4 GB).
+# Other NVIDIA ORCA scenes with the same texture convention work too, e.g. Beeple's Zero-Day
+# (developer.nvidia.com/orca/beeple-zero-day): <ZeroDay_v1>/MEASURE_ONE/MEASURE_ONE.fbx resource/models/ZeroDay 1 1.
+# Its textures are in "tex" next to the FBX, some glowing materials use "Emissive2" textures, and it is animated:
+# the app shows still scenes, so one frame of the animation is converted (frame, default the file's first).
 # Tested with Blender 5.2 (its Python has numpy).
 # Geometry: Blender's FBX importer + glTF exporter (no images). Materials are then written directly into the
 # .gltf from the Bistro texture convention (README): BaseColor (alpha = cut-out), Specular (R occlusion,
@@ -23,7 +27,10 @@ args = sys.argv[sys.argv.index('--') + 1:]
 fbx_path = os.path.abspath(args[0])
 out_dir = os.path.abspath(args[1])
 emissive_strength = float(args[2]) if len(args) > 2 else 1.0
-src_textures = os.path.join(os.path.dirname(fbx_path), 'Textures')
+frame = int(args[3]) if len(args) > 3 else None
+src_textures = next((os.path.join(os.path.dirname(fbx_path), d) for d in ('Textures', 'tex')
+                     if os.path.isdir(os.path.join(os.path.dirname(fbx_path), d))), None)
+assert src_textures, 'no Textures or tex folder next to ' + fbx_path
 out_textures = os.path.join(out_dir, 'Textures')
 os.makedirs(out_textures, exist_ok=True)
 name = os.path.splitext(os.path.basename(fbx_path))[0]
@@ -34,6 +41,8 @@ exterior = name == 'BistroExterior'
 # Geometry
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.fbx(filepath=fbx_path)
+if frame is not None:
+    bpy.context.scene.frame_set(frame)  # animated objects move there; the export below takes this pose
 for o in list(bpy.data.objects):
     # Cameras and the Exterior's directional light (the app has its own sun) go; point and spot lights become
     # KHR_lights_punctual. Empties stay: some hold the parent transform (cm -> m).
@@ -50,6 +59,8 @@ def texture_files(material):
             if n.type == 'TEX_IMAGE' and n.image:
                 base = os.path.basename(bpy.path.abspath(n.image.filepath))
                 kind = os.path.splitext(base)[0].rsplit('_', 1)[-1].lower()
+                if kind == 'emissive2':
+                    kind = 'emissive'  # Zero-Day: a second emissive texture, the material's only one
                 files[kind] = base
     return files
 

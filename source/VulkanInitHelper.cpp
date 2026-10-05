@@ -207,6 +207,8 @@ void Application::createLogicalDevice(){
     features2.features.shaderStorageImageExtendedFormats = VK_TRUE;
     // Block-compressed textures (BC1-7, from .dds files): a quarter of the memory or less, every desktop GPU has them
     features2.features.textureCompressionBC = VK_TRUE;
+    // Anisotropic filtering: sharp textures on surfaces seen at a slant (floors, streets), see getSampler
+    features2.features.samplerAnisotropy = VK_TRUE;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -651,6 +653,7 @@ bool checkDeviceFeatureSupport(VkPhysicalDevice device) {
 
     return features2.features.shaderStorageImageExtendedFormats &&
            features2.features.textureCompressionBC &&
+           features2.features.samplerAnisotropy &&
            vulkan12Features.bufferDeviceAddress &&
            vulkan12Features.descriptorIndexing &&
            vulkan12Features.runtimeDescriptorArray &&

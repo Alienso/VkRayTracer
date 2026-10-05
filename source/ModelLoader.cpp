@@ -51,8 +51,8 @@ static TextureWrap toWrap(cgltf_wrap_mode mode) {
 }
 
 // DDS (DirectDraw Surface): a 128-byte header, for newer formats a 20-byte "DX10" header after it, then the
-// mip levels one after the other. We keep the first level's blocks as they are. Returns false if the file
-// isn't a DDS in one of the formats we can sample.
+// mip levels one after the other. We keep the blocks as they are, with as many levels as the file has (at least
+// the first). Returns false if the file isn't a DDS in one of the formats we can sample.
 static bool readDds(const uint8_t* data, size_t size, TextureData& texture, std::string& error) {
     auto read32 = [&](size_t offset) {
         uint32_t value;
@@ -100,12 +100,27 @@ static bool readDds(const uint8_t* data, size_t size, TextureData& texture, std:
         error = "DDS format " + format + " not supported";
         return false;
     }
-    size_t levelSize = static_cast<size_t>((texture.width + 3) / 4) * ((texture.height + 3) / 4) * blockBytes;
-    if (texture.width == 0 || texture.height == 0 || offset + levelSize > size) {
+    auto levelSize = [&](uint32_t level) {
+        uint32_t w = std::max(texture.width >> level, 1u), h = std::max(texture.height >> level, 1u);
+        return static_cast<size_t>((w + 3) / 4) * ((h + 3) / 4) * blockBytes;
+    };
+    if (texture.width == 0 || texture.height == 0 || offset + levelSize(0) > size) {
         error = "truncated DDS file";
         return false;
     }
-    texture.pixels.assign(data + offset, data + offset + levelSize);
+    // The header's level count (0 or missing = 1); a level that doesn't fit in the file ends the chain
+    uint32_t fileLevels = std::max(read32(28), 1u);
+    uint32_t fullChain = 1;
+    while ((std::max(texture.width, texture.height) >> fullChain) > 0) {
+        fullChain++;
+    }
+    size_t end = offset;
+    texture.mipLevels = 0;
+    while (texture.mipLevels < std::min(fileLevels, fullChain) && end + levelSize(texture.mipLevels) <= size) {
+        end += levelSize(texture.mipLevels);
+        texture.mipLevels++;
+    }
+    texture.pixels.assign(data + offset, data + end);
     return true;
 }
 
