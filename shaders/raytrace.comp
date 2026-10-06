@@ -8,10 +8,12 @@
 // One thread per pixel, in 8x8 tiles.
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// The same shader runs as two pipelines (RayTracer.cpp): 0 = the image, 1 = the radiance cache's update paths
-// (a few full-length paths that fill the cache, see "Radiance cache" below). A specialization constant, so each
-// pipeline only contains the code it needs.
+// The same shader runs as several pipelines (RayTracer.cpp), told apart by specialization constants, so each
+// pipeline only contains the code it needs. Both 0: the image. CACHE_UPDATE_PASS = 1: the radiance cache's update
+// paths (a few full-length paths that fill the cache, see "Radiance cache" below). RESTIR_PASS = 1: the camera
+// rays, stored for the image pass (see "Primary hits"), and ReSTIR DI's light samples (see "ReSTIR DI").
 layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
+layout(constant_id = 1) const uint RESTIR_PASS = 0;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
@@ -73,6 +75,18 @@ layout(binding = 3) uniform SceneUniforms {
     uint textureMipmaps;    // 1 = textures are read at the level that fits the hit's footprint (ray cones, see traceClosest)
     float pixelSpreadAngle; // angle between neighboring camera rays (radians): how fast a pixel's footprint grows
     uint normalMapFiltering; // 1 = bumps that a normal map's smaller levels average away widen the reflection (Toksvig)
+    uint restirDi;          // 1 = ReSTIR DI: the RESTIR_PASS traced the camera rays and picked a light sample per pixel
+    uint restirTriangleCandidates;  // candidates per kind of light (0 when there are none of that kind)
+    uint restirPunctualCandidates;
+    uint restirSkyCandidates;
+    uint restirBrdfCandidates;
+    float restirMinRoughness;       // rougher surfaces use ReSTIR (restirSurface)
+    uint restirTemporal;            // 1 = reuse last frame's reservoirs (restirTemporal); 2 = also with a shadow ray
+    float restirMaxHistory;         // last frame's reservoir counts for at most this many times this frame's candidates
+    uint restirHistoryValid;        // 0: last frame's reservoirs are unusable (first frame, lights changed, ...)
+    uint restirCurrentHalf;         // which half of the reservoir and surface buffers is this frame's (0/1)
+    uint restirPermutation;         // shuffle of last frame's pixels: bit 4 = on, this frame's offset x in bits 0-1, y in 2-3
+    vec4 previousCameraPosition;    // last frame's (for last frame's view directions)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -163,9 +177,25 @@ layout(binding = 10, scalar) readonly buffer InstanceFirstLight { int instanceFi
 // entry [roughness * SIZE + view angle], total for a given F0 = F0 * x + y.
 layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
 
-// Per TLAS instance: takes a point on it from this frame's world position to last frame's (object motion).
-// Identity for objects that didn't move.
-layout(binding = 12, scalar) readonly buffer InstanceMotion { mat4 instanceMotion[]; };
+// Per TLAS instance. Must match GpuInstance in Application.h.
+struct InstanceData {
+    mat4 motion;         // takes a point on it from this frame's world position to last frame's (object motion);
+                         // identity for objects that didn't move
+    mat3 objectToWorld;  // without the translation (what directions and normals need). Used instead of the ray
+    mat3 worldToObject;  // query's matrices, so a stored hit (see "Primary hits") is rebuilt the same way
+};
+layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
+
+// The camera rays' hits (RESTIR_PASS), one per render pixel, row by row. Must match GpuPrimaryHit in Application.h.
+struct PrimaryHit {
+    uint meshIndex;      // ~0: the camera ray hit nothing
+    uint instanceIndex;
+    int primitive;
+    vec2 barycentrics;
+    float t;
+    uint seed;           // the pixel's random numbers after the ray (cut-outs use some), for the image pass to go on with
+};
+layout(binding = 25, scalar) buffer PrimaryHits { PrimaryHit primaryHits[]; };
 const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
@@ -414,35 +444,52 @@ void uvFootprint(vec3 e1, vec3 e2, vec2 uv1, vec2 uv2, vec3 direction, float wid
     alongY = uv1 * stB.x + uv2 * stB.y;
 }
 
-// coneWidth, coneSpread: the ray's cone at its origin (see uvFootprint); 0, 0 reads every texture at full size.
-Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, float coneSpread) {
+// What a ray query tells about a hit: WHICH instance and triangle, WHERE on it (barycentrics), and how far.
+// Everything else (Hit) we look up in our own buffers, in hitFromIntersection.
+struct Intersection {
+    uint meshIndex;      // the instance's custom index (set to the mesh index in the TLAS)
+    uint instanceIndex;  // which TLAS instance
+    int primitive;       // which triangle of the mesh
+    vec2 barycentrics;
+    float t;
+};
+
+// The closest hit along a ray (cut-outs decided with seed, see traverse). false: nothing hit.
+bool intersectClosest(vec3 origin, vec3 direction, inout uint seed, out Intersection hit) {
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.001, direction, 1000.0);
     traverse(rayQuery, seed);
-
-    Hit hit;
-    hit.found = rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
-    if (!hit.found) {
-        return hit;
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        return false;
     }
-
-    // The ray query only tells us WHICH instance and triangle was hit and WHERE on it (barycentrics).
-    // Everything else we look up in our own buffers. The custom index was set to the mesh index in the TLAS.
     hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
     hit.instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+    hit.primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+    return true;
+}
+
+// The surface at an intersection of the ray from origin along direction: position, normals, material.
+// coneWidth, coneSpread: the ray's cone at its origin (see uvFootprint); 0, 0 reads every texture at full size.
+Hit hitFromIntersection(Intersection intersection, vec3 origin, vec3 direction, float coneWidth, float coneSpread) {
+    Hit hit;
+    hit.found = true;
+    hit.meshIndex = intersection.meshIndex;
+    hit.instanceIndex = intersection.instanceIndex;
     MeshInfo mesh = meshInfos[hit.meshIndex];
-    int primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    int primitive = intersection.primitive;
     uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
-    int firstLight = instanceFirstLight[rayQueryGetIntersectionInstanceIdEXT(rayQuery, true)];
+    int firstLight = instanceFirstLight[hit.instanceIndex];
     hit.lightIndex = firstLight >= 0 ? firstLight + primitive : -1;
     // The corners' attributes are read where they are needed, not all at once: normals and tangents read before
     // the material's texture reads would sit in registers meanwhile.
     uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
 
-    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    vec2 bary = intersection.barycentrics;
     vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
-    hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+    hit.t = intersection.t;
     hit.position = origin + direction * hit.t;
     vec2 uv0 = vertices[corner.x].uv;
     vec2 uv1 = vertices[corner.y].uv;
@@ -452,16 +499,17 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
 
     // Normals are transformed with the inverse transpose of the object's matrix;
     // n * M == transpose(M) * n, and M (world -> object) is already the inverse.
-    mat3 worldToObject = mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, true));
-    mat3 objectToWorld = mat3(rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true));
+    // The matrices are read from the instance buffer where they are used: kept in registers from the start, they
+    // would take 18 of them across the texture reads below.
 
     // Flat normal from the triangle's edges
     vec3 p0 = vertices[corner.x].position;
     vec3 edge1 = vertices[corner.y].position - p0;
     vec3 edge2 = vertices[corner.z].position - p0;
-    hit.geometricNormal = normalize(cross(edge1, edge2) * worldToObject);
+    hit.geometricNormal = normalize(cross(edge1, edge2) * instances[hit.instanceIndex].worldToObject);
 
     float footprintWidth = scene.textureMipmaps != 0 ? coneWidth + coneSpread * hit.t : 0.0;
+    mat3 objectToWorld = instances[hit.instanceIndex].objectToWorld;
     uvFootprint(objectToWorld * edge1, objectToWorld * edge2, uv1 - uv0, uv2 - uv0, direction, footprintWidth,
                 hit.uvFootprintX, hit.uvFootprintY);
     evaluateMaterial(hit);
@@ -472,7 +520,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
     if (mesh.hasNormals != 0) {
         vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
                             + vertices[corner.z].normal * weights.z;
-        hit.normal = normalize(smoothNormal * worldToObject);
+        hit.normal = normalize(smoothNormal * instances[hit.instanceIndex].worldToObject);
 
         // Normal map: a texture of small surface directions (bumps, scratches, seams) that don't exist in the
         // geometry. They are stored relative to the surface: X along the tangent, Y along the bitangent, Z along
@@ -481,6 +529,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
         if (mesh.hasTangents != 0) {
             vec4 tangent = vertices[corner.x].tangent * weights.x + vertices[corner.y].tangent * weights.y
                            + vertices[corner.z].tangent * weights.z;
+            mat3 objectToWorld = instances[hit.instanceIndex].objectToWorld;
             vec3 t = objectToWorld * tangent.xyz;
             t -= hit.normal * dot(hit.normal, t);  // interpolation bends it slightly off the surface
             // Broken tangents in the file (along the normal, or corners pointing opposite ways so the blend
@@ -539,7 +588,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
 
     // The normals still point outwards here: tells whether the ray enters or leaves a solid.
     hit.frontFace = dot(hit.geometricNormal, direction) < 0.0;
-    hit.objectScale = length(worldToObject * direction) * mesh.unitScale;
+    hit.objectScale = length(instances[hit.instanceIndex].worldToObject * direction) * mesh.unitScale;
 
     // Triangles are double-sided: if we hit the back, flip both normals towards the ray.
     if (!hit.frontFace) {
@@ -547,6 +596,25 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
         hit.normal = -hit.normal;
     }
     return hit;
+}
+
+// The reflection formulas need the viewer above the shading normal. A smooth or normal-mapped normal can tilt
+// away from the viewer near silhouettes; tilt it back just far enough.
+void tiltTowardsViewer(inout Hit hit, vec3 direction) {
+    float cosViewer = dot(hit.normal, -direction);
+    if (cosViewer < 1e-3) {
+        hit.normal = normalize(hit.normal - direction * (1e-3 - cosViewer));
+    }
+}
+
+Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, float coneSpread) {
+    Intersection intersection;
+    if (!intersectClosest(origin, direction, seed, intersection)) {
+        Hit hit;
+        hit.found = false;
+        return hit;
+    }
+    return hitFromIntersection(intersection, origin, direction, coneWidth, coneSpread);
 }
 
 // Where a direction lands on the environment map, and back. u goes around the horizon (the same way as in
@@ -1230,18 +1298,16 @@ LightSample noLightSample() {
     return s;
 }
 
-// One randomly picked point on the glowing triangles. surfacePoint: where the shadow ray starts.
-LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, inout uint seed) {
-    LightSample s = noLightSample();
-    // 1: pick a triangle, with the light tree (by what it could send to this point), or by its share of all light:
-    //    binary search for the first one whose running sum exceeds a random number. Triangles with a bigger share
-    //    cover a bigger stretch of [0, 1], so get picked more.
+// Picks a glowing triangle for the point p (normal n), with the light tree (by what it could send to this
+// point), or by its share of all light: binary search for the first one whose running sum exceeds a random
+// number. Triangles with a bigger share cover a bigger stretch of [0, 1], so get picked more.
+// -1: none (all glowing triangles are behind the surface, or a triangle with probability 0, see below).
+int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, inout uint seed, out float pickProbability) {
     int lightIndex;
-    float pickProbability;
     if (scene.lightTree != 0) {
-        lightIndex = pickFromLightTree(hit.position, shadingNormal, hit.diffuseTransmission > 0.0, seed, pickProbability);
+        lightIndex = pickFromLightTree(p, n, twoSided, seed, pickProbability);
         if (lightIndex < 0) {
-            return s;  // all glowing triangles are behind the surface
+            return -1;
         }
     } else {
         float pick = randomFloat(seed);
@@ -1257,13 +1323,23 @@ LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, 
         lightIndex = int(low);
         pickProbability = emissiveTriangles[low].probability;
     }
-    EmissiveTriangle light = emissiveTriangles[lightIndex];
     // Triangles with probability 0 (a black part of an emissive texture) have no stretch of [0, 1] of their own,
     // but the search can still land on one when the random number is exactly a boundary (e.g. 0). Dividing by
     // its pdf of 0 would give infinity, which would stick in the pixel's running average forever.
-    if (pickProbability <= 0.0) {
+    return pickProbability > 0.0 ? lightIndex : -1;
+}
+
+// One randomly picked point on the glowing triangles. surfacePoint: where the shadow ray starts.
+LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, inout uint seed) {
+    LightSample s = noLightSample();
+    // 1: pick a triangle
+    float pickProbability;
+    int lightIndex = pickEmissiveTriangle(hit.position, shadingNormal, hit.diffuseTransmission > 0.0, seed,
+                                          pickProbability);
+    if (lightIndex < 0) {
         return s;
     }
+    EmissiveTriangle light = emissiveTriangles[lightIndex];
 
     // 2: a uniformly random point on it (the square root keeps points from bunching up in one corner)
     float r1 = sqrt(randomFloat(seed));
@@ -1347,6 +1423,383 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// ReSTIR DI (see RESTIR_DI_PLAN.md)
+//
+// Direct light at the first surface the camera sees, if it is rough enough (restirSurface). Instead of a shadow
+// ray per kind of light, the RESTIR_PASS draws several candidate light samples per pixel (glowing triangles,
+// punctual lights, the sky) and keeps one of them, picked with a chance proportional to how much light it would
+// bring if nothing blocked it (its "target", restirTarget): resampled importance sampling (RIS, Talbot et al.
+// 2005). The kept sample and its weight W go into the pixel's reservoir. The image pass traces one shadow ray to
+// it and counts its light times W. W = (sum of the candidates' weights) / (the kept sample's target) keeps the
+// result correct on average, whatever the target is; the closer the target is to the real light (shadows aside),
+// the less noise. The sun is not in it: it keeps its own shadow ray (slot 0 of the light loop).
+//
+// The candidates come from two kinds of strategies: light sampling (each kind of light has its own candidates) and
+// BRDF sampling (a direction picked by the surface's reflection, whatever light its ray finds). The light ones
+// find small and distant lights; the BRDF ones the light a glossy surface reflects in a narrow cone, or a large
+// light very close by. A candidate's weight is target / (sum over the strategies that could have produced it of
+// their number of candidates * their pdf of it): generalized RIS with the balance heuristic (Lin et al. 2022).
+// A light the BRDF rays can't find (punctual lights, or one whose triangles are left out of light sampling, which
+// the bounce ray counts instead) only has its light-sampling term.
+//
+// A sample is stored as which light and where on it, so that another pixel or the next frame can use it too. Its
+// light, target and W are per unit of the light's own measure: per area of a glowing triangle, per solid angle of
+// the sky, per punctual light. These don't depend on the point being lit, so a sample moves between pixels without
+// a change of variables (a Jacobian). The light loop's solid-angle quantities differ from them by cos / distance^2.
+//
+// Temporal reuse (restirTemporal): last frame's reservoir of the same surface point is merged in. With a still
+// scene, a pixel's reservoir soon stands for the candidates of many frames (up to restirMaxHistory times this
+// frame's), and the shadow ray in the RESTIR_PASS (visibility reuse) keeps blocked samples from being passed on.
+//
+// Buffers: reservoirs and surfaces have two halves, this frame's and last frame's, swapped every frame.
+
+const uint RESTIR_NOT_USED = 0xFFFFFFFFu;  // Reservoir.light: this pixel's first surface does its own light sampling
+const uint LIGHT_KIND_NONE = 0;            // nothing could light the surface
+const uint LIGHT_KIND_TRIANGLE = 1;        // a glowing triangle; point: barycentrics (2 x 16 bits)
+const uint LIGHT_KIND_PUNCTUAL = 2;        // a punctual light
+const uint LIGHT_KIND_SKY = 3;             // the sky; point: see encodeSkyPoint
+
+// Must match GpuReservoir in Application.h
+struct Reservoir {
+    uint light;   // kind << 30 | index
+    uint point;   // where on the light
+    float W;      // the kept sample's weight: its light * W estimates the direct light (0: nothing)
+    float M;      // how many candidates it stands for
+};
+layout(binding = 26, scalar) buffer Reservoirs { Reservoir reservoirs[]; };  // 2 halves of one per render pixel
+
+// What the reuse needs to know about a pixel's first surface: enough for its target (restirTarget) without its
+// textures. 32 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Application.h.
+struct RestirSurface {
+    vec3 position;
+    uint normal;             // octahedral, 2 x 16 bits
+    uint geometricNormal;
+    uint albedoRoughness;    // 4 x 8 bits
+    uint material;           // metallic, (ior - 1) / 2, diffuse transmission (8 bits each)
+    uint diffuseTransmissionColor;
+};
+layout(binding = 27, scalar) buffer RestirSurfaces { RestirSurface restirSurfaces[]; };  // 2 halves, as above
+
+uint restirPixelCount() {
+    uvec2 size = uvec2(imageSize(radianceImage));
+    return size.x * size.y;
+}
+
+// Where a pixel's reservoir and surface are, in this frame's half (previousFrame: last frame's)
+uint restirIndex(ivec2 pixel, bool previousFrame) {
+    uint part = previousFrame ? 1u - scene.restirCurrentHalf : scene.restirCurrentHalf;
+    return part * restirPixelCount() + uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
+}
+
+// Unit vectors in 32 bits: the octahedron folded flat (Cigolle et al. 2014)
+uint encodeDirection(vec3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(e);
+}
+
+vec3 decodeDirection(uint packed) {
+    vec2 e = unpackSnorm2x16(packed);
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    float t = max(-n.z, 0.0);
+    n.xy += vec2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+
+RestirSurface packRestirSurface(Hit hit) {
+    RestirSurface surface;
+    surface.position = hit.position;
+    surface.normal = encodeDirection(hit.normal);
+    surface.geometricNormal = encodeDirection(hit.geometricNormal);
+    surface.albedoRoughness = packUnorm4x8(vec4(hit.albedo, hit.roughness));
+    surface.material = packUnorm4x8(vec4(hit.metallic, (hit.ior - 1.0) * 0.5, hit.diffuseTransmission, 0.0));
+    surface.diffuseTransmissionColor = packUnorm4x8(vec4(hit.diffuseTransmissionColor, 0.0));
+    return surface;
+}
+
+// A Hit with what restirTarget reads (the rest stays unset)
+Hit unpackRestirSurface(RestirSurface surface) {
+    Hit hit;
+    hit.found = true;
+    hit.position = surface.position;
+    hit.normal = decodeDirection(surface.normal);
+    hit.geometricNormal = decodeDirection(surface.geometricNormal);
+    vec4 albedoRoughness = unpackUnorm4x8(surface.albedoRoughness);
+    hit.albedo = albedoRoughness.rgb;
+    hit.roughness = albedoRoughness.a;
+    vec4 material = unpackUnorm4x8(surface.material);
+    hit.metallic = material.x;
+    hit.ior = 1.0 + 2.0 * material.y;
+    hit.diffuseTransmission = material.z;
+    hit.diffuseTransmissionColor = unpackUnorm4x8(surface.diffuseTransmissionColor).rgb;
+    hit.transmission = 0.0;  // ReSTIR surfaces have none
+    return hit;
+}
+
+// Surfaces that use ReSTIR: rough enough that a picked light sample finds the light they reflect. A near-mirror
+// reflects a light in a tiny cone that a bounce ray finds far better; those keep the usual light sampling + MIS.
+bool restirSurface(Hit hit) {
+    return hit.roughness >= scene.restirMinRoughness && hit.transmission <= 0.0;
+}
+
+// A sky direction in 32 bits: the cell of the sky's sampling (see environmentCellPdf) and 32 x 32 places within
+// it. The cell is kept exactly: rounded across a cell's edge, a direction would be weighted with the wrong cell's
+// pdf, a bias where the sky's brightness jumps (a sun in the map). Evenly spread directions within a cell stay
+// evenly spread over its places, so the cell's pdf stays right for them.
+uint encodeSkyPoint(vec3 direction) {
+    uint height = scene.environmentHeight, width = scene.environmentWidth;
+    vec2 uv = environmentUv(direction);
+    uint row = min(uint(uv.y * float(height)), height - 1);
+    uint column = min(uint(uv.x * float(width)), width - 1);
+    // within the cell: around evenly, and evenly in cos (as sampleEnvironment picks)
+    float cos0 = cos(PI * float(row) / float(height));
+    float cos1 = cos(PI * float(row + 1) / float(height));
+    vec2 within = clamp(vec2(uv.x * float(width) - float(column), (direction.y - cos0) / (cos1 - cos0)), 0.0, 1.0);
+    uvec2 place = min(uvec2(within * 32.0), uvec2(31));
+    return ((row * width + column) << 10) | (place.x << 5) | place.y;
+}
+
+vec3 decodeSkyPoint(uint point) {
+    uint height = scene.environmentHeight, width = scene.environmentWidth;
+    uint cell = point >> 10;
+    uint row = cell / width, column = cell % width;
+    vec2 within = (vec2((point >> 5) & 31u, point & 31u) + 0.5) / 32.0;
+    float cos0 = cos(PI * float(row) / float(height));
+    float cos1 = cos(PI * float(row + 1) / float(height));
+    return environmentDirection((float(column) + within.x) / float(width), mix(cos0, cos1, within.y));
+}
+
+// The sample a stored light and point stand for, with shadow rays from surfacePoint. s.light: the light arriving at
+// a surface facing it per unit of the light's measure (see above; not divided by any pdf). s.pdf: per unit of that
+// measure, the chance of picking this point once the light is picked (triangles: evenly over their area, 1 / area;
+// the sky: its sampling; punctual lights: 1). toSolidAngle: solid angle per unit of the measure (triangles:
+// cos / distance^2, else 1), to turn a pdf per solid angle (BRDF sampling) into one per unit of the measure.
+LightSample restirLightSample(uint light, uint point, vec3 surfacePoint, out float toSolidAngle) {
+    toSolidAngle = 1.0;
+    uint kind = light >> 30;
+    uint index = light & 0x3FFFFFFFu;
+    LightSample s = noLightSample();
+    if (kind == LIGHT_KIND_TRIANGLE) {
+        EmissiveTriangle triangle = emissiveTriangles[index];
+        vec2 bary = unpackUnorm2x16(point);
+        vec3 weights = vec3(max(1.0 - bary.x - bary.y, 0.0), bary);
+        vec3 lightPoint = triangle.p0 * weights.x + triangle.p1 * weights.y + triangle.p2 * weights.z;
+        vec2 lightUv = triangle.uv0 * weights.x + triangle.uv1 * weights.y + triangle.uv2 * weights.z;
+        vec3 toLight = lightPoint - surfacePoint;
+        float distance = length(toLight);
+        s.direction = toLight / distance;
+        vec3 lightNormal = normalize(cross(triangle.p1 - triangle.p0, triangle.p2 - triangle.p0));
+        float cosLight = abs(dot(lightNormal, s.direction));
+        if (cosLight <= 1e-6) {
+            return noLightSample();  // seen exactly edge-on
+        }
+        s.distance = distance * 0.999;  // stop just short of the light itself
+        toSolidAngle = cosLight / (distance * distance);
+        s.pdf = 1.0 / max(triangle.area, 1e-12);
+        s.light = emissionAt(triangle.materialIndex, lightUv) * toSolidAngle;
+    } else if (kind == LIGHT_KIND_PUNCTUAL) {
+        s = punctualLightSample(punctualLights[index], surfacePoint);
+        s.pdf = 1.0;
+    } else if (kind == LIGHT_KIND_SKY) {
+        s.direction = decodeSkyPoint(point);
+        s.distance = SKY_DISTANCE;
+        s.pdf = environmentPdf(s.direction);
+        s.light = environmentLight(s.direction);
+    }
+    s.mis = MIS_NONE;
+    s.shadowed = true;
+    return s;
+}
+
+// The target: how bright the sample would make the surface (seen from direction v) if nothing blocked it.
+// Same rules as the light loop: in front of the surface, or behind one that lets light through.
+// brdfPdf: the chance (per solid angle) of BRDF sampling picking the sample's direction.
+float restirTarget(Hit hit, vec3 v, LightSample s, out float brdfPdf) {
+    brdfPdf = 0.0;
+    float cosLight = dot(hit.normal, s.direction);
+    float side = dot(hit.geometricNormal, s.direction);
+    bool behind = cosLight < 0.0 && side < 0.0 && hit.diffuseTransmission > 0.0;
+    if (!((cosLight > 0.0 && side > 0.0) || behind)) {
+        return 0.0;
+    }
+    return luminance(s.light * evaluateBrdfWorld(hit, hit.normal, v, s.direction, brdfPdf) * abs(cosLight));
+}
+
+// Whether a candidate hit stops a ray the way it stops shadow rays (see shadowTransmittance): holes of cut-outs
+// (by chance, for see-through ones) and glass let it through.
+bool blocksLight(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
+    MeshInfo mesh = meshInfos[meshIndex];
+    uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
+    vec2 uv0 = vertices[mesh.vertexOffset + indices[firstIndex + 0]].uv;
+    vec2 uv1 = vertices[mesh.vertexOffset + indices[firstIndex + 1]].uv;
+    vec2 uv2 = vertices[mesh.vertexOffset + indices[firstIndex + 2]].uv;
+    vec2 uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+    float opacity = opacityAt(mesh.materialIndex, uv);
+    if (opacity < 1.0 && (opacity <= 0.0 || randomFloat(seed) >= opacity)) {
+        return false;
+    }
+    Material material = materials[mesh.materialIndex];
+    float transmission = material.transmission;
+    if (transmission > 0.0 && material.transmissionTexture >= 0) {
+        transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
+    }
+    float metallic = material.metallic;
+    if (transmission > 0.0 && material.metallicRoughnessTexture >= 0) {
+        metallic *= sampleTextureFull(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
+    }
+    return transmission <= 0.0 || metallic >= 1.0;
+}
+
+// The BRDF candidates' ray: the first surface that isn't glass. Through glass like the shadow rays, so the BRDF
+// candidates find exactly the lights that light candidates can reach: the MIS weights count on that (a light
+// behind a window would otherwise get the BRDF share of its weight but never be found by a BRDF ray).
+bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Intersection hit) {
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.001, direction, 1000.0);
+    while (rayQueryProceedEXT(rayQuery)) {
+        if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+            blocksLight(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
+                        rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
+                        rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed)) {
+            rayQueryConfirmIntersectionEXT(rayQuery);
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        return false;
+    }
+    hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
+    hit.instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+    hit.primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+    return true;
+}
+
+// The RESTIR_PASS's candidates for a surface seen from direction v. Streaming RIS: each candidate replaces the
+// kept one with a chance of its weight / the sum of the weights so far.
+Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
+    vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+    bool twoSided = hit.diffuseTransmission > 0.0;
+    uint triangles = scene.restirTriangleCandidates;
+    uint punctual = scene.restirPunctualCandidates;
+    uint sky = scene.restirSkyCandidates;
+    uint lightCandidates = triangles + punctual + sky;
+    uint total = lightCandidates + scene.restirBrdfCandidates;
+    Reservoir r;
+    r.light = LIGHT_KIND_NONE << 30;
+    r.point = 0;
+    r.M = float(total);
+    float weightSum = 0.0;
+    float keptTarget = 0.0;
+    [[dont_unroll]] for (uint i = 0; i < total; i++) {
+        uint light;
+        uint point = 0;
+        float pickProbability = 0.0;  // triangles: the chance that light sampling picks this one
+        if (i < triangles) {
+            int index = pickEmissiveTriangle(hit.position, hit.normal, twoSided, seed, pickProbability);
+            if (index < 0) {
+                continue;
+            }
+            float r1 = sqrt(randomFloat(seed));  // evenly over the triangle, as in sampleEmissiveLight
+            float r2 = randomFloat(seed);
+            point = packUnorm2x16(vec2(r1 * (1.0 - r2), r1 * r2));
+            light = (LIGHT_KIND_TRIANGLE << 30) | uint(index);
+        } else if (i < triangles + punctual) {
+            uint count = scene.punctualLightCount;
+            uint index = min(uint(randomFloat(seed) * float(count)), count - 1);
+            light = (LIGHT_KIND_PUNCTUAL << 30) | index;
+        } else if (i < lightCandidates) {
+            float pdf;
+            point = encodeSkyPoint(sampleEnvironment(seed, pdf));
+            light = LIGHT_KIND_SKY << 30;
+        } else {
+            // BRDF sampling: a direction as the bounce ray would pick it, and the light its ray finds (if light
+            // sampling could have picked it too; otherwise the bounce ray counts that light, see tracePath)
+            ShadingFrame frame = makeShadingFrame(hit.normal);
+            vec3 l, weight;
+            float pdf, lobeRoughness;
+            bool transmitted, specularLobe;
+            if (!sampleBrdf(hit, toLocal(frame, v), seed, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
+                continue;
+            }
+            vec3 direction = toWorld(frame, l);
+            float side = dot(direction, hit.geometricNormal);
+            if (l.z < 0.0 ? side >= 0.0 : side <= 0.0) {
+                continue;  // on the wrong side of the real triangle (see tracePath)
+            }
+            Intersection found;
+            vec3 origin = hit.position + hit.geometricNormal * (side < 0.0 ? -0.001 : 0.001);
+            if (intersectTowardsLight(origin, direction, seed, found)) {
+                int firstLight = instanceFirstLight[found.instanceIndex];
+                if (triangles == 0 || firstLight < 0) {
+                    continue;
+                }
+                int index = firstLight + found.primitive;
+                pickProbability = lightPickProbability(index, hit.position, hit.normal, twoSided);
+                if (pickProbability <= 0.0) {
+                    continue;
+                }
+                point = packUnorm2x16(found.barycentrics);
+                light = (LIGHT_KIND_TRIANGLE << 30) | uint(index);
+            } else {
+                if (sky == 0) {
+                    continue;
+                }
+                point = encodeSkyPoint(direction);
+                light = LIGHT_KIND_SKY << 30;
+            }
+        }
+        // Evaluated from the stored (rounded) point, so the pdfs and the target are exactly the kept sample's
+        float toSolidAngle;
+        LightSample s = restirLightSample(light, point, surfacePoint, toSolidAngle);
+        float brdfPdf;
+        float target = restirTarget(hit, v, s, brdfPdf);
+        uint kind = light >> 30;
+        float sourcePdf;  // sum over the strategies of (number of candidates * pdf), per unit of the light's measure
+        if (kind == LIGHT_KIND_PUNCTUAL) {
+            sourcePdf = float(punctual) / float(scene.punctualLightCount);
+        } else {
+            sourcePdf = (kind == LIGHT_KIND_TRIANGLE ? float(triangles) * pickProbability : float(sky)) * s.pdf
+                        + float(scene.restirBrdfCandidates) * brdfPdf * toSolidAngle;
+        }
+        if (target <= 0.0 || !(sourcePdf > 0.0)) {
+            continue;
+        }
+        float weight = target / sourcePdf;
+        weightSum += weight;
+        if (randomFloat(seed) * weightSum < weight) {
+            r.light = light;
+            r.point = point;
+            keptTarget = target;
+        }
+    }
+    r.W = keptTarget > 0.0 ? weightSum / keptTarget : 0.0;
+    return r;
+}
+
+// The image pass's light sample at a ReSTIR surface: the reservoir's, its light times W
+LightSample restirReservoirSample(ivec2 pixel, vec3 surfacePoint) {
+    Reservoir r = reservoirs[restirIndex(pixel, false)];
+    if (!(r.W > 0.0)) {
+        return noLightSample();
+    }
+    float toSolidAngle;
+    LightSample s = restirLightSample(r.light, r.point, surfacePoint, toSolidAngle);
+    s.light *= r.W;
+    return s;
+}
+
+// The target of a reservoir's sample at a surface (0 for none)
+float restirTargetOf(Reservoir r, Hit hit, vec3 v) {
+    if ((r.light >> 30) == LIGHT_KIND_NONE) {
+        return 0.0;
+    }
+    float toSolidAngle, brdfPdf;
+    LightSample s = restirLightSample(r.light, r.point, hit.position + hit.geometricNormal * 0.001, toSolidAngle);
+    return restirTarget(hit, v, s, brdfPdf);
+}
+
+// ---------------------------------------------------------------------------------------------
 
 // DLSS inputs
 
@@ -1385,7 +1838,7 @@ void storeSkyGuides(ivec2 pixel, vec3 direction) {
 // like a reflection). The specular hit distance is 0 (unknown) unless the bounce from here reflects (tracePath).
 void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction) {
     // A point on an object that moved is reprojected with the object's own motion as well
-    vec4 previousPosition = instanceMotion[hit.instanceIndex] * vec4(hit.position, 1.0);
+    vec4 previousPosition = instances[hit.instanceIndex].motion * vec4(hit.position, 1.0);
     imageStore(linearDepthImage, pixel, vec4(hit.t * dot(direction, scene.cameraForward.xyz)));
     imageStore(motionVectorImage, pixel, vec4(motionVector(vec4(hit.position, 1.0), previousPosition), 0.0, 0.0));
     ReflectionEnergy energy = reflectionEnergy(hit, dot(hit.normal, -direction));
@@ -1477,17 +1930,57 @@ int cacheFindOrInsert(uint slot, uint fingerprint) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Primary hits
+//
+// With ReSTIR DI the camera rays are traced in a pass of their own (RESTIR_PASS), before the image pass: ReSTIR
+// needs every pixel's first surface before any pixel gets shaded. The image pass then reads the stored hit instead
+// of tracing the ray again.
+
+uint primaryHitIndex(ivec2 pixel) {
+    return uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
+}
+
+void storePrimaryHit(ivec2 pixel, bool found, Intersection intersection, uint seed) {
+    PrimaryHit stored;
+    stored.meshIndex = found ? intersection.meshIndex : ~0u;
+    stored.instanceIndex = intersection.instanceIndex;
+    stored.primitive = intersection.primitive;
+    stored.barycentrics = intersection.barycentrics;
+    stored.t = intersection.t;
+    stored.seed = seed;
+    primaryHits[primaryHitIndex(pixel)] = stored;
+}
+
+// false: the camera ray hit nothing. The pixel's random numbers go on from where the RESTIR_PASS left them, so
+// the path continues exactly as if the image pass had traced the ray itself.
+bool loadPrimaryHit(ivec2 pixel, inout uint seed, out Intersection intersection) {
+    PrimaryHit stored = primaryHits[primaryHitIndex(pixel)];
+    seed = stored.seed;
+    if (stored.meshIndex == ~0u) {
+        return false;
+    }
+    intersection.meshIndex = stored.meshIndex;
+    intersection.instanceIndex = stored.instanceIndex;
+    intersection.primitive = stored.primitive;
+    intersection.barycentrics = stored.barycentrics;
+    intersection.t = stored.t;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
 // storeGuides: write the DLSS inputs of this path (the first hit, and the distance to the second if the first
-// bounce reflected) for this thread's pixel.
+// bounce reflected) for this thread's pixel. usePrimaryHit: the camera ray's hit is this pixel's stored one
+// (see "Primary hits"), and its direct light comes from the pixel's ReSTIR reservoir; direction must be the same
+// camera ray.
 //
 // Keep in mind when adding to this loop: every value that lives from one bounce to the next, or across the light
 // loop below (whose shadow ray needs many registers of its own), takes a register in every pixel. The shader is
 // near the point where the GPU fits fewer pixels at a time, or moves values out to slow memory (the Debug tab
 // shows both: register count and local memory). Recomputing something cheap, reading it from the uniforms, or
 // storing it right away is usually faster than keeping it.
-vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
+vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, bool usePrimaryHit) {
     // The sun is a small glowing disc in the sky. Its total light (PI * sunColor, see below) is spread evenly
     // over the disc's solid angle. Like glowing triangles, it is found both by shadow rays aimed at it and by
     // bounce rays that happen to hit it, combined with MIS: a mirror finds it through its bounce ray, a matte
@@ -1543,13 +2036,29 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
     vec3 reflectionPosition = vec3(0.0);
     vec3 reflectionNormal = vec3(0.0, 0.0, 1.0);
     bool reflectionTwoSided = false;
+    // The last reflection was the first surface with ReSTIR DI: its reservoir counted all the light that light
+    // sampling can find (glowing triangles, punctual lights, the sampled sky), behind glass or not. Its bounce ray
+    // then counts only what light sampling can't pick.
+    bool restirReflection = false;
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
     // by bouncing would be one bounce short, and the methods wouldn't agree.
     for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
-        Hit hit = traceClosest(origin, direction, seed, coneWidth, coneSpread);
+        // (not traceClosest: one copy of the code that builds a Hit, called once here, keeps the shader smaller)
+        Intersection intersection;
+        bool found;
+        if (bounce == 0 && usePrimaryHit) {
+            found = loadPrimaryHit(pixel, seed, intersection);
+        } else {
+            found = intersectClosest(origin, direction, seed, intersection);
+        }
+        Hit hit;
+        hit.found = found;
+        if (found) {
+            hit = hitFromIntersection(intersection, origin, direction, coneWidth, coneSpread);
+        }
         previousVertex = currentVertex;
         currentVertex = -1;
         if (bounce == 1 && firstBounceSpecular) {
@@ -1563,7 +2072,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
             vec3 skyLight = throughput * environmentLight(direction);
             if (scene.environmentSampling == 0 || !reflectedOnce) {
                 ADD_LIGHT(skyLight);  // nothing else finds it (the camera sees the sky, maybe through glass)
-            } else if (!throughSolidGlass) {
+            } else if (!throughSolidGlass && !restirReflection) {
                 // The bounce-sampling share of the last surface's direct skylight, also through thin panes. Unlike
                 // the sun's, it goes into that surface's cache cell as well: a path ending there takes it from the
                 // cache (see the shadow ray below). A smooth sky is mostly found this way, so its light comes
@@ -1583,12 +2092,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
             }
             break;
         }
-        // The reflection formulas need the viewer above the shading normal. A smooth or normal-mapped normal
-        // can tilt away from the viewer near silhouettes; tilt it back just far enough.
-        float cosViewer = dot(hit.normal, -direction);
-        if (cosViewer < 1e-3) {
-            hit.normal = normalize(hit.normal - direction * (1e-3 - cosViewer));
-        }
+        tiltTowardsViewer(hit, direction);
         if (bounce == 0 && wantGuides) {
             storeSurfaceGuides(pixel, hit, direction);
         }
@@ -1604,7 +2108,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
         if (any(greaterThan(hit.emissive, vec3(0.0)))) {
             float weight = 1.0;
             bool lightSampled = sampleLights && hit.lightIndex >= 0;
-            if (reflectedOnce && throughGlass) {
+            if (reflectedOnce && restirReflection && lightSampled) {
+                weight = lightPickProbability(hit.lightIndex, reflectionPosition, reflectionNormal,
+                                              reflectionTwoSided) > 0.0 ? 0.0 : 1.0;
+            } else if (reflectedOnce && throughGlass) {
                 weight = lightSampled ? 0.0 : 1.0;
             } else if (reflectedOnce && lightSampled) {
                 if (scene.emissiveSampling == EMISSIVE_LIGHT_SAMPLING) {
@@ -1669,13 +2176,16 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
 
         // Inside glass there is nothing to light-sample: lights are outside, behind the glass surface.
         bool leavingGlass = hit.solid && !hit.frontFace && hit.transmission > 0.0;
+        // The first surface with ReSTIR DI: slot 2 takes the reservoir's sample instead of a glowing triangle,
+        // the sky slot is left out, and the punctual ones if the reservoir has them (more than a few lights)
+        bool restirVertex = bounce == 0 && usePrimaryHit && reservoirs[restirIndex(pixel, false)].light != RESTIR_NOT_USED;
         if (!leavingGlass) {
             // Direct light: one shadow ray per kind of light (see LightSample). Slot 0: the sun, 1: the sky, 2: the
             // glowing triangles, 3 and up: the punctual lights. One loop, so the shadow ray and the BRDF exist only
             // once in the compiled shader. In world space: a shading frame would take 9 more registers across the
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
-            uint lightSlots = 3 + punctualLightSamples();
+            uint lightSlots = restirVertex && scene.restirPunctualCandidates > 0 ? 3 : 3 + punctualLightSamples();
             [[dont_unroll]] for (uint slot = 0; slot < lightSlots; slot++) {
                 LightSample s = noLightSample();
                 if (slot == 0) {
@@ -1695,7 +2205,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
                     // A direction picked by the sky's brightness. Behind solid glass no bounce ray counts it (as for
                     // the sun); behind thin panes they do. Ending in the cache, the cache has the bounce rays' share
                     // (see the miss above), so this stays the MIS share.
-                    if (scene.environmentSampling != 0) {
+                    if (scene.environmentSampling != 0 && !restirVertex) {
                         float skyPdf;
                         s.direction = sampleEnvironment(seed, skyPdf);
                         if (skyPdf > 0.0) {
@@ -1707,7 +2217,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
                         }
                     }
                 } else if (slot == 2) {
-                    if (sampleLights) {
+                    if (restirVertex) {
+                        s = restirReservoirSample(pixel, hit.position + hit.geometricNormal * 0.001);
+                    } else if (sampleLights) {
                         s = sampleEmissiveLight(hit, hit.normal, hit.position + hit.geometricNormal * 0.001, seed);
                     }
                 } else {
@@ -1800,6 +2312,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides) {
             throughGlass = false;
             throughSolidGlass = false;
             reflectedOnce = true;
+            restirReflection = restirVertex;
             reflectionPdf = bouncePdf;
             reflectionPosition = hit.position;
             reflectionNormal = hit.normal;
@@ -1897,7 +2410,171 @@ void updateCache() {
     if (position.x >= float(size.x) || position.y >= float(size.y)) {
         return;
     }
-    tracePath(scene.cameraPosition.xyz, cameraRayDirection(position, size), seed, false);
+    tracePath(scene.cameraPosition.xyz, cameraRayDirection(position, size), seed, false, false);
+}
+
+// The start of a pixel's random numbers in this frame
+uint pixelSeed(ivec2 pixel) {
+    return pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(scene.frameIndex)));
+}
+
+// Spread samples randomly over the pixel (anti-aliasing). A single sample without accumulation
+// goes through the pixel center, otherwise edges would flicker from frame to frame.
+vec3 sampleCameraRay(ivec2 pixel, ivec2 size, inout uint seed) {
+    bool randomOffset = scene.samplesPerPixel > 1 || scene.accumulate != 0;
+    vec2 offset = randomOffset ? vec2(randomFloat(seed), randomFloat(seed)) - 0.5 : vec2(0.0);
+    return cameraRayDirection(vec2(pixel) + 0.5 + offset, size);
+}
+
+// Whether a reservoir's sample is seen from a surface (a shadow ray; through glass counts as seen)
+bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
+    float toSolidAngle;
+    LightSample s = restirLightSample(r.light, r.point, hit.position + hit.geometricNormal * 0.001, toSolidAngle);
+    bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
+    vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
+    bool crossedGlass, crossedSolidGlass;
+    vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
+    return any(greaterThan(transmittance, vec3(0.0)));
+}
+
+// Last frame's reservoir of the same surface point (where it was on last frame's image), merged into r, which holds
+// this frame's candidates. Both reservoirs' samples are resampled for this surface with the generalized balance
+// heuristic: a sample's MIS weight is its reservoir's M times its target there, over the sum of that over both
+// surfaces (Lin et al. 2022). Last frame's surface comes from its stored copy, and its view direction from last
+// frame's camera. Targets ignore what blocks the light. That's a bias: a sample this frame's surface sees but last
+// frame's doesn't (last frame's ray hit elsewhere in the pixel, close to a shadow's edge) gets a share of its MIS
+// weight for last frame's surface, which could never have produced it: too dark near shadow edges (Sponza with the
+// sky: 3.7%, taking history from up to 3 pixels away). With restirTemporal = 2 (the default), both targets at last frame's surface include whether it sees the sample
+// (a shadow ray each): last frame's own sample needs one too, it may come from older frames and never have been
+// tested from there. Then the weights add up to 1 for every sample either surface can produce: no bias.
+Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
+    if (scene.restirTemporal == 0 || scene.restirHistoryValid == 0) {
+        return r;
+    }
+    vec4 previousPosition = instances[hit.instanceIndex].motion * vec4(hit.position, 1.0);
+    if ((scene.previousViewProjection * previousPosition).w <= 0.0) {
+        return r;  // behind last frame's camera
+    }
+    ivec2 reprojected = ivec2(floor(projectToPixel(scene.previousViewProjection, previousPosition)));
+    // Last frame's view depth of this point (clip w), to compare with the stored surfaces'
+    float expectedDepth = (scene.previousViewProjection * previousPosition).w;
+    ivec2 size = imageSize(radianceImage);
+
+    // A matching surface of last frame: the reprojected pixel, or if that one doesn't match (something else was
+    // there, or a different part of a bumpy surface), one of up to 8 random pixels within 2 of it (as RTXDI).
+    // Matching: shading normals within 60 degrees, view depths within 10%, as RTXDI. A stricter test rejects
+    // history in a scattered pattern on normal-mapped surfaces, and pixels with long and short histories next to
+    // each other look patchy.
+    uint previousIndex = 0;
+    Hit previousHit;
+    bool found = false;
+    for (int attempt = 0; attempt < 9 && !found; attempt++) {
+        ivec2 candidate = reprojected;
+        if (attempt == 0) {
+            // Permutation sampling (as RTXDI): every frame the whole image takes its history from pixels shuffled
+            // within 4 x 4 blocks (shift by this frame's offset, mirror within the block, shift back), so every
+            // reservoir is still used once. Without it a pixel keeps its sample for many frames, and so its error,
+            // moving with the surface: a denoiser takes error that doesn't change for detail. DLSS painted it
+            // into the image (smudges like brush strokes, trails behind moving edges).
+            if ((scene.restirPermutation & 16u) != 0u) {
+                ivec2 offset = ivec2(scene.restirPermutation & 3u, (scene.restirPermutation >> 2) & 3u);
+                candidate = ((candidate + offset) ^ ivec2(3)) - offset;
+            }
+        } else {
+            candidate += ivec2(round((vec2(randomFloat(seed), randomFloat(seed)) - 0.5) * 4.0));
+        }
+        if (any(lessThan(candidate, ivec2(0))) || any(greaterThanEqual(candidate, size))) {
+            continue;  // off last frame's image
+        }
+        uint index = restirIndex(candidate, true);
+        if (reservoirs[index].light == RESTIR_NOT_USED) {
+            continue;
+        }
+        Hit surface = unpackRestirSurface(restirSurfaces[index]);
+        float depth = (scene.previousViewProjection * vec4(surface.position, 1.0)).w;
+        if (dot(surface.normal, hit.normal) >= 0.5 && abs(depth - expectedDepth) <= 0.1 * max(depth, expectedDepth)) {
+            previousIndex = index;
+            previousHit = surface;
+            found = true;
+        }
+    }
+    if (!found) {
+        return r;
+    }
+    Reservoir previous = reservoirs[previousIndex];
+    vec3 previousV = normalize(scene.previousCameraPosition.xyz - previousHit.position);
+    float previousM = min(previous.M, scene.restirMaxHistory * r.M);
+
+    // Targets of both samples at both surfaces
+    float currentHere = restirTargetOf(r, hit, v);
+    float currentThere = restirTargetOf(r, previousHit, previousV);
+    if (scene.restirTemporal == 2 && currentThere > 0.0 && r.W > 0.0 && !restirVisible(r, previousHit, seed)) {
+        currentThere = 0.0;
+    }
+    float previousHere = restirTargetOf(previous, hit, v);
+    float previousThere = restirTargetOf(previous, previousHit, previousV);
+    if (scene.restirTemporal == 2 && previousThere > 0.0 && previous.W > 0.0 && !restirVisible(previous, previousHit, seed)) {
+        previousThere = 0.0;
+    }
+    float currentSum = r.M * currentHere + previousM * currentThere;
+    float previousSum = r.M * previousHere + previousM * previousThere;
+    float currentWeight = currentSum > 0.0 ? r.M * currentHere / currentSum * currentHere * r.W : 0.0;
+    float previousWeight = previousSum > 0.0 ? previousM * previousThere / previousSum * previousHere * previous.W : 0.0;
+
+    float weightSum = currentWeight + previousWeight;
+    float keptTarget = currentHere;
+    if (randomFloat(seed) * weightSum < previousWeight) {
+        r.light = previous.light;
+        r.point = previous.point;
+        keptTarget = previousHere;
+    }
+    r.M += previousM;
+    r.W = keptTarget > 0.0 ? weightSum / keptTarget : 0.0;
+    return r;
+}
+
+// RESTIR_PASS: the first camera ray of each pixel, with the same random numbers the image pass will use, then
+// the candidates of its first surface
+void restirPass(ivec2 pixel, ivec2 size) {
+    uint seed = pixelSeed(pixel);
+    vec3 direction = sampleCameraRay(pixel, size, seed);
+    Intersection intersection;
+    bool found = intersectClosest(scene.cameraPosition.xyz, direction, seed, intersection);
+    storePrimaryHit(pixel, found, intersection, seed);
+
+    Reservoir reservoir;
+    reservoir.light = RESTIR_NOT_USED;
+    reservoir.point = 0;
+    reservoir.W = 0.0;
+    reservoir.M = 0.0;
+    if (found) {
+        // The same surface the image pass will see (see tracePath's first bounce)
+        Hit hit = hitFromIntersection(intersection, scene.cameraPosition.xyz, direction, 0.0, scene.pixelSpreadAngle);
+        tiltTowardsViewer(hit, direction);
+        if (restirSurface(hit)) {
+            // Random numbers of their own: the image pass goes on with the pixel's (its bounce directions must
+            // not depend on which light was picked)
+            uint candidateSeed = pcgHash(seed ^ 0x9e3779b9u);
+            reservoir = restirCandidates(hit, -direction, candidateSeed);
+            // Visibility reuse: a blocked sample gets W = 0, so it isn't passed on to the next frame (or neighbors)
+            if (reservoir.W > 0.0) {
+                vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+                float toSolidAngle;
+                LightSample s = restirLightSample(reservoir.light, reservoir.point, surfacePoint, toSolidAngle);
+                bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
+                vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
+                bool crossedGlass, crossedSolidGlass;
+                vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, candidateSeed,
+                                                         crossedGlass, crossedSolidGlass);
+                if (all(equal(transmittance, vec3(0.0)))) {
+                    reservoir.W = 0.0;
+                }
+            }
+            reservoir = restirTemporal(reservoir, hit, -direction, candidateSeed);
+            restirSurfaces[restirIndex(pixel, false)] = packRestirSurface(hit);
+        }
+    }
+    reservoirs[restirIndex(pixel, false)] = reservoir;
 }
 
 void main() {
@@ -1910,8 +2587,12 @@ void main() {
     if (pixel.x >= size.x || pixel.y >= size.y) {
         return;  // the last tiles can stick out past the image edge
     }
+    if (RESTIR_PASS != 0) {
+        restirPass(pixel, size);
+        return;
+    }
 
-    uint seed = pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) + pcgHash(scene.frameIndex)));
+    uint seed = pixelSeed(pixel);
 
     if (scene.debugView != 0) {
         vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed);
@@ -1919,16 +2600,12 @@ void main() {
         return;
     }
 
-    // Spread samples randomly over the pixel (anti-aliasing). A single sample without accumulation
-    // goes through the pixel center, otherwise edges would flicker from frame to frame.
-    bool randomOffset = scene.samplesPerPixel > 1 || scene.accumulate != 0;
-
     vec3 color = vec3(0.0);
     for (uint s = 0; s < scene.samplesPerPixel; s++) {
-        vec2 offset = randomOffset ? vec2(randomFloat(seed), randomFloat(seed)) - 0.5 : vec2(0.0);
-        vec3 direction = cameraRayDirection(vec2(pixel) + 0.5 + offset, size);
-        // DLSS gets one sample per pixel anyway: the first path writes the guides
-        color += tracePath(scene.cameraPosition.xyz, direction, seed, s == 0);
+        vec3 direction = sampleCameraRay(pixel, size, seed);
+        // DLSS gets one sample per pixel anyway: the first path writes the guides. The RESTIR_PASS traced the
+        // first sample's camera ray.
+        color += tracePath(scene.cameraPosition.xyz, direction, seed, s == 0, s == 0 && scene.restirDi != 0);
     }
     color /= float(scene.samplesPerPixel);
 

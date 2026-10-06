@@ -249,8 +249,9 @@ void Application::readNoiseResults() {
     result.brightness = reference > 0.0 ? static_cast<float>(measured / reference) : 0.0f;
     result.regionBrightness = regionReference > 0.0 ? static_cast<float>(regionMeasured / regionReference) : 0.0f;
     // readTimestamps read this frame slot's timestamps just before: the same frame
-    result.traceMs = lastPassTimes[0] + lastPassTimes[1];  // radiance cache + trace
-    result.dlssMs = lastPassTimes[2];
+    result.traceMs = lastPassTimes[0] + lastPassTimes[1] + lastPassTimes[2];  // radiance cache + ReSTIR + trace
+    result.restirMs = lastPassTimes[1];
+    result.dlssMs = lastPassTimes[3];
     noiseResults.push_back(result);
     if (result.frame >= static_cast<uint32_t>(noiseMeasureFrames)) {
         finishNoiseMeasurement();
@@ -259,16 +260,20 @@ void Application::readNoiseResults() {
 
 void Application::finishNoiseMeasurement() {
     noiseState = NoiseState::Idle;
-    float traceMs = 0.0f, dlssMs = 0.0f;
+    float traceMs = 0.0f, restirMs = 0.0f, dlssMs = 0.0f;
     for (const NoiseResult& result : noiseResults) {
         traceMs += result.traceMs;
+        restirMs += result.restirMs;
         dlssMs += result.dlssMs;
     }
-    traceMs /= static_cast<float>(std::max<size_t>(noiseResults.size(), 1));
-    dlssMs /= static_cast<float>(std::max<size_t>(noiseResults.size(), 1));
+    float count = static_cast<float>(std::max<size_t>(noiseResults.size(), 1));
+    traceMs /= count;
+    restirMs /= count;
+    dlssMs /= count;
     char line[256];
-    std::snprintf(line, sizeof(line), "measured %s%s: trace %.2f ms, DLSS %.2f ms per frame",
-                  renderModeName(noiseMeasureMode), settings.radianceCache ? " + radiance cache" : "", traceMs, dlssMs);
+    std::snprintf(line, sizeof(line), "measured %s%s%s: trace %.2f ms (ReSTIR %.2f), DLSS %.2f ms per frame",
+                  renderModeName(noiseMeasureMode), settings.radianceCache ? " + radiance cache" : "",
+                  settings.restirDi ? " + ReSTIR DI" : "", traceMs, restirMs, dlssMs);
     noiseStatus = line;
     std::cout << "noise: " << line << std::endl;
     std::cout << "noise: frame  relMSE      rel. RMSE  brightness  region" << std::endl;

@@ -48,6 +48,19 @@ for o in list(bpy.data.objects):
     # KHR_lights_punctual. Empties stay: some hold the parent transform (cm -> m).
     if o.type == 'CAMERA' or (o.type == 'LIGHT' and o.data.type not in ('POINT', 'SPOT')):
         bpy.data.objects.remove(o)
+def switched_off(o):
+    while o:
+        if o.hide_viewport or o.hide_render:
+            return True
+        o = o.parent
+    return False
+# Objects the artist switched off (FBX visibility 0): the importer keeps them hidden, the glTF exporter writes them
+# like any other. Zero-Day has 134 meshes this way: a spare copy of its side pipes ("BACKUP") placed through the
+# room, and the lit variants of its accent lights ("accent_on...") on top of the unlit ones the scene shows.
+hidden = [o for o in bpy.data.objects if o.type == 'MESH' and switched_off(o)]
+print('removed %d switched-off meshes (%d faces)' % (len(hidden), sum(len(o.data.polygons) for o in hidden)))
+for o in hidden:
+    bpy.data.objects.remove(o)
 for m in bpy.data.meshes:
     while len(m.uv_layers) > 1:          # the second set is a lightmap layout, unused
         m.uv_layers.remove(m.uv_layers[1])

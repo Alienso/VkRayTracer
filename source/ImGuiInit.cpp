@@ -69,8 +69,8 @@ void Application::buildImGui() {
     // Always visible, whichever tab is open
     ImGui::Text("GPU: %s", physicalDeviceProperties.deviceName);
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-    ImGui::Text("GPU: cache %.2f ms, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
-                gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4]);
+    ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
+                gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4], gpuPassTimes[5]);
     ImGui::Text("%u triangles", primitiveCount);
     if (settings.accumulate && !dlssActive()) {
         ImGui::Text("%u frames accumulated", accumulatedFrames);
@@ -115,6 +115,10 @@ void Application::buildImGui() {
 void Application::buildCameraUi() {
     ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
     ImGui::TextDisabled("hold right mouse button to look around");
+    bool fullscreenChecked = fullscreen;
+    if (ImGui::Checkbox("Fullscreen (F11)", &fullscreenChecked)) {
+        setFullscreen(fullscreenChecked);
+    }
     ImGui::DragFloat3("Position", &camera.position.x, 0.05f);
     ImGui::DragFloat("Yaw", &camera.yaw, 0.5f);
     ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
@@ -189,10 +193,53 @@ void Application::buildRenderingUi() {
     ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                         "instead of slowly converging sparkles (fireflies)");
     buildRadianceCacheUi();
+    buildRestirUi();
 
     ImGui::SeparatorText("Image");
     buildExposureUi();
     ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
+}
+
+// ReSTIR DI (work in progress, see RESTIR_DI_PLAN.md)
+void Application::buildRestirUi() {
+    ImGui::SeparatorText("ReSTIR DI");
+    ImGui::Checkbox("ReSTIR DI", &settings.restirDi);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Direct light at the first surface the camera sees (if rough enough): several candidate light\n"
+                          "samples per pixel, the most promising one kept and reused by the next frame. Less noise with\n"
+                          "many lights (Bistro at night). The sun keeps its own shadow ray.");
+    }
+    ImGui::BeginDisabled(!settings.restirDi);
+    ImGui::SliderInt("Light candidates", &settings.restirLightCandidates, 1, 16);
+    ImGui::SliderInt("Sky candidates", &settings.restirSkyCandidates, 1, 8);
+    ImGui::SliderInt("BRDF candidates", &settings.restirBrdfCandidates, 0, 4);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Light candidates: points on glowing triangles (light tree), each per pixel and frame.\n"
+                          "Sky candidates: directions picked by the sky's brightness (HDR maps only).\n"
+                          "BRDF candidates: directions the surface reflects into, a ray each (the light a glossy\n"
+                          "surface mirrors).");
+    }
+    ImGui::SliderFloat("Min. roughness", &settings.restirMinRoughness, 0.0f, 1.0f, "%.2f");
+    ImGui::Checkbox("Reuse last frame", &settings.restirTemporal);
+    ImGui::BeginDisabled(!settings.restirTemporal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Unbiased", &settings.restirTemporalVisibility);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Two more shadow rays per pixel, from last frame's surface. Without them, areas near shadow\n"
+                          "edges come out too dark (Sponza with the sky: 3.7%%, Bistro at night: 0.6%%).");
+    }
+    ImGui::Checkbox("Shuffle pixels", &settings.restirPermutation);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Last frame's samples come from pixels up to 3 away, shuffled differently every frame.\n"
+                          "Off: each pixel keeps its samples, and DLSS paints their error into the image.");
+    }
+    ImGui::SliderFloat("Max. history", &settings.restirMaxHistory, 1.0f, 50.0f, "%.0f x");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Last frame's samples count for at most this many times this frame's candidates. Higher:\n"
+                          "less noise on still images, slower reaction to changes.");
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
 }
 
 void Application::buildDebugUi() {

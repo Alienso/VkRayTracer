@@ -244,7 +244,7 @@ void Application::updateScene() {
     // 2: objects -> TLAS instances. An object becomes one instance per part of its model.
     frameInstances.clear();
     frameInstanceTransforms.clear();
-    frameInstanceMotion.clear();
+    frameGpuInstances.clear();
     frameInstanceMeshes.clear();
     primitiveCount = 0;
     for (SceneObject& object : sceneObjects) {
@@ -282,7 +282,8 @@ void Application::updateScene() {
             instance.accelerationStructureReference = blases[part.meshIndex].address;
             frameInstances.push_back(instance);
             frameInstanceTransforms.push_back(world);
-            frameInstanceMotion.push_back(motion);
+            glm::mat3 objectToWorld(world);
+            frameGpuInstances.push_back({motion, objectToWorld, glm::inverse(objectToWorld)});
             frameInstanceMeshes.push_back(part.meshIndex);
             primitiveCount += meshInfos[part.meshIndex].indexCount / 3;
         }

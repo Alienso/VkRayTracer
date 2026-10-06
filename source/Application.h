@@ -73,6 +73,55 @@ struct SceneUniforms {
     uint32_t textureMipmaps;         // 1 = textures are read at the mip level that fits the hit (ray cones)
     float pixelSpreadAngle;          // radians between neighboring camera rays (render resolution)
     uint32_t normalMapFiltering;     // 1 = bumps that a normal map's smaller levels average away widen the reflection
+    uint32_t restirDi;               // 1 = ReSTIR DI: camera rays and light samples in a pass of their own (recordRayTracing)
+    uint32_t restirTriangleCandidates;  // ReSTIR candidates per kind of light (0 when there are none of that kind)
+    uint32_t restirPunctualCandidates;
+    uint32_t restirSkyCandidates;
+    uint32_t restirBrdfCandidates;
+    float restirMinRoughness;        // rougher surfaces use ReSTIR
+    uint32_t restirTemporal;         // 1 = reuse last frame's reservoirs
+    float restirMaxHistory;          // last frame's reservoir counts for at most this many times this frame's candidates
+    uint32_t restirHistoryValid;     // 0: last frame's reservoirs can't be used (see buildSceneUniforms)
+    uint32_t restirCurrentHalf;      // which half of the reservoir and surface buffers is this frame's
+    uint32_t restirPermutation;      // shuffle of last frame's pixels: bit 4 = on, bits 0-3 = this frame's offset
+    alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
+};
+
+// Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
+struct GpuInstance {
+    glm::mat4 motion;         // this frame's world position -> last frame's (motion vectors)
+    glm::mat3 objectToWorld;  // without the translation (directions, normals): the shader reads these instead of the
+    glm::mat3 worldToObject;  // ray query's, so hits stored by the ReSTIR camera-ray pass can be rebuilt the same way
+};
+
+// One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
+struct GpuPrimaryHit {
+    uint32_t meshIndex;
+    uint32_t instanceIndex;
+    int32_t primitive;
+    glm::vec2 barycentrics;
+    float t;
+    uint32_t seed;
+};
+
+// Two per render pixel (this frame's and last frame's), binding 26: ReSTIR DI's light sample. Must match Reservoir in
+// shaders/raytrace.comp.
+struct GpuReservoir {
+    uint32_t light;
+    uint32_t point;
+    float W;
+    float M;
+};
+
+// Two per render pixel, binding 27: the first surface, packed, for ReSTIR's reuse. Must match RestirSurface in
+// shaders/raytrace.comp.
+struct GpuRestirSurface {
+    glm::vec3 position;
+    uint32_t normal;
+    uint32_t geometricNormal;
+    uint32_t albedoRoughness;
+    uint32_t material;
+    uint32_t diffuseTransmissionColor;
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -137,7 +186,8 @@ struct NoiseResult {
     float relativeMse;   // mean of ((measured - reference) / (reference + floor))^2 over the image, luminance
     float brightness;    // measured / reference, summed over the image (1 = no bias)
     float regionBrightness;  // the same inside noiseRegion only (local bias, e.g. light leaking into a corner)
-    float traceMs;       // GPU time of this frame's trace (+ radiance cache) and DLSS passes
+    float traceMs;       // GPU time of this frame's trace (+ radiance cache and ReSTIR) and DLSS passes
+    float restirMs;      // of which ReSTIR
     float dlssMs;
 };
 enum class NoiseState { Idle, BuildingReference, WaitingToMeasure, Measuring };
@@ -390,6 +440,18 @@ struct RenderSettings {
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
     float cacheHistoryFrames = 32.0f;  // old cache samples fade out over about this many frames
+    bool restirDi = false;  // ReSTIR DI (work in progress, RESTIR_DI_PLAN.md): direct light at the first surface
+    int restirLightCandidates = 4;   // candidate samples of glowing triangles per pixel (of punctual lights: up to this)
+    int restirSkyCandidates = 2;     // of the sky, when it is light-sampled
+    int restirBrdfCandidates = 1;    // directions picked by the surface's reflection (a ray each)
+    float restirMinRoughness = 0.25f;  // smoother surfaces keep the usual light sampling
+    bool restirTemporal = true;        // reuse last frame's samples
+    bool restirTemporalVisibility = true;   // with shadow rays from last frame's surface (else Sponza ends up 3.7% too dark)
+    bool restirPermutation = true;     // take last frame's samples from shuffled pixels (keeps DLSS from painting noise)
+    // Last frame's samples count for at most this many times this frame's candidates. 20 (RTXDI's default) made
+    // patches flicker under DLSS: a lucky bright sample held for many frames, then lost (8x more flickering pixels
+    // in Bistro at night than 5); the noise was the same.
+    float restirMaxHistory = 5.0f;
     float cacheMinSamples = 4.0f;   // a cell is used once it has this much sample weight
     bool accumulate = true;
 
@@ -427,6 +489,11 @@ public:
 
 private:
     GLFWwindow* window;
+    // Fullscreen = borderless window covering the monitor it is on; the windowed position and size come back after
+    bool fullscreen = false;
+    bool fullscreenKeyDown = false;  // F11 toggles once per press
+    int windowedX = 0, windowedY = 0, windowedWidth = 0, windowedHeight = 0;
+    bool windowedMaximized = false;
     VkInstance instance;
     VkDebugUtilsMessengerEXT debugMessenger;
     VkSurfaceKHR surface;
@@ -501,9 +568,9 @@ private:
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, from the objects
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
     std::vector<glm::mat4> frameInstanceTransforms;  // world transform of each of frameInstances
-    std::vector<glm::mat4> frameInstanceMotion;      // per instance: this frame's world position -> last frame's
-    VkBuffer instanceMotionBuffer = VK_NULL_HANDLE;  // frameInstanceMotion on the GPU, room for tlasCapacity
-    VkDeviceMemory instanceMotionMemory = VK_NULL_HANDLE;
+    std::vector<GpuInstance> frameGpuInstances;      // per instance: motion and matrices for the shader
+    VkBuffer instanceDataBuffer = VK_NULL_HANDLE;    // frameGpuInstances on the GPU, room for tlasCapacity
+    VkDeviceMemory instanceDataMemory = VK_NULL_HANDLE;
     std::vector<uint32_t> frameInstanceMeshes;       // mesh of each of frameInstances
     bool tlasDirty = true;
 
@@ -562,6 +629,17 @@ private:
     RenderImage normalRoughnessImage;     // RGBA16F: world-space shading normal, roughness in alpha
     RenderImage specularHitDistanceImage; // R32F: first hit -> next hit along a reflection/refraction, 0 = unknown
     RenderImage guideHistoryImage;        // RGBA16F: last frame's diffuse albedo, for the reprojection error view
+    VkBuffer primaryHitBuffer = VK_NULL_HANDLE;  // GpuPrimaryHit per render pixel (ReSTIR: camera rays traced first)
+    VkDeviceMemory primaryHitMemory = VK_NULL_HANDLE;
+    VkBuffer reservoirBuffer = VK_NULL_HANDLE;   // GpuReservoir per render pixel, this frame's and last frame's
+    VkDeviceMemory reservoirMemory = VK_NULL_HANDLE;
+    VkBuffer restirSurfaceBuffer = VK_NULL_HANDLE;  // GpuRestirSurface per render pixel, this frame's and last frame's
+    VkDeviceMemory restirSurfaceMemory = VK_NULL_HANDLE;
+    // Last frame's reservoirs can be reused: ReSTIR ran, at this size, with the same lights
+    bool restirHistoryAvailable = false;
+    bool restirLightsChanged = false;  // this frame uploads new lights (their indices may have changed)
+    uint32_t restirCurrentHalf = 0;
+    glm::vec3 previousCameraPosition = glm::vec3(0.0f);
 
     // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
     // from this frame's position to last frame's (object motion). Binding 12, uploaded every frame.
@@ -580,6 +658,7 @@ private:
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
     VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
+    VkPipeline rtRestirPipeline;       // the same shader with RESTIR_PASS = 1: camera rays and ReSTIR DI candidates
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;
@@ -686,7 +765,7 @@ private:
 
     // GPU time of each pass (trace, exposure, display): timestamps before and after them, one set of queries
     // per frame in flight, read when that frame slot is recorded again. Smoothed over ~20 frames, in ms.
-    static constexpr uint32_t timestampsPerFrame = 6;  // before the cache, after cache / trace / DLSS / exposure / display
+    static constexpr uint32_t timestampsPerFrame = 7;  // before the cache, after cache / ReSTIR / trace / DLSS / exposure / display
     VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
     std::vector<bool> timestampsWritten;
     float gpuPassTimes[timestampsPerFrame - 1] = {};
@@ -713,6 +792,7 @@ private:
 
 
     void initWindow();
+    void setFullscreen(bool on);
     void initVulkan();
     void mainLoop();
     void cleanup();
@@ -830,6 +910,7 @@ private:
     void recordRadianceCache(VkCommandBuffer commandBuffer);
     void destroyRadianceCache();
     void buildRadianceCacheUi();
+    void buildRestirUi();
 
     // Noise.cpp
     void ensureNoiseResources();
@@ -860,7 +941,7 @@ private:
     void createRayTracingPipeline();
     std::string readPipelineStatistics(VkPipeline pipeline);
     SceneUniforms buildSceneUniforms();
-    void recordInstanceMotionUpload(VkCommandBuffer commandBuffer);
+    void recordInstanceUpload(VkCommandBuffer commandBuffer);
     void createTimestampQueries();
     void readTimestamps();
     void writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index);

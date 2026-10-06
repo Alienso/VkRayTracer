@@ -9,6 +9,7 @@
 #include <imgui/backends/imgui_impl_glfw.h>
 #include "Application.h"
 #include <cstring>
+#include <algorithm>
 #include "Configuration.h"
 
 static void destroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT debugMessenger, const VkAllocationCallbacks* pAllocator);
@@ -28,6 +29,47 @@ void Application::initWindow() {
     window = glfwCreateWindow(Configuration::wWidth, Configuration::wHeight, "Vulkan", nullptr, nullptr);
     glfwSetWindowUserPointer(window,this);
     glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+}
+
+// Borderless fullscreen on the monitor holding most of the window, at the monitor's own resolution and refresh rate:
+// the swapchain follows through the resize callback, like any other window size change.
+void Application::setFullscreen(bool on) {
+    if (on == fullscreen) {
+        return;
+    }
+    if (on) {
+        windowedMaximized = glfwGetWindowAttrib(window, GLFW_MAXIMIZED) == GLFW_TRUE;
+        if (windowedMaximized) {
+            glfwRestoreWindow(window);  // remember the size it un-maximizes to
+        }
+        glfwGetWindowPos(window, &windowedX, &windowedY);
+        glfwGetWindowSize(window, &windowedWidth, &windowedHeight);
+        int monitorCount = 0;
+        GLFWmonitor** monitors = glfwGetMonitors(&monitorCount);
+        GLFWmonitor* best = glfwGetPrimaryMonitor();
+        int bestOverlap = 0;
+        for (int i = 0; i < monitorCount; i++) {
+            int x, y;
+            glfwGetMonitorPos(monitors[i], &x, &y);
+            const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+            int overlapX = std::min(windowedX + windowedWidth, x + mode->width) - std::max(windowedX, x);
+            int overlapY = std::min(windowedY + windowedHeight, y + mode->height) - std::max(windowedY, y);
+            int overlap = std::max(overlapX, 0) * std::max(overlapY, 0);
+            if (overlap > bestOverlap) {
+                bestOverlap = overlap;
+                best = monitors[i];
+            }
+        }
+        const GLFWvidmode* mode = glfwGetVideoMode(best);
+        glfwSetWindowMonitor(window, best, 0, 0, mode->width, mode->height, mode->refreshRate);
+    } else {
+        glfwSetWindowMonitor(window, nullptr, windowedX, windowedY, windowedWidth, windowedHeight, GLFW_DONT_CARE);
+        if (windowedMaximized) {
+            glfwMaximizeWindow(window);
+        }
+    }
+    fullscreen = on;
+    framebufferResized = true;
 }
 
 void Application::initVulkan() {
@@ -72,6 +114,11 @@ void Application::mainLoop() {
     double lastTime = glfwGetTime();
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+        bool fullscreenKey = glfwGetKey(window, GLFW_KEY_F11) == GLFW_PRESS;
+        if (fullscreenKey && !fullscreenKeyDown) {
+            setFullscreen(!fullscreen);
+        }
+        fullscreenKeyDown = fullscreenKey;
 
         double now = glfwGetTime();
         float deltaTime = static_cast<float>(now - lastTime);

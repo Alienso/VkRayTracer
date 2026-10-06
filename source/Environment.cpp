@@ -345,8 +345,14 @@ void Application::buildEnvironmentUi() {
                 ImGui::TextDisabled("%u x %u", environmentMapSize.x, environmentMapSize.y);
             }
             ImGui::SliderFloat("Rotation##map", &settings.environmentRotation, -180.0f, 180.0f, "%.0f deg");
-            ImGui::SliderFloat("Intensity##map", &settings.environmentIntensity, 0.01f, 100.0f, "%.2f",
+            // Down to 1e-5: night maps come brightness-normalized like day ones (Poly Haven), while real moonlight
+            // or city sky glow is ~1/30000 of daylight
+            ImGui::SliderFloat("Intensity##map", &settings.environmentIntensity, 0.00001f, 100.0f, "%.2g",
                                ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Multiplies the map. Night maps are stored about as bright as day ones: for a night\n"
+                                  "scene lit by street lamps (Bistro), around 0.0001-0.001 (real moonlight is ~0.0001).");
+            }
             if (settings.sunEnabled) {
                 ImGui::TextDisabled("a map with a sun in it already lights the scene: the Sun above adds a second one");
             }
