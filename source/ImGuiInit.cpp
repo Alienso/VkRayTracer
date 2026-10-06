@@ -176,6 +176,15 @@ void Application::buildRenderingUi() {
                           "(smaller copies for distant or blurry hits): faster, no shimmering in the distance.\n"
                           "Off: always the full-size texture.");
     }
+    ImGui::BeginDisabled(!settings.textureMipmaps);
+    ImGui::Checkbox("Normal map filtering", &settings.normalMapFiltering);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Toksvig: where a smaller mip level of a normal map averages its bumps away (distant or\n"
+                          "blurry hits), the reflection gets as much rougher as the bumps would have spread it.\n"
+                          "Off: distant bumpy surfaces reflect as sharply as polished ones (and sparkle).\n"
+                          "Needs Texture mipmaps.");
+    }
     ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
     ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                         "instead of slowly converging sparkles (fireflies)");

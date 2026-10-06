@@ -53,13 +53,14 @@ VkSampler Application::getSampler(const TextureData& texture) {
 }
 
 // sRGB variants: the GPU converts to linear when sampling, so the shader always works with linear values.
-// BC5 (two-channel normal maps) has no sRGB variant, and doesn't need one.
+// BC5 (two-channel normal maps) and BC4 (Toksvig) have no sRGB variant, and don't need one.
 static VkFormat toVulkan(const TextureData& texture) {
     switch (texture.format) {
         case TextureFormat::BC1: return texture.srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
         case TextureFormat::BC2: return texture.srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
         case TextureFormat::BC3: return texture.srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
         case TextureFormat::BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+        case TextureFormat::BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
         case TextureFormat::BC7: return texture.srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
         default: return texture.srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     }
@@ -123,7 +124,7 @@ static size_t levelSize(const TextureData& texture, uint32_t level) {
     if (texture.format == TextureFormat::RGBA8) {
         return static_cast<size_t>(width) * height * 4;
     }
-    size_t blockBytes = texture.format == TextureFormat::BC1 ? 8 : 16;
+    size_t blockBytes = texture.format == TextureFormat::BC1 || texture.format == TextureFormat::BC4 ? 8 : 16;
     return static_cast<size_t>((width + 3) / 4) * ((height + 3) / 4) * blockBytes;
 }
 
@@ -232,6 +233,7 @@ std::vector<GpuMaterial> Application::packMaterials() const {
         gpu.normalScale = m.normalScale;
         gpu.normalTwoChannel = gpu.normalTexture >= 0 &&
                                sceneTextures[gpu.normalTexture].format == TextureFormat::BC5 ? 1 : 0;
+        gpu.normalVarianceTexture = gpu.normalTexture >= 0 ? m.normalVarianceTexture : -1;
         gpu.baseColorUvTransform = m.baseColorUvTransform;
         gpu.metallicRoughnessUvTransform = m.metallicRoughnessUvTransform;
         gpu.transmissionUvTransform = m.transmissionUvTransform;

@@ -220,15 +220,29 @@ ray cone (`uvFootprint`), filtered anisotropically. Simplifications:
   soft) and widens by 2 x GGX alpha per bounce (the diffuse layer as roughness 1). Curved surfaces don't widen or
   narrow it, so a curved mirror or a glass ball reads textures behind it at the wrong level.
 - Cut-out tests (traversal, shadow rays), glass tints in shadow rays and points on glowing triangles still read
-  the full-size level: averaged alpha would make leaves fade at a distance (fixable with alpha-coverage-preserving
-  mips), the others are rare.
-- Normal maps get flatter at small levels (averaged bumps), so distant bumpy surfaces look a bit too smooth
-  (Toksvig: fold the lost bumpiness into roughness).
+  the full-size level. Tried and measured for the cut-outs (Bistro Exterior street view), not worth it:
+  - With the ray cone of colors, which widens at every rough bounce: -4..-7 % trace time, but bounce rays then see
+    a bush as a uniform fog of leaves at its average coverage, so light leaks in between them (the bush +3 % too
+    bright).
+  - With one camera pixel's footprint along the path (visibility stays as sharp as at full size; at small levels
+    a mask passes with chance = averaged alpha, which keeps coverage): the bush matches, but no faster (0..+6 %,
+    Sponza +2 %). The full-size reads that cost are those near the camera, inside bushes, which need full size.
+  Forcing every cut-out test to level 3 gave -8 %, so there is little to win there anyway.
+- Normal maps get flatter at small levels (averaged bumps). Toksvig puts the lost bumpiness back as roughness
+  (Rendering tab "Normal map filtering"): at load time each normal map (8-bit or BC5) gets a half-size BC4 texture
+  with the spread its levels average away (`makeNormalVarianceTexture`, all of a model's on all cores: Intel Sponza
+  0.9 s, Bistro 0.8 s; memory 1/8 of a BC5 map), which the shader adds to the material's alpha^2. Approximations:
+  the spread is one number (round, not stretched along grooves), alpha^2 = 1 / kappa of a von Mises-Fisher fit
+  was chosen by measurement (average brightness against mipmaps off: Intel Sponza +2.7 % -> -0.2 %, Sponza
+  +0.2 % -> -0.2 %, Zero-Day +0.45 % -> +0.34 %), the normal map's strength scales it linearly, and a roughness
+  texture of another size or UV transform is combined per hit, not per texel. Normal maps in other formats
+  (BC1/BC3/BC7) get none. No measurable cost per frame. Zero-Day's white panels no longer glitter at a distance.
 - Odd-sized 8-bit images drop their last row / column when halved (a tiny shift).
 - Measured: Sponza trace -15 to -30 %, Bistro Exterior ~-2 % (its cost is the geometry and the cut-out foliage),
   the helmet unchanged. Texture memory +33 % (Bistro Exterior 774 -> 1043 MB).
 - Where: `uvFootprint`, `traceClosest`, `sampleTexture` (shader), `generateMipLevels`, `getSampler`
-  (source/Materials.cpp), `pixelSpreadAngle` (source/RayTracer.cpp), Rendering tab "Texture mipmaps".
+  (source/Materials.cpp), `pixelSpreadAngle` (source/RayTracer.cpp), `makeNormalVarianceTexture`
+  (source/ModelLoader.cpp), Rendering tab "Texture mipmaps".
 
 ### DDS textures: no CPU copy
 DDS files (`MSFT_texture_dds`) in BC1/BC2/BC3/BC5/BC7 go to the GPU still compressed, with the mip levels the file

@@ -21,6 +21,8 @@
 #include <limits>
 #include <map>
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 static const cgltf_accessor* findAttribute(const cgltf_primitive& primitive, cgltf_attribute_type type) {
     for (cgltf_size i = 0; i < primitive.attributes_count; i++) {
@@ -122,6 +124,192 @@ static bool readDds(const uint8_t* data, size_t size, TextureData& texture, std:
     }
     texture.pixels.assign(data + offset, data + end);
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Normal map filtering (Toksvig)
+//
+// A smaller mip level of a normal map averages its bumps away: from afar a bumpy surface would reflect as sharply as
+// a polished one (and sparkle), although its many small bumps together spread the reflection. The average of unit
+// normals is shorter than 1, the shorter the more they differ (Toksvig 2005). Taken as a von Mises-Fisher
+// distribution, length r gives the concentration kappa = r (3 - r^2) / (1 - r^2) (Banerjee et al. 2005). That would
+// be a Beckmann lobe of alpha^2 = 2 / kappa; GGX's long tails spread more light at the same alpha, and against the
+// full-size reference (mipmaps off) alpha^2 = 1 / kappa came closest: average brightness Intel Sponza +2.7 % ->
+// -0.2 % (2 / kappa: -2.3 %), Sponza +0.2 % -> -0.2 %, Zero-Day +0.45 % -> +0.34 %. The shader adds it to the
+// material's alpha^2. BC5 maps lose the
+// length (the shader rebuilds Z) and 8-bit maps keep it only roughly, so it is computed here from the full-size
+// level, once per normal map, and stored as a texture of its own: BC4, sqrt(alpha^2) in 0..1.
+
+// One BC4 block (8 bytes: two end values and a 3-bit index per texel) -> 16 values 0..255
+static void decodeBc4Block(const uint8_t* block, uint8_t values[16]) {
+    int e0 = block[0], e1 = block[1];
+    int palette[8] = {e0, e1};
+    if (e0 > e1) {
+        for (int k = 1; k <= 6; k++) {
+            palette[k + 1] = ((7 - k) * e0 + k * e1 + 3) / 7;
+        }
+    } else {
+        for (int k = 1; k <= 4; k++) {
+            palette[k + 1] = ((5 - k) * e0 + k * e1 + 2) / 5;
+        }
+        palette[6] = 0;
+        palette[7] = 255;
+    }
+    uint64_t bits = 0;
+    for (int i = 0; i < 6; i++) {
+        bits |= static_cast<uint64_t>(block[2 + i]) << (8 * i);
+    }
+    for (int t = 0; t < 16; t++) {
+        values[t] = static_cast<uint8_t>(palette[(bits >> (3 * t)) & 7]);
+    }
+}
+
+// 16 values 0..1 -> one BC4 block: the largest and smallest as end values, each texel the nearest of the 8 between
+static void encodeBc4Block(const float values[16], uint8_t* block) {
+    int quantized[16];
+    int lo = 255, hi = 0;
+    for (int t = 0; t < 16; t++) {
+        quantized[t] = static_cast<int>(std::clamp(values[t], 0.0f, 1.0f) * 255.0f + 0.5f);
+        lo = std::min(lo, quantized[t]);
+        hi = std::max(hi, quantized[t]);
+    }
+    block[0] = static_cast<uint8_t>(hi);
+    block[1] = static_cast<uint8_t>(lo);
+    uint64_t bits = 0;
+    if (hi > lo) {  // otherwise all texels take index 0 (= hi)
+        for (int t = 0; t < 16; t++) {
+            // Position between hi (0) and lo (7), then the palette's order: 0 = hi, 1 = lo, 2..7 = in between
+            int step = static_cast<int>(std::lround(7.0 * (hi - quantized[t]) / (hi - lo)));
+            uint64_t index = step == 0 ? 0 : step == 7 ? 1 : step + 1;
+            bits |= index << (3 * t);
+        }
+    }
+    for (int i = 0; i < 6; i++) {
+        block[2 + i] = static_cast<uint8_t>(bits >> (8 * i));
+    }
+}
+
+// Whether makeNormalVarianceTexture can work with this normal map: 8-bit RGBA or BC5 (normal maps come in those),
+// larger than 1x1
+static bool normalVarianceSupported(const TextureData& normals) {
+    return (normals.format == TextureFormat::RGBA8 || normals.format == TextureFormat::BC5) &&
+           (normals.width > 1 || normals.height > 1);
+}
+
+// The unit normal for each stored X, Y (0..255) pair. Z is rebuilt from them, as the shader does for BC5; 8-bit maps
+// store it too, but rounded.
+static const std::vector<glm::vec3>& unitNormalTable() {
+    static const std::vector<glm::vec3> table = [] {
+        std::vector<glm::vec3> normals(256 * 256);
+        for (int y = 0; y < 256; y++) {
+            for (int x = 0; x < 256; x++) {
+                glm::vec2 v = glm::vec2(x, y) / 127.5f - 1.0f;
+                normals[y * 256 + x] = glm::normalize(glm::vec3(v, std::sqrt(std::max(1.0f - glm::dot(v, v), 0.0f))));
+            }
+        }
+        return normals;
+    }();
+    return table;
+}
+
+// Makes the normal map's Toksvig texture (see above and Material::normalVarianceTexture); normalVarianceSupported
+// must hold. Several run at once (TextureLoader::finish).
+static void makeNormalVarianceTexture(const TextureData& normals, TextureData& variance) {
+    uint32_t width = normals.width, height = normals.height;
+    const std::vector<glm::vec3>& table = unitNormalTable();
+
+    // Averages of the unit normals, level by level (each the mean of the 2x2 below it; the last row / column of an
+    // odd size is dropped, as in generateMipLevels), and per level the spread they leave out. Level 1 comes from the
+    // full size, read two rows at a time: as stored, or from BC5 a block row (4 rows) decoded at a time.
+    uint32_t levelWidth = std::max(width / 2, 1u), levelHeight = std::max(height / 2, 1u);
+    std::vector<glm::vec3> average(static_cast<size_t>(levelWidth) * levelHeight);
+    std::vector<uint8_t> blockRow(static_cast<size_t>(width) * 4 * 2);  // BC5: X, Y of 4 rows
+    uint32_t decodedBlockRow = UINT32_MAX;
+    for (uint32_t y = 0; y < levelHeight; y++) {
+        const uint8_t* rows[2];
+        uint32_t stride = 4;
+        for (uint32_t d = 0; d < 2; d++) {
+            uint32_t sy = std::min(y * 2 + d, height - 1);
+            if (normals.format == TextureFormat::RGBA8) {
+                rows[d] = &normals.pixels[static_cast<size_t>(sy) * width * 4];
+                continue;
+            }
+            stride = 2;
+            if (sy / 4 != decodedBlockRow) {
+                decodedBlockRow = sy / 4;
+                uint32_t blocksX = (width + 3) / 4;
+                for (uint32_t bx = 0; bx < blocksX; bx++) {
+                    const uint8_t* block = &normals.pixels[(static_cast<size_t>(decodedBlockRow) * blocksX + bx) * 16];
+                    uint8_t x[16], yv[16];
+                    decodeBc4Block(block, x);
+                    decodeBc4Block(block + 8, yv);
+                    for (uint32_t t = 0; t < 16; t++) {
+                        uint32_t px = bx * 4 + t % 4;
+                        if (px < width) {
+                            size_t i = (static_cast<size_t>(t / 4) * width + px) * 2;
+                            blockRow[i] = x[t];
+                            blockRow[i + 1] = yv[t];
+                        }
+                    }
+                }
+            }
+            rows[d] = &blockRow[static_cast<size_t>(sy % 4) * width * 2];
+        }
+        for (uint32_t x = 0; x < levelWidth; x++) {
+            glm::vec3 sum(0.0f);
+            for (uint32_t d = 0; d < 4; d++) {
+                const uint8_t* texel = rows[d / 2] + static_cast<size_t>(std::min(x * 2 + d % 2, width - 1)) * stride;
+                sum += table[texel[1] * 256 + texel[0]];
+            }
+            average[static_cast<size_t>(y) * levelWidth + x] = sum * 0.25f;
+        }
+    }
+    variance.name = normals.name + " (Toksvig)";
+    variance.width = levelWidth;
+    variance.height = levelHeight;
+    variance.format = TextureFormat::BC4;
+    variance.mipLevels = 0;
+    variance.nearest = normals.nearest;
+    variance.wrapU = normals.wrapU;
+    variance.wrapV = normals.wrapV;
+    while (true) {
+        // The level's spread, as 4x4 blocks
+        uint32_t blocksX = (levelWidth + 3) / 4, blocksY = (levelHeight + 3) / 4;
+        size_t start = variance.pixels.size();
+        variance.pixels.resize(start + static_cast<size_t>(blocksX) * blocksY * 8);
+        for (uint32_t by = 0; by < blocksY; by++) {
+            for (uint32_t bx = 0; bx < blocksX; bx++) {
+                float values[16];
+                for (uint32_t t = 0; t < 16; t++) {
+                    // Texels past the edge repeat the last row / column
+                    uint32_t px = std::min(bx * 4 + t % 4, levelWidth - 1), py = std::min(by * 4 + t / 4, levelHeight - 1);
+                    float r = std::clamp(glm::length(average[static_cast<size_t>(py) * levelWidth + px]), 1e-4f, 1.0f);
+                    float alphaSquared = (1.0f - r * r) / (r * (3.0f - r * r));  // 1 / kappa
+                    values[t] = std::sqrt(alphaSquared);
+                }
+                encodeBc4Block(values, &variance.pixels[start + (static_cast<size_t>(by) * blocksX + bx) * 8]);
+            }
+        }
+        variance.mipLevels++;
+        if (levelWidth == 1 && levelHeight == 1) {
+            break;
+        }
+        uint32_t nextWidth = std::max(levelWidth / 2, 1u), nextHeight = std::max(levelHeight / 2, 1u);
+        std::vector<glm::vec3> next(static_cast<size_t>(nextWidth) * nextHeight);
+        for (uint32_t y = 0; y < nextHeight; y++) {
+            for (uint32_t x = 0; x < nextWidth; x++) {
+                glm::vec3 sum(0.0f);
+                for (uint32_t d = 0; d < 4; d++) {
+                    uint32_t sx = std::min(x * 2 + d % 2, levelWidth - 1), sy = std::min(y * 2 + d / 2, levelHeight - 1);
+                    sum += average[static_cast<size_t>(sy) * levelWidth + sx];
+                }
+                next[static_cast<size_t>(y) * nextWidth + x] = sum * 0.25f;
+            }
+        }
+        average = std::move(next);
+        levelWidth = nextWidth;
+        levelHeight = nextHeight;
+    }
 }
 
 static std::vector<uint8_t> readFile(const std::string& path) {
@@ -262,6 +450,47 @@ public:
         return index;
     }
 
+    // The normal map's Toksvig texture (see makeNormalVarianceTexture), one per normal map; -1 if none. Only its
+    // place is taken here: finish() makes them all at once.
+    int loadNormalVariance(int normalTexture) {
+        if (normalTexture < 0) {
+            return -1;
+        }
+        auto it = varianceCache.find(normalTexture);
+        if (it != varianceCache.end()) {
+            return it->second;
+        }
+        int index = -1;
+        if (normalVarianceSupported(model.textures[normalTexture])) {
+            index = static_cast<int>(model.textures.size());
+            model.textures.emplace_back();
+            varianceJobs.emplace_back(normalTexture, index);
+        }
+        varianceCache[normalTexture] = index;
+        return index;
+    }
+
+    // Makes the Toksvig textures, on all cores: a few seconds for a scene with dozens of 4K normal maps otherwise.
+    // The texture list doesn't change meanwhile, each job writes its own entry.
+    void finish() {
+        std::atomic<size_t> next{0};
+        auto work = [&] {
+            for (size_t job = next++; job < varianceJobs.size(); job = next++) {
+                makeNormalVarianceTexture(model.textures[varianceJobs[job].first], model.textures[varianceJobs[job].second]);
+            }
+        };
+        std::vector<std::thread> threads;
+        size_t count = std::min<size_t>(std::max(std::thread::hardware_concurrency(), 1u), varianceJobs.size());
+        for (size_t i = 1; i < count; i++) {
+            threads.emplace_back(work);
+        }
+        work();
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        varianceJobs.clear();
+    }
+
 private:
     // cgltf keeps extensions it doesn't know as JSON text, e.g. {"source":3}
     const cgltf_image* ddsImage(const cgltf_texture& texture) const {
@@ -286,6 +515,8 @@ private:
     std::string directory;
     Model& model;
     std::map<std::pair<ptrdiff_t, bool>, int> cache;
+    std::map<int, int> varianceCache;  // normal map -> its Toksvig texture
+    std::vector<std::pair<int, int>> varianceJobs;  // Toksvig textures to make: normal map, its place
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -347,6 +578,7 @@ static Material loadMaterial(const cgltf_material& gltfMaterial, TextureLoader& 
 
     material.normalTexture = textures.load(gltfMaterial.normal_texture, false, "normal", material.name);
     material.normalScale = gltfMaterial.normal_texture.scale;
+    material.normalVarianceTexture = textures.loadNormalVariance(material.normalTexture);
     material.normalUvTransform = uvTransform(gltfMaterial.normal_texture);
 
     switch (gltfMaterial.alpha_mode) {
@@ -604,6 +836,7 @@ Model loadGltfModel(const std::string& path) {
         for (cgltf_size m = 0; m < data->materials_count; m++) {
             model.materials.push_back(loadMaterial(data->materials[m], textures));
         }
+        textures.finish();
     } catch (...) {
         cgltf_free(data);
         throw;

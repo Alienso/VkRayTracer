@@ -702,6 +702,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !lightTree.empty() ? 1 : 0;
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
     uniforms.textureMipmaps = settings.textureMipmaps ? 1 : 0;
+    uniforms.normalMapFiltering = settings.normalMapFiltering ? 1 : 0;
     // How much of the scene one ray stands for (the start of its ray cone, see uvFootprint in the shader): half an
     // output pixel, vertically (pixels are square). The image ends up sharper than one render pixel: accumulation
     // averages many offsets within each pixel, and DLSS adds detail up to the output resolution (NVIDIA's guide

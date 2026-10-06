@@ -72,6 +72,7 @@ layout(binding = 3) uniform SceneUniforms {
     float sunRadianceScale; // sunColor * this = the light of one point of the disc
     uint textureMipmaps;    // 1 = textures are read at the level that fits the hit's footprint (ray cones, see traceClosest)
     float pixelSpreadAngle; // angle between neighboring camera rays (radians): how fast a pixel's footprint grows
+    uint normalMapFiltering; // 1 = bumps that a normal map's smaller levels average away widen the reflection (Toksvig)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -130,6 +131,7 @@ struct Material {
     int diffuseTransmissionColorTexture; // RGB: tint
     mat3x2 diffuseTransmissionUvTransform;
     mat3x2 diffuseTransmissionColorUvTransform;
+    int normalVarianceTexture;     // R: the bumps the normal map's level averages away, as GGX alpha (see traceClosest)
 };
 layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
 
@@ -510,6 +512,21 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
                     mapped.xy = vec2(slope.x, -slope.y) * (length(mapped.xy) / slopeLength);
                 }
                 hit.normal = normalize(t * mapped.x + b * mapped.y + hit.normal * mapped.z);
+
+                // Toksvig: the bumps this level averages away widen the reflection by the alpha stored for it
+                // (see makeNormalVarianceTexture), added to the material's alpha^2 (as two independent spreads).
+                // That texture is half the size: read with the same footprint it gives the right level, except
+                // between the normal map's levels 0 and 1, where it fades out (the full size averages nothing).
+                if (scene.normalMapFiltering != 0 && material.normalVarianceTexture >= 0 && hit.uvFootprintX != vec2(0.0)) {
+                    vec2 texels = vec2(textureSize(textures[nonuniformEXT(material.normalTexture)], 0));
+                    // The level the GPU reads: from the footprint's short axis (filtered along the long one)
+                    float level = log2(min(length(toTexture * hit.uvFootprintX * texels),
+                                           length(toTexture * hit.uvFootprintY * texels)));
+                    float bumps = sampleTexture(material.normalVarianceTexture, material.normalUvTransform, hit).r
+                                  * clamp(level, 0.0, 1.0) * material.normalScale;
+                    float alpha = hit.roughness * hit.roughness;
+                    hit.roughness = sqrt(sqrt(alpha * alpha + bumps * bumps));
+                }
             }
         }
         // The vertex normals define which side is "outside"; the winding order may disagree.

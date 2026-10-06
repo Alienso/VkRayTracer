@@ -72,6 +72,7 @@ struct SceneUniforms {
     float sunRadianceScale;          // sunColor times this = the light of one point of the disc (PI / solid angle)
     uint32_t textureMipmaps;         // 1 = textures are read at the mip level that fits the hit (ray cones)
     float pixelSpreadAngle;          // radians between neighboring camera rays (render resolution)
+    uint32_t normalMapFiltering;     // 1 = bumps that a normal map's smaller levels average away widen the reflection
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -225,6 +226,7 @@ struct GpuMaterial {
     int32_t diffuseTransmissionColorTexture;
     glm::mat3x2 diffuseTransmissionUvTransform;
     glm::mat3x2 diffuseTransmissionColorUvTransform;
+    int32_t normalVarianceTexture;  // R: the normal map's averaged-away bumps as GGX alpha (Toksvig), see Material
 };
 
 // A texture on the GPU. Samplers are shared between textures with the same settings.
@@ -383,6 +385,7 @@ struct RenderSettings {
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
+    bool normalMapFiltering = true;  // Toksvig: distant bumpy surfaces keep their blurrier reflection
     bool radianceCache = true;      // paths stop after a diffuse bounce and read the light from the cache
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels

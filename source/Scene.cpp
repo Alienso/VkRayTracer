@@ -143,6 +143,7 @@ int Application::findOrLoadModel(const std::string& fileName) {
     for (Material& material : model.materials) {
         for (int* texture : {&material.baseColorTexture, &material.metallicRoughnessTexture,
                              &material.transmissionTexture, &material.emissiveTexture, &material.normalTexture,
+                             &material.normalVarianceTexture,
                              &material.diffuseTransmissionTexture, &material.diffuseTransmissionColorTexture}) {
             if (*texture >= 0) {
                 *texture += firstTexture;

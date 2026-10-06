@@ -22,8 +22,9 @@ struct SceneVertex {
 enum class TextureWrap : int { Repeat = 0, ClampToEdge = 1, MirroredRepeat = 2 };
 
 // How TextureData::pixels is stored. Block-compressed formats (from .dds files) stay compressed on the GPU too:
-// 4x4 texels per block of 8 (BC1) or 16 bytes. BC5 has two channels only (normal maps: X and Y, Z is rebuilt).
-enum class TextureFormat : int { RGBA8 = 0, BC1, BC2, BC3, BC5, BC7 };
+// 4x4 texels per block of 8 (BC1, BC4) or 16 bytes. BC5 has two channels only (normal maps: X and Y, Z is rebuilt),
+// BC4 one (made by the loader, see Material::normalVarianceTexture).
+enum class TextureFormat : int { RGBA8 = 0, BC1, BC2, BC3, BC5, BC7, BC4 };
 
 // An image as it goes to the GPU: 8-bit RGBA, or the blocks of a compressed format.
 // Mip levels: each half the size of the one before (rounded down, at least 1), down to 1x1, for distant or blurry
@@ -76,6 +77,10 @@ struct Material {
     int diffuseTransmissionColorTexture = -1;  // RGB: color of the light that goes through
     int normalTexture = -1;             // RGB (or RG, see TextureFormat::BC5): surface direction in tangent space, see the shader
     float normalScale = 1.0f;           // strength of the normal map's bumps
+    // Made by the loader from the normal map (Toksvig): R = how much the bumps that a smaller mip level averages away
+    // widen the reflection (as GGX alpha). Half the normal map's size: its level k belongs to the normal map's level
+    // k + 1 (the full size averages nothing). -1 without a normal map, or one in a format we can't decode.
+    int normalVarianceTexture = -1;
 
     // KHR_texture_transform: where each texture is read, texture UV = transform * (mesh UV, 1). Lets a file tile,
     // move or rotate a texture without changing the mesh. Identity when the file doesn't have one.
