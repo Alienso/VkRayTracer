@@ -429,8 +429,8 @@ void Application::createRayTracingDescriptors() {
     // specular albedo, normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages,
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
-    // 29: ReSTIR GI reservoirs
-    std::vector<VkDescriptorSetLayoutBinding> bindings(30);
+    // 29: ReSTIR GI reservoirs, 30: blue noise
+    std::vector<VkDescriptorSetLayoutBinding> bindings(31);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -459,6 +459,7 @@ void Application::createRayTracingDescriptors() {
     bindings[27] = {27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[28] = {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[29] = {29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[30] = {30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -482,7 +483,7 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 19},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -545,12 +546,13 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorBufferInfo restirSurfaceInfo{restirSurfaceBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bounceHitInfo{bounceHitBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo giReservoirInfo{giReservoirBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo blueNoiseInfo{blueNoiseBuffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(30);
+    std::vector<VkWriteDescriptorSet> writes(31);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -610,6 +612,8 @@ void Application::updateRayTracingDescriptorSet() {
     writes[28].pBufferInfo = &bounceHitInfo;
     writes[29].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[29].pBufferInfo = &giReservoirInfo;
+    writes[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[30].pBufferInfo = &blueNoiseInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -792,6 +796,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.restirGiMaxAge = static_cast<uint32_t>(std::max(settings.restirGiMaxAge, 1));
     uniforms.restirGiPermutation = settings.restirGiPermutation ? 1 : 0;
     uniforms.restirGiTemporalVisibility = settings.restirGiTemporalVisibility ? 1 : 0;
+    uniforms.pathSampling = static_cast<uint32_t>(std::clamp(settings.pathSampling, 0, 2));
     bool giSpatial = settings.restirGiSpatial && uniforms.restirGi != 0;
     uniforms.restirGiSpatialNeighbors = giSpatial ? static_cast<uint32_t>(std::max(settings.restirGiSpatialNeighbors, 0)) : 0;
     uniforms.restirGiSpatialRadius = settings.restirGiSpatialRadius;
@@ -1066,6 +1071,9 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
                    displayImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    swapChainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &blit, VK_FILTER_NEAREST);
+
+    // 9: the "Capture" button: the display image (without the UI) into a buffer for a PNG
+    recordCapture(commandBuffer);
 }
 
 void Application::createTimestampQueries() {
@@ -1130,6 +1138,7 @@ void Application::cleanupRayTracing() {
     destroySceneGeometry();
     destroyMaterialBuffer();
     destroySpecularAlbedoTable();
+    destroyBlueNoiseTexture();
     destroyExposureResources();
     destroyNoiseResources();
     destroyDisplayResources();

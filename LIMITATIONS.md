@@ -220,6 +220,28 @@ frames under DLAA -21% (Bistro night), -60% (Sponza), -17% (Bistro day); in Accu
   The noise numbers above were measured with the boiling filter and the cache at x2. Next try: the cache at x2
   again, its value read fresh whenever a sample is used.
 
+## Sampling
+
+### Sobol points for a path's main decisions only
+"Sobol random numbers" (on by default) gives the camera offset, the sun's point, the sky direction, the glowing
+triangle and each bounce (lobe, direction, Russian roulette) Owen-scrambled Sobol points (Burley 2020): a pixel's
+samples spread evenly. Measured after 64 frames in Accumulation, the remaining error (mean squared) is 12-42% lower
+with ReSTIR DI (Bistro night -42%, jungle -33%, Bistro day -18%, Sponza -12%) and 28-56% without it, for about
+0.3 ms. Under DLSS Quality the gain is smaller: Bistro night -15% after 64 frames (-44% in a single frame), the
+others 1-4%. The rest keeps independent random numbers: ReSTIR's candidates and reuse (the
+first surface's direct light when ReSTIR DI is on, hence the smaller gain), the punctual lights, cut-outs, the
+cache's update paths.
+- Across the screen the error is white noise (each pixel scrambles on its own). "Sobol + blue noise" instead
+  shares one scrambled sequence between all pixels, each shifted by its texel of a 64 x 64 blue-noise texture
+  (Georgiev & Fajardo 2016; made at startup, BlueNoise.cpp). It measured no better: under DLSS Quality within
+  +-4% of Sobol after 64 frames in all four scenes, and in Accumulation 22% worse in Bistro at night (one shared
+  scramble randomizes less than one per pixel), even elsewhere. Blue noise per decision only becomes blue error
+  where a single number decides a pixel's light smoothly (a soft shadow edge); here most of the noise is light
+  found through several bounces, which depends on many numbers together, and the first surface's direct light
+  comes from ReSTIR DI, whose candidates use white noise. Giving those candidates blue-noise numbers is the place
+  it could still pay off.
+- Where: `pathSample`, `startPathSamples`, `blueNoiseAt` (shaders/raytrace.comp).
+
 ## Radiance cache
 
 ### The cache is biased

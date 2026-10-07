@@ -103,6 +103,7 @@ struct SceneUniforms {
     float restirGiBoilingFilter;     // 0 = off; else its strength (drops reservoirs far brighter than their neighbors')
     float restirGiRadianceClamp;     // 0 = off; else the most a GI sample's light may be (luminance)
     uint32_t restirGiTemporalVisibility;  // 1 = unbiased temporal GI reuse (a ray from last frame's surface)
+    uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
@@ -479,6 +480,11 @@ struct RenderSettings {
     float punctualLightScale = 1.0f;   // multiplies them all
 
     int samplesPerPixel = 1;
+    // Random numbers for the main decisions of a path (camera offset, sun, sky, glowing triangles, bounces), see
+    // pathSample in the shader: independent (white noise), Sobol points (a pixel's samples spread evenly), or Sobol
+    // points shifted per pixel by a blue-noise texture (also neighboring pixels' samples differ evenly). Blue noise
+    // measured no better under DLSS and 22% worse in Bistro at night when accumulating (see LIMITATIONS.md).
+    int pathSampling = 1;
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
@@ -642,6 +648,9 @@ private:
     static constexpr uint32_t specularAlbedoSize = 32;
     VkBuffer specularAlbedoBuffer;
     VkDeviceMemory specularAlbedoMemory;
+    // 64 x 64 blue-noise texels, 4 channels of 16 bits (BlueNoise.cpp), binding 30
+    VkBuffer blueNoiseBuffer;
+    VkDeviceMemory blueNoiseMemory;
 
     // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
     // It has room for tlasCapacity instances and is only recreated when more are needed.
@@ -889,6 +898,15 @@ private:
     VkDeviceMemory uniformBufferMemory;
     uint64_t primitiveCount = 0;  // triangles over all instances (billions with vegetation)
 
+    // Frame capture (Capture.cpp): the button sets captureRequested, the frame copies the display image into
+    // captureBuffer, the next loop iteration writes it as a PNG
+    bool captureRequested = false;
+    VkBuffer captureBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory captureMemory = VK_NULL_HANDLE;
+    VkExtent2D captureExtent{};
+    uint32_t captureFrame = 0;   // frame in flight that recorded the copy
+    std::string captureMessage;  // shown next to the button
+
     Camera camera;
     RenderSettings settings;
     uint32_t frameIndex = 0;
@@ -997,6 +1015,9 @@ private:
     void recordMaterialUpdate(VkCommandBuffer commandBuffer);
     void createSpecularAlbedoTable();
     void destroySpecularAlbedoTable();
+    // BlueNoise.cpp
+    void createBlueNoiseTexture();
+    void destroyBlueNoiseTexture();
     // Dlss.cpp
     void initStreamline();
     void addStreamlineDeviceRequirements(std::vector<const char*>& extensions, VkPhysicalDeviceVulkan12Features& features12,
@@ -1055,6 +1076,8 @@ private:
     std::string readPipelineStatistics(VkPipeline pipeline);
     SceneUniforms buildSceneUniforms();
     void recordInstanceUpload(VkCommandBuffer commandBuffer);
+    void recordCapture(VkCommandBuffer commandBuffer);
+    void finishCapture();
     void createTimestampQueries();
     void readTimestamps();
     void writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index);

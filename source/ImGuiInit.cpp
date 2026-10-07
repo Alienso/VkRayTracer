@@ -72,6 +72,11 @@ void Application::buildImGui() {
     ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
                 gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4], gpuPassTimes[5]);
     ImGui::Text("%llu triangles", static_cast<unsigned long long>(primitiveCount));
+    if (ImGui::Button("Capture")) {
+        captureRequested = true;  // the next frame's image, without this window, as a PNG next to the executable
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", captureMessage.empty() ? "PNG of the image, without the UI" : captureMessage.c_str());
     if (settings.accumulate && !dlssActive()) {
         ImGui::Text("%u frames accumulated", accumulatedFrames);
     }
@@ -161,6 +166,14 @@ void Application::buildRenderingUi() {
 
     ImGui::SeparatorText("Light paths");
     ImGui::SliderInt("Samples per pixel", &settings.samplesPerPixel, 1, 64);
+    ImGui::Combo("Random numbers", &settings.pathSampling, "White noise\0Sobol\0Sobol + blue noise\0");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("For the main decisions of a path (camera offset, sun, sky, glowing triangles, bounces).\n"
+                          "White noise: independent random numbers.\n"
+                          "Sobol: Owen-scrambled Sobol points, a pixel's samples spread evenly: it settles faster.\n"
+                          "+ blue noise: the points shifted per pixel by a blue-noise texture, so neighboring pixels'\n"
+                          "errors differ too: fine-grained noise instead of blotches, easier for DLSS to filter.");
+    }
     ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
     ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
     ImGui::Combo("Emissive light", &settings.emissiveSampling,

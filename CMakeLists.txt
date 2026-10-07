@@ -32,6 +32,7 @@ add_executable(vulkanDemo main.cpp
         include/imgui/backends/imgui_impl_vulkan.h include/imgui/backends/imgui_impl_vulkan.cpp
 
         include/stb_image.cpp include/stb_image.h
+        include/stb_image_write.cpp include/stb_image_write.h
         source/Application.cpp source/Application.h
         source/Configuration.cpp source/Configuration.h
         source/VulkanInitHelper.cpp source/ImGuiInit.cpp
@@ -47,6 +48,8 @@ add_executable(vulkanDemo main.cpp
         source/Noise.cpp
         source/RadianceCache.cpp
         source/Display.cpp
+        source/Capture.cpp
+        source/BlueNoise.cpp
         source/Dlss.cpp
         include/cgltf/cgltf.h)
 

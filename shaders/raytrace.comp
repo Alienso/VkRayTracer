@@ -108,6 +108,7 @@ layout(binding = 3) uniform SceneUniforms {
     float restirGiBoilingFilter;    // 0 = off; else its strength (see restirGiTemporalPass)
     float restirGiRadianceClamp;    // 0 = off; else the most a GI sample's Lo may be (luminance)
     uint restirGiTemporalVisibility;  // 1 = the temporal reuse is unbiased (a ray from last frame's surface)
+    uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
     vec4 previousCameraPosition;   // last frame's (for last frame's view directions)
 } scene;
 
@@ -292,6 +293,125 @@ float randomFloat(inout uint seed) {
     return float(seed) / 4294967295.0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Low-discrepancy samples (Owen-scrambled Sobol points, Burley 2020: "Practical Hash-based Owen Scrambling")
+//
+// Independent random numbers clump and leave gaps by chance, and a pixel's average only settles as those even out.
+// The main decisions of a path take their numbers from a Sobol sequence instead, whose first 2, 4, 8, ... points
+// always fill [0,1)^4 evenly: the pixel's samples (one per frame, or several per frame) cover the light, the sun's
+// disc, the sky and the bounce directions without clumps, and its average settles faster. Each decision (SAMPLE_*)
+// at each bounce takes its own 4D point. Owen scrambling with a seed per decision randomizes the points without
+// losing that evenness, and makes the decisions independent of each other ("padding"); the sample index is
+// shuffled the same way. Everything else (cut-outs, the punctual lights, ReSTIR's candidates and reuse, the cache's
+// update paths) keeps randomFloat.
+// Neighboring pixels: with "Sobol", each pixel scrambles with its own seed too, so their errors are unrelated (white
+// noise over the screen). With "+ blue noise" all pixels share the scrambled points, each shifted (modulo 1) by
+// its texel of a blue-noise texture (Georgiev & Fajardo 2016): in a frame, neighboring pixels then take samples that
+// differ evenly, and their errors too, fine-grained noise that DLSS filters more easily than blotches. The shift
+// is the same in every frame, so a pixel's own samples stay just as evenly spread.
+const uvec4 SOBOL_DIRECTIONS[32] = uvec4[](  // dimensions 0-3: van der Corput, then Joe & Kuo's 2-4
+    uvec4(0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u),
+    uvec4(0x40000000u, 0xc0000000u, 0xc0000000u, 0xc0000000u),
+    uvec4(0x20000000u, 0xa0000000u, 0x60000000u, 0x20000000u),
+    uvec4(0x10000000u, 0xf0000000u, 0x90000000u, 0x50000000u),
+    uvec4(0x08000000u, 0x88000000u, 0xe8000000u, 0xf8000000u),
+    uvec4(0x04000000u, 0xcc000000u, 0x5c000000u, 0x74000000u),
+    uvec4(0x02000000u, 0xaa000000u, 0x8e000000u, 0xa2000000u),
+    uvec4(0x01000000u, 0xff000000u, 0xc5000000u, 0x93000000u),
+    uvec4(0x00800000u, 0x80800000u, 0x68800000u, 0xd8800000u),
+    uvec4(0x00400000u, 0xc0c00000u, 0x9cc00000u, 0x25400000u),
+    uvec4(0x00200000u, 0xa0a00000u, 0xee600000u, 0x59e00000u),
+    uvec4(0x00100000u, 0xf0f00000u, 0x55900000u, 0xe6d00000u),
+    uvec4(0x00080000u, 0x88880000u, 0x80680000u, 0x78080000u),
+    uvec4(0x00040000u, 0xcccc0000u, 0xc09c0000u, 0xb40c0000u),
+    uvec4(0x00020000u, 0xaaaa0000u, 0x60ee0000u, 0x82020000u),
+    uvec4(0x00010000u, 0xffff0000u, 0x90550000u, 0xc3050000u),
+    uvec4(0x00008000u, 0x80008000u, 0xe8808000u, 0x208f8000u),
+    uvec4(0x00004000u, 0xc000c000u, 0x5cc0c000u, 0x51474000u),
+    uvec4(0x00002000u, 0xa000a000u, 0x8e606000u, 0xfbea2000u),
+    uvec4(0x00001000u, 0xf000f000u, 0xc5909000u, 0x75d93000u),
+    uvec4(0x00000800u, 0x88008800u, 0x6868e800u, 0xa0858800u),
+    uvec4(0x00000400u, 0xcc00cc00u, 0x9c9c5c00u, 0x914e5400u),
+    uvec4(0x00000200u, 0xaa00aa00u, 0xeeee8e00u, 0xdbe79e00u),
+    uvec4(0x00000100u, 0xff00ff00u, 0x5555c500u, 0x25db6d00u),
+    uvec4(0x00000080u, 0x80808080u, 0x8000e880u, 0x58800080u),
+    uvec4(0x00000040u, 0xc0c0c0c0u, 0xc0005cc0u, 0xe54000c0u),
+    uvec4(0x00000020u, 0xa0a0a0a0u, 0x60008e60u, 0x79e00020u),
+    uvec4(0x00000010u, 0xf0f0f0f0u, 0x9000c590u, 0xb6d00050u),
+    uvec4(0x00000008u, 0x88888888u, 0xe8006868u, 0x800800f8u),
+    uvec4(0x00000004u, 0xccccccccu, 0x5c009c9cu, 0xc00c0074u),
+    uvec4(0x00000002u, 0xaaaaaaaau, 0x8e00eeeeu, 0x200200a2u),
+    uvec4(0x00000001u, 0xffffffffu, 0xc5005555u, 0x50050093u));
+const uint SAMPLE_CAMERA = 0u;    // the offset in the pixel
+const uint SAMPLE_SUN = 1u;       // a point on the sun's disc
+const uint SAMPLE_SKY = 2u;       // a direction picked by the sky's brightness
+const uint SAMPLE_EMISSIVE = 3u;  // a glowing triangle, and a point on it
+const uint SAMPLE_BOUNCE = 4u;    // the bounce: lobe, direction, Russian roulette
+uint sobolPixelSeed = 0u;  // this pixel's scrambling seed (blue noise: the same for all); 0 = off (white noise)
+uint sobolIndex = 0u;      // this path's number among its pixel's samples
+ivec2 sobolPixel = ivec2(0);
+
+// 64 x 64 texels, tiled; per texel 4 channels of 16 bits, each a blue-noise mask of its own (BlueNoise.cpp)
+const uint BLUE_NOISE_SIZE = 64u;
+layout(binding = 30, scalar) readonly buffer BlueNoise { uvec2 blueNoise[]; };
+
+// The texture at this pixel, moved by an offset of its own per decision: neighbors in one channel differ evenly,
+// and the decisions' shifts are unrelated to each other
+vec4 blueNoiseAt(ivec2 pixel, uint seed) {
+    uvec2 texel = (uvec2(pixel) + uvec2(seed, seed >> 16u)) & (BLUE_NOISE_SIZE - 1u);
+    uvec2 v = blueNoise[texel.y * BLUE_NOISE_SIZE + texel.x];
+    return vec4(v.x & 0xffffu, v.x >> 16u, v.y & 0xffffu, v.y >> 16u) / 65536.0;
+}
+
+// One random-looking permutation of the 32-bit values that only mixes each bit with lower ones (Laine & Karras;
+// the constants are Vegdahl's improved version). Applied to the reversed bits, that is Owen scrambling.
+uint laineKarrasPermutation(uint x, uint seed) {
+    x ^= x * 0x3d20adeau;
+    x += seed;
+    x *= (seed >> 16u) | 1u;
+    x ^= x * 0x05526c56u;
+    x ^= x * 0x53a22864u;
+    return x;
+}
+
+uint nestedUniformScramble(uint x, uint seed) {
+    return bitfieldReverse(laineKarrasPermutation(bitfieldReverse(x), seed));
+}
+
+// The pixel's sample number: one sample per frame (several with samplesPerPixel), counted from the start of the
+// accumulation, or from the program's start otherwise (DLSS keeps a history of its own)
+void startPathSamples(ivec2 pixel, uint sampleInFrame) {
+    uint frame = scene.accumulate != 0 ? scene.accumulatedFrames : scene.frameIndex;
+    sobolIndex = frame * scene.samplesPerPixel + sampleInFrame;
+    sobolPixel = pixel;
+    sobolPixelSeed = scene.pathSampling == 0 ? 0u
+                   : scene.pathSampling == 2 ? 0x2545f491u  // all pixels alike, shifted by the blue noise
+                   : pcgHash(uint(pixel.x) + pcgHash(uint(pixel.y) ^ 0x9e3779b9u)) | 1u;
+}
+
+// Four numbers in [0, 1) for one decision of the path (SAMPLE_*) at a bounce: the coordinates of this path's
+// Sobol point, or white noise when off
+vec4 pathSample(uint bounce, uint decision, inout uint seed) {
+    if (sobolPixelSeed == 0u) {
+        return vec4(randomFloat(seed), randomFloat(seed), randomFloat(seed), randomFloat(seed));
+    }
+    uint dimensionSeed = pcgHash(sobolPixelSeed ^ pcgHash(bounce * 8u + decision));
+    uint index = nestedUniformScramble(sobolIndex, dimensionSeed);
+    uvec4 x = uvec4(0u);
+    for (uint bit = 0u; index != 0u; bit++, index >>= 1u) {
+        if ((index & 1u) != 0u) {
+            x ^= SOBOL_DIRECTIONS[bit];
+        }
+    }
+    x = uvec4(nestedUniformScramble(x.x, pcgHash(dimensionSeed + 1u)), nestedUniformScramble(x.y, pcgHash(dimensionSeed + 2u)),
+              nestedUniformScramble(x.z, pcgHash(dimensionSeed + 3u)), nestedUniformScramble(x.w, pcgHash(dimensionSeed + 4u)));
+    vec4 u = vec4(x >> 8u) / 16777216.0;  // 24 bits: exactly representable, below 1
+    if (scene.pathSampling == 2) {
+        u = min(fract(u + blueNoiseAt(sobolPixel, dimensionSeed)), vec4(0.99999994));
+    }
+    return u;
+}
+
 // Any two vectors perpendicular to n (and to each other).
 void buildBasis(vec3 n, out vec3 tangent, out vec3 bitangent) {
     vec3 helper = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -300,10 +420,10 @@ void buildBasis(vec3 n, out vec3 tangent, out vec3 bitangent) {
 }
 
 // Uniformly distributed direction inside a cone around `axis`. cosMaxAngle = 1 gives `axis` itself.
-vec3 randomDirectionInCone(vec3 axis, float cosMaxAngle, inout uint seed) {
-    float cosTheta = mix(1.0, cosMaxAngle, randomFloat(seed));
+vec3 randomDirectionInCone(vec3 axis, float cosMaxAngle, vec2 u) {
+    float cosTheta = mix(1.0, cosMaxAngle, u.x);
     float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
-    float phi = randomFloat(seed) * 2.0 * PI;
+    float phi = u.y * 2.0 * PI;
     vec3 tangent, bitangent;
     buildBasis(axis, tangent, bitangent);
     return normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + axis * cosTheta);
@@ -950,10 +1070,11 @@ vec3 sampleGgxVisibleNormal(vec3 v, float alpha, vec2 u) {
 // weight is simply the transmitted share of the light: the direction follows the visible microfacets.
 // Diffuse transmission also gives l.z < 0, but is an ordinary scattering (transmitted = false, with a pdf).
 // specularLobe: a reflection or transmission was picked, not the diffuse layer (for the DLSS hit distance).
-bool sampleBrdf(Hit hit, vec3 v, inout uint seed, out vec3 l, out vec3 weight, out float pdf,
+// random: x picks the lobe, y and z the direction
+bool sampleBrdf(Hit hit, vec3 v, vec3 random, out vec3 l, out vec3 weight, out float pdf,
                 out float lobeRoughness, out bool transmitted, out bool specularLobe) {
-    float u0 = randomFloat(seed);
-    vec2 u = vec2(randomFloat(seed), randomFloat(seed));
+    float u0 = random.x;
+    vec2 u = random.yz;
     ReflectionEnergy energy = reflectionEnergy(hit, v.z);
     LobeProbabilities p = lobeProbabilities(hit, energy);
     transmitted = false;
@@ -1026,11 +1147,11 @@ bool sampleBrdf(Hit hit, vec3 v, inout uint seed, out vec3 l, out vec3 weight, o
 // Inside solid glass, at the surface on the way out: either reflect back inside or refract out into the air,
 // chosen by the exact Fresnel reflectance of the visible microfacet. Light isn't lost or tinted here (the tint
 // was applied on the way in; absorption on the way through), so the weight is 1 either way.
-bool sampleGlassExit(Hit hit, vec3 v, inout uint seed, out vec3 l) {
-    vec2 u = vec2(randomFloat(seed), randomFloat(seed));
-    vec3 h = sampleGgxVisibleNormal(v, ggxAlpha(hit.roughness), u);
+// random: x chooses reflection or refraction, y and z the microfacet
+bool sampleGlassExit(Hit hit, vec3 v, vec3 random, out vec3 l) {
+    vec3 h = sampleGgxVisibleNormal(v, ggxAlpha(hit.roughness), random.yz);
     float fresnel = fresnelDielectric(dot(v, h), hit.ior);  // n_glass / n_air
-    if (randomFloat(seed) < fresnel) {
+    if (random.x < fresnel) {
         l = reflect(-v, h);
         return l.z > 0.0;
     }
@@ -1214,9 +1335,8 @@ float lightTreeLeftChance(LightTreeNode node, vec3 p, vec3 n, bool twoSided) {
 
 // Walks down the tree with one random number (rescaled at every step to stay evenly distributed).
 // Returns the triangle, or -1 when nothing can light the point.
-int pickFromLightTree(vec3 p, vec3 n, bool twoSided, inout uint seed, out float probability) {
+int pickFromLightTree(vec3 p, vec3 n, bool twoSided, float u, out float probability) {
     probability = 1.0;
-    float u = randomFloat(seed);
     LightTreeNode node = lightTreeNodes[0];
     while (node.child >= 0) {
         float leftChance = lightTreeLeftChance(node, p, n, twoSided);
@@ -1295,15 +1415,15 @@ float environmentPdf(vec3 direction) {
     return environmentCellPdf(row, column);
 }
 
-vec3 sampleEnvironment(inout uint seed, out float pdf) {
+vec3 sampleEnvironment(vec4 random, out float pdf) {
     uint height = scene.environmentHeight, width = scene.environmentWidth;
-    uint row = searchEnvironmentCdf(0, height, randomFloat(seed));
-    uint column = searchEnvironmentCdf(height + row * width, width, randomFloat(seed));
+    uint row = searchEnvironmentCdf(0, height, random.x);
+    uint column = searchEnvironmentCdf(height + row * width, width, random.y);
     // Evenly over the cell's solid angle: evenly in cos(angle from straight up) and around
     float cos0 = cos(PI * float(row) / float(height));
     float cos1 = cos(PI * float(row + 1) / float(height));
-    float cosTheta = mix(cos0, cos1, randomFloat(seed));
-    float u = (float(column) + randomFloat(seed)) / float(width);
+    float cosTheta = mix(cos0, cos1, random.z);
+    float u = (float(column) + random.w) / float(width);
     pdf = environmentCellPdf(row, column);  // 0 for a black cell hit by a random number exactly on its boundary
     return environmentDirection(u, cosTheta);
 }
@@ -1355,15 +1475,14 @@ LightSample noLightSample() {
 // point), or by its share of all light: binary search for the first one whose running sum exceeds a random
 // number. Triangles with a bigger share cover a bigger stretch of [0, 1], so get picked more.
 // -1: none (all glowing triangles are behind the surface, or a triangle with probability 0, see below).
-int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, inout uint seed, out float pickProbability) {
+int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, float pick, out float pickProbability) {
     int lightIndex;
     if (scene.lightTree != 0) {
-        lightIndex = pickFromLightTree(p, n, twoSided, seed, pickProbability);
+        lightIndex = pickFromLightTree(p, n, twoSided, pick, pickProbability);
         if (lightIndex < 0) {
             return -1;
         }
     } else {
-        float pick = randomFloat(seed);
         uint low = 0, high = scene.emissiveTriangleCount - 1;
         while (low < high) {
             uint middle = (low + high) / 2;
@@ -1382,12 +1501,13 @@ int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, inout uint seed, out flo
     return pickProbability > 0.0 ? lightIndex : -1;
 }
 
-// One randomly picked point on the glowing triangles. surfacePoint: where the shadow ray starts.
-LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, inout uint seed) {
+// One randomly picked point on the glowing triangles. surfacePoint: where the shadow ray starts. random: x picks the
+// triangle, y and z the point.
+LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, vec3 random) {
     LightSample s = noLightSample();
     // 1: pick a triangle
     float pickProbability;
-    int lightIndex = pickEmissiveTriangle(hit.position, shadingNormal, hit.diffuseTransmission > 0.0, seed,
+    int lightIndex = pickEmissiveTriangle(hit.position, shadingNormal, hit.diffuseTransmission > 0.0, random.x,
                                           pickProbability);
     if (lightIndex < 0) {
         return s;
@@ -1395,8 +1515,8 @@ LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, 
     EmissiveTriangle light = emissiveTriangles[lightIndex];
 
     // 2: a uniformly random point on it (the square root keeps points from bunching up in one corner)
-    float r1 = sqrt(randomFloat(seed));
-    float r2 = randomFloat(seed);
+    float r1 = sqrt(random.y);
+    float r2 = random.z;
     vec3 weights = vec3(1.0 - r1, r1 * (1.0 - r2), r1 * r2);
     vec3 lightPoint = light.p0 * weights.x + light.p1 * weights.y + light.p2 * weights.z;
     vec2 lightUv = light.uv0 * weights.x + light.uv1 * weights.y + light.uv2 * weights.z;
@@ -1846,7 +1966,7 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
         uint point = 0;
         float pickProbability = 0.0;  // triangles: the chance that light sampling picks this one
         if (i < triangles) {
-            int index = pickEmissiveTriangle(hit.position, hit.normal, twoSided, seed, pickProbability);
+            int index = pickEmissiveTriangle(hit.position, hit.normal, twoSided, randomFloat(seed), pickProbability);
             if (index < 0) {
                 continue;
             }
@@ -1860,7 +1980,8 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             light = (LIGHT_KIND_PUNCTUAL << 30) | index;
         } else if (i < lightCandidates) {
             float pdf;
-            point = encodeSkyPoint(sampleEnvironment(seed, pdf));
+            point = encodeSkyPoint(sampleEnvironment(vec4(randomFloat(seed), randomFloat(seed), randomFloat(seed),
+                                                          randomFloat(seed)), pdf));
             light = LIGHT_KIND_SKY << 30;
         } else {
             // BRDF sampling: a direction as the bounce ray would pick it, and the light its ray finds (if light
@@ -1870,7 +1991,8 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             float pdf, lobeRoughness;
             bool transmitted, specularLobe;
             Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0);
-            if (!sampleBrdf(hit, toLocal(frame, v), seed, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
+            vec3 random = vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed));
+            if (!sampleBrdf(hit, toLocal(frame, v), random, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
                 if (i == lightCandidates) {
                     storeBounceHit(false, false, none, vec3(0.0), vec3(0.0), 0.0, 0.0, false, false);
                 }
@@ -2477,7 +2599,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     // PI * sunColor in total, so a white matte surface (BRDF 1 / PI) facing the sun looks exactly
                     // sunColor bright. (none when the sun is switched off: its color is then 0)
                     if (scene.sunOn != 0) {
-                        s.direction = randomDirectionInCone(scene.sunDirection.xyz, scene.sunDirection.w, seed);
+                        s.direction = randomDirectionInCone(scene.sunDirection.xyz, scene.sunDirection.w,
+                                                            pathSample(bounce, SAMPLE_SUN, seed).xy);
                         s.distance = SKY_DISTANCE;
                         s.light = PI * scene.sunColor.rgb;
                         s.pdf = scene.sunPdf;
@@ -2490,7 +2613,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     // (see the miss above), so this stays the MIS share.
                     if (scene.environmentSampling != 0 && !restirVertex) {
                         float skyPdf;
-                        s.direction = sampleEnvironment(seed, skyPdf);
+                        s.direction = sampleEnvironment(pathSample(bounce, SAMPLE_SKY, seed), skyPdf);
                         if (skyPdf > 0.0) {
                             s.distance = SKY_DISTANCE;
                             s.light = environmentLight(s.direction) / skyPdf;
@@ -2503,7 +2626,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     if (restirVertex) {
                         s = restirReservoirSample(pixel, hit.position + hit.geometricNormal * 0.001);
                     } else if (sampleLights) {
-                        s = sampleEmissiveLight(hit, hit.normal, hit.position + hit.geometricNormal * 0.001, seed);
+                        s = sampleEmissiveLight(hit, hit.normal, hit.position + hit.geometricNormal * 0.001,
+                                                pathSample(bounce, SAMPLE_EMISSIVE, seed).xyz);
                     }
                 } else {
                     s = samplePunctualLight(slot - 3, hit.position, seed);
@@ -2562,8 +2686,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         float lobeRoughness = hit.roughness;
         bool transmitted = false;
         bool specularLobe = true;
+        vec4 bounceRandom = pathSample(bounce, SAMPLE_BOUNCE, seed);  // xyz: the direction, w: Russian roulette
         if (leavingGlass) {
-            if (!sampleGlassExit(hit, v, seed, l)) {
+            if (!sampleGlassExit(hit, v, bounceRandom.xyz, l)) {
                 break;
             }
             transmitted = true;  // in or out, the path stays "through glass" for the light rules above
@@ -2586,7 +2711,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         } else {
             // Indirect light: continue the path in a direction picked by the surface's reflection (mostly where
             // it reflects the most light), or through it. The throughput is multiplied by BRDF * cos / pdf.
-            if (!sampleBrdf(hit, v, seed, l, weight, bouncePdf, lobeRoughness, transmitted, specularLobe)) {
+            if (!sampleBrdf(hit, v, bounceRandom.xyz, l, weight, bouncePdf, lobeRoughness, transmitted, specularLobe)) {
                 break;
             }
         }
@@ -2631,7 +2756,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // take light away.
         if (bounce >= 2) {
             float survive = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
-            if (randomFloat(seed) >= survive) {
+            if (bounceRandom.w >= survive) {
                 break;
             }
             throughput /= survive;
@@ -2747,7 +2872,7 @@ uint pixelSeed(ivec2 pixel) {
 // goes through the pixel center, otherwise edges would flicker from frame to frame.
 vec3 sampleCameraRay(ivec2 pixel, ivec2 size, inout uint seed) {
     bool randomOffset = scene.samplesPerPixel > 1 || scene.accumulate != 0;
-    vec2 offset = randomOffset ? vec2(randomFloat(seed), randomFloat(seed)) - 0.5 : vec2(0.0);
+    vec2 offset = randomOffset ? pathSample(0u, SAMPLE_CAMERA, seed).xy - 0.5 : vec2(0.0);
     return cameraRayDirection(vec2(pixel) + 0.5 + offset, size);
 }
 
@@ -2872,6 +2997,7 @@ Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
 // "not used" and the image pass samples the lights as usual.
 void restirPass(ivec2 pixel, ivec2 size) {
     uint seed = pixelSeed(pixel);
+    startPathSamples(pixel, 0u);
     vec3 direction = sampleCameraRay(pixel, size, seed);
     Intersection intersection;
     bool found = intersectClosest(scene.cameraPosition.xyz, direction, seed, intersection);
@@ -3407,6 +3533,7 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
         return;
     }
     uint seed = pixelSeed(pixel);
+    startPathSamples(pixel, 0u);
     vec3 direction = sampleCameraRay(pixel, size, seed);
     Intersection intersection;
     if (!loadPrimaryHit(pixel, seed, intersection)) {
@@ -3514,6 +3641,7 @@ void main() {
 
     vec3 color = vec3(0.0);
     for (uint s = 0; s < scene.samplesPerPixel; s++) {
+        startPathSamples(pixel, s);
         vec3 direction = sampleCameraRay(pixel, size, seed);
         // DLSS gets one sample per pixel anyway: the first path writes the guides. The RESTIR_PASS traced the
         // first sample's camera ray.

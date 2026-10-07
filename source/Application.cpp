@@ -89,6 +89,7 @@ void Application::initVulkan() {
 
     createUniformBuffer();
     createSpecularAlbedoTable();
+    createBlueNoiseTexture();
     findAvailableModels();
     findAvailableEnvironments();
     createDefaultScene();
@@ -125,6 +126,7 @@ void Application::mainLoop() {
         lastTime = now;
         frameDeltaTime = deltaTime;
 
+        finishCapture();  // a capture recorded last frame -> PNG
         buildImGui();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
@@ -137,6 +139,7 @@ void Application::mainLoop() {
     }
 
     vkp.deviceWaitIdle(device);
+    finishCapture();
 }
 
 void Application::cleanup() {
