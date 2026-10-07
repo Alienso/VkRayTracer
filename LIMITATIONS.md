@@ -141,9 +141,12 @@ them only rarely. Such files need the light moved out, or a spot that keeps the 
 Shadow rays pick sky directions by brightness alone. For an HDR map that is what matters (its sun gets the
 samples): one-frame error vs bounce rays only, Bistro Exterior ~150x lower per ms, Bistro Interior ~3x. The
 gradient sky is brightest at the horizon and on the "ground" below it, which walls and floors usually block, so
-many of its shadow rays are wasted: Bistro Interior (windows) ~1.2x better per ms, Sponza about even (it costs
-1-1.5 ms more per frame there, the noise is the same; Bistro Exterior by day 5-7 ms more). So "Sample the sky"
-defaults to Auto: HDR maps only. On samples the gradient too, Off never samples.
+many of its shadow rays are wasted. Still, "Sample the sky" defaults to On (Auto: HDR maps only; Off: never). With
+Auto as the default (from "Optimized shader" on), a Sponza side aisle lit only by sky through the arches was found
+by rare bounce rays alone: one frame's error 4000x higher than with sampling, and under DLSS a dim image whose
+patches never settled. Measured with the gradient sky and sun, DLAA, On vs Auto: one-frame error -74% in that aisle
+(+0.5 ms), -44% in Sponza's hall (+3.1 ms), -51% in Bistro Exterior (no measurable cost: ReSTIR DI takes the sky
+into its reservoir at the first surface).
 - Where: source/Environment.cpp (the table), `sampleEnvironment` and the sky slot of the light loop in `tracePath`.
 - Fix: also weight by the surface's cosine (a few tables per normal direction), or learn which directions are
   open per region of the scene (path guiding).
@@ -183,27 +186,39 @@ of extra GPU time. It is unbiased (brightness within 0.02% of ReSTIR off). Its s
 
 ### ReSTIR GI: first bounce only, slightly darker
 ReSTIR GI (RESTIR_GI_PLAN.md) reuses the light that reaches the first surface via a second one: where the first
-bounce went (x2) and the light found from there on (Lo), from last frame and nearby pixels. On by default in the
-DLSS modes, off in Accumulation; independent of ReSTIR DI. Measured at 1600x900 (temporal + spatial): noise after 64
+bounce went (x2) and the light found from there on (Lo), from last frame and nearby pixels. Off by default (an
+option for both kinds of mode; independent of ReSTIR DI): see the last point. Measured at 1600x900 (temporal + spatial): noise after 64
 frames under DLAA -21% (Bistro night), -60% (Sponza), -17% (Bistro day); in Accumulation -46..-82%. It costs
 ~2.5-5 ms of GPU time. Its shortcuts:
 - Only the first surface ReSTIR DI would use (roughness >= 0.25, no glass); glossy surfaces keep their plain
   bounce. x2 can be any surface but glass ("Min. roughness (bounce)"): Lo of a glossy x2 depends on where it is seen
   from, and is reused as if it didn't.
-- Slightly too dark: 0.35% (Bistro night), 0.85% (Sponza), 0.7% (Bistro day) against GI off. From the Jacobian clamp
-  (as RTXDI: a sample next to the surface that reuses it would get a huge weight), the temporal reuse ignoring
-  visibility (RTXDI's "basic"), and the boiling filter (~0.1-0.2%; without it noise is 15-20% higher).
+- Measured before the fixes below: 0.35% (Bistro night), 0.85% (Sponza), 0.7% (Bistro day) too dark against GI
+  off. Sponza's side aisle (lit only through gaps by the sky and sun) came out 14.5% too dark and flickered: 9% from
+  the boiling filter (RTXDI's: it drops samples far brighter than their neighbors', which there are the ones that
+  carry the light), 6% from the temporal reuse ignoring visibility (RTXDI's "basic"). Now the filter is off by
+  default and the temporal reuse has DI's ray ("Unbiased"): within 0.6% there. Left: the Jacobian clamp (as RTXDI:
+  a sample next to the surface that reuses it would get a huge weight). Without the filter, noise in evenly lit
+  scenes is 15-20% higher.
+- A GI sample's path doesn't end in the radiance cache at its second surface (it may one surface later): its Lo
+  would hold the cell's value of that frame, kept and spread by the reuse; where cells are noisy, patches came and
+  went.
 - Lo is the light of the frame the sample was found in: a light that moves or changes brightness is followed only
   as samples age out (30 frames) or are replaced. A changed sun or sky, or rebuilt light lists, drop the history.
   An object that moves takes its x2 points with it only when they are found again.
 - x2's own glow and what the bounce ray sees without a surface (sky, sun) aren't part of a sample: they stay with
   the pixel's own path (they depend on x1's light sampling).
-- A sample reused from elsewhere needs a visibility ray when shaded, plus (default, "Unbiased") rays from the
-  neighbors' surfaces in the spatial pass.
+- Rays: a sample reused from elsewhere needs a visibility ray when shaded; "Unbiased" adds one per pixel in the
+  temporal reuse and up to one per neighbor in the spatial reuse.
 - Memory: 120 bytes per render pixel (170 MB at 1600x900).
 - Where: "ReSTIR GI" in `shaders/raytrace.comp` (the split in `tracePath`, `restirGiTemporalPass`,
   `restirGiSpatial`, `restirGiShade`), Rendering → ReSTIR GI in the UI.
 - Fix: final MIS for glossy first surfaces (RTXDI); re-tracing a few samples per frame to follow changing light.
+- Why off: once unbiased (boiling filter off, temporal visibility ray, no cache at x2) it lowered the noise under
+  DLSS only 0-8% (Sponza aisle, Bistro night, Sponza hall) for 3-10 ms, and a rare bright sample kept for several
+  frames shows as a flash (6x more than without GI in Sponza's aisle; a history of 1-2 removes them and the gain).
+  The noise numbers above were measured with the boiling filter and the cache at x2. Next try: the cache at x2
+  again, its value read fresh whenever a sample is used.
 
 ## Radiance cache
 

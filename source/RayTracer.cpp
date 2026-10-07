@@ -792,6 +792,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.restirGiMaxHistory = settings.restirGiMaxHistory;
     uniforms.restirGiMaxAge = static_cast<uint32_t>(std::max(settings.restirGiMaxAge, 1));
     uniforms.restirGiPermutation = settings.restirGiPermutation ? 1 : 0;
+    uniforms.restirGiTemporalVisibility = settings.restirGiTemporalVisibility ? 1 : 0;
     bool giSpatial = settings.restirGiSpatial && uniforms.restirGi != 0;
     uniforms.restirGiSpatialNeighbors = giSpatial ? static_cast<uint32_t>(std::max(settings.restirGiSpatialNeighbors, 0)) : 0;
     uniforms.restirGiSpatialRadius = settings.restirGiSpatialRadius;

@@ -273,7 +273,7 @@ void Application::buildRestirUi() {
         ImGui::SetTooltip("Light reaching the first surface via another one (bounce light), at the surfaces ReSTIR DI\n"
                           "would use (Min. roughness above): where the first bounce went and the light found there\n"
                           "become a sample, reused by the next frame and nearby pixels. Independent of ReSTIR DI.\n"
-                          "Set separately for Accumulation (off by default: the reference) and the DLSS modes (on).");
+                          "Set separately for Accumulation and the DLSS modes (off by default in both: see LIMITATIONS.md).");
     }
     ImGui::BeginDisabled(!restirGi);
     ImGui::SliderFloat("Min. roughness (bounce)", &settings.restirGiMinRoughness, 0.0f, 1.0f, "%.2f");
@@ -283,6 +283,12 @@ void Application::buildRestirUi() {
     }
     ImGui::Checkbox("Reuse last frame##gi", &settings.restirGiTemporal);
     ImGui::BeginDisabled(!settings.restirGiTemporal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Unbiased##gitemporal", &settings.restirGiTemporalVisibility);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("A ray from last frame's surface per pixel. Without it, areas that see light through gaps\n"
+                          "come out too dark (Sponza's side aisle: 6%%).");
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Shuffle pixels##gi", &settings.restirGiPermutation);
     ImGui::SliderFloat("Max. history##gi", &settings.restirGiMaxHistory, 1.0f, 50.0f, "%.0f x");

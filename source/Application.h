@@ -102,6 +102,7 @@ struct SceneUniforms {
     uint32_t restirGiSpatialVisibility;    // 1 = rays from the neighbors' surfaces for the kept sample
     float restirGiBoilingFilter;     // 0 = off; else its strength (drops reservoirs far brighter than their neighbors')
     float restirGiRadianceClamp;     // 0 = off; else the most a GI sample's light may be (luminance)
+    uint32_t restirGiTemporalVisibility;  // 1 = unbiased temporal GI reuse (a ray from last frame's surface)
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
@@ -388,8 +389,9 @@ struct SceneObject {
 // loses energy then looks exactly as bright as the background; anything darker shows where energy is lost.
 enum class Environment : int { Sky = 0, Map = 1, Black = 2, White = 3 };
 
-// Whether surfaces aim a shadow ray at the sky (see Environment.cpp). It costs a ray per bounce and pays off where the
-// sky has bright spots (an HDR map's sun); a smooth gradient is found about as well by the bounce rays alone.
+// Whether surfaces aim a shadow ray at the sky (see Environment.cpp). It costs a ray per bounce. It pays off where the
+// sky has bright spots (an HDR map's sun), and for the gradient too wherever the sky is seen through openings
+// (interiors): there bounce rays rarely find it, and its light comes as rare, very bright samples (see LIMITATIONS.md).
 enum class SkySampling : int {
     Auto = 0,  // HDR maps only
     On = 1,
@@ -472,7 +474,7 @@ struct RenderSettings {
     int environmentMap = 0;            // index into Application::availableEnvironments
     float environmentRotation = 0.0f;  // degrees around the vertical axis
     float environmentIntensity = 1.0f;
-    int skySampling = static_cast<int>(SkySampling::Auto);  // shadow rays towards the sky (see Environment.cpp)
+    int skySampling = static_cast<int>(SkySampling::On);  // shadow rays towards the sky (see Environment.cpp)
     bool punctualLights = true;        // the lights that came with the models (KHR_lights_punctual)
     float punctualLightScale = 1.0f;   // multiplies them all
 
@@ -509,14 +511,16 @@ struct RenderSettings {
     int restirDisocclusionNeighbors = 8;  // for pixels without history (just uncovered)
     bool restirSpatialVisibility = true;  // unbiased: else Sponza ends up 9.7% too dark (neighbors within 30 pixels)
     // ReSTIR GI (RESTIR_GI_PLAN.md): light reaching the first surface via a second one. Independent of ReSTIR DI,
-    // set separately for Accumulation and the DLSS modes as it is (off in Accumulation: the reference).
+    // set separately for Accumulation and the DLSS modes as it is. Off in both: under DLSS it barely lowered the noise
+    // once unbiased (boiling filter off, temporal visibility ray), for 3-10 ms, and its kept samples flash.
     bool restirGiAccumulation = false;
-    bool restirGiDlss = true;
+    bool restirGiDlss = false;
     bool& restirGi(int mode) {
         return mode == static_cast<int>(RenderMode::Accumulation) ? restirGiAccumulation : restirGiDlss;
     }
     float restirGiMinRoughness = 0.0f;  // second surfaces at least this rough give samples (0: all but glass, as RTXDI)
     bool restirGiTemporal = true;       // reuse last frame's samples
+    bool restirGiTemporalVisibility = true;  // with a ray from last frame's surface (else Sponza's aisle: 6% too dark)
     bool restirGiPermutation = true;    // from shuffled pixels (as DI; RTXDI's default is off, DLSS RR's guide asks for it)
     float restirGiMaxHistory = 8.0f;    // RTXDI's default; to be set by the flicker test as DI's
     int restirGiMaxAge = 30;            // frames (RTXDI's default)
@@ -525,7 +529,9 @@ struct RenderSettings {
     float restirGiSpatialRadius = 32.0f;
     int restirGiDisocclusionNeighbors = 4;  // for pixels without history
     bool restirGiSpatialVisibility = true;   // rays for the kept sample: half the darkening of RTXDI's "basic" (none)
-    bool restirGiBoilingFilter = true;       // drop reservoirs far brighter than their neighbors' (RTXDI)
+    // Drop reservoirs far brighter than their neighbors' (RTXDI). Off: where light comes as rare bright samples it
+    // takes much of it away and flickers (Sponza's side aisle: 9% darker); elsewhere it lowers noise 15-20%.
+    bool restirGiBoilingFilter = false;
     float restirGiBoilingStrength = 0.2f;    // RTXDI's default: dropped above 41 x the average
     bool restirGiClampRadiance = false;      // limit a sample's light, set on screen as the bounce light clamp
     float restirGiRadianceClampLevel = 8.0f; // brightness on screen (after exposure, before tone mapping)

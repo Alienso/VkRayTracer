@@ -107,6 +107,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint restirGiSpatialVisibility; // 1 = rays from the neighbors' surfaces for the kept sample (see restirGiSpatial)
     float restirGiBoilingFilter;    // 0 = off; else its strength (see restirGiTemporalPass)
     float restirGiRadianceClamp;    // 0 = off; else the most a GI sample's Lo may be (luminance)
+    uint restirGiTemporalVisibility;  // 1 = the temporal reuse is unbiased (a ray from last frame's surface)
     vec4 previousCameraPosition;   // last frame's (for last frame's view directions)
 } scene;
 
@@ -2435,7 +2436,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                         cacheVertices++;
                     }
                 }
-            } else if (scene.cacheQuery != 0 && bounce >= 1 && previousLobeRough) {
+            } else if (scene.cacheQuery != 0 && bounce >= 1 && previousLobeRough && !(giState == 2 && bounce == 1)) {
+                // Not at a GI sample's second surface: its Lo would hold the cell's value of this frame, kept and
+                // shared by the reuse for many frames and pixels. Where cells are noisy (light through openings),
+                // the reuse also favours samples whose cell was momentarily bright: patches that came and went
+                // (Sponza's side aisle). The path goes on and may end in the cache one surface later.
                 uint slot, fingerprint;
                 float cellSize;
                 cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
@@ -3104,9 +3109,13 @@ float restirGiTarget(Hit hit, vec3 v, GiReservoir r) {
 
 // Last frame's GI reservoir of the same surface point merged into r, this frame's fresh sample, as ReSTIR DI's
 // (restirTemporal): generalized balance heuristic, each target taken at the other surface and converted to this
-// surface's measure with the Jacobian (see "ReSTIR GI"). Targets ignore visibility ("basic", RTXDI's default): a
-// sample the other surface can't see still takes a share of its MIS weight. The kept sample gets a visibility ray
-// when it is shaded (restirGiShade).
+// surface's measure with the Jacobian (see "ReSTIR GI"). Without visibility in the targets (RTXDI's default,
+// "basic"), a fresh sample last frame's surface can't see still gives it a share of its MIS weight: light lost
+// where the two see different things. Last frame's surface is the same point but up to 3 pixels away (shuffle,
+// fallback search), so near edges and far away they often do: Sponza's side aisle, lit through gaps, came out 6%
+// too dark (whole image, Accumulation). With restirGiTemporalVisibility, as DI's: a ray from last frame's surface
+// to the fresh sample. Last frame's own sample needs none: shading dropped it (W = 0) if its surface didn't see it.
+bool restirGiVisible(Hit hit, vec3 x2, inout uint seed);
 GiReservoir restirGiTemporal(GiReservoir r, ivec2 pixel) {
     Hit hit = unpackRestirSurface(restirSurfaces[restirIndex(pixel, false)]);
     uint seed = pcgHash(pixelSeed(pixel) ^ 0x68e31da4u);
@@ -3132,6 +3141,10 @@ GiReservoir restirGiTemporal(GiReservoir r, ivec2 pixel) {
         currentThere = geometry > 0.0
                        ? restirGiTarget(previousHit, previousV, r) * restirGiGeometry(previousHit.position, r) / geometry
                        : 0.0;
+        if (scene.restirGiTemporalVisibility != 0 && currentThere > 0.0
+                && !restirGiVisible(previousHit, r.position, seed)) {
+            currentThere = 0.0;
+        }
     }
     float previousHere = 0.0, previousThere = 0.0, jacobian = 1.0;
     if (previous.W > 0.0) {
@@ -3176,7 +3189,9 @@ shared float giBoilingWeights[64];  // one per thread of the 8 x 8 group (restir
 // Boiling filter (RTXDI's): a reservoir whose sample brings far more light (target * W) than the average of the
 // group's (8 x 8 pixels, those with light) is emptied. Without it, one lucky bright sample spreads over its
 // neighbors and is passed on for many frames: a blotch that grows and then vanishes ("boiling"). Dropped when it
-// brings more than 10 / strength - 9 times the average (strength 0.2: 41 x). Takes a little light away.
+// brings more than 10 / strength - 9 times the average (strength 0.2: 41 x). Takes light away: little where light
+// is spread evenly (0.1-0.2%), a lot where it all comes as rare bright samples (Sponza's side aisle, lit through
+// gaps: 9%, and the dropping made it flicker). Off by default.
 void restirGiTemporalPass(ivec2 pixel, bool inside) {
     uint freshIndex = restirGiFreshIndex(pixel);
     GiReservoir r;
