@@ -353,7 +353,10 @@ void Application::createRayTracingImages() {
     createBuffer(sizeof(GpuPrimaryHit) * renderExtent.width * renderExtent.height, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory);
     VkDeviceSize pixels = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
-    createBuffer(sizeof(GpuReservoir) * 2 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    createBuffer(sizeof(GpuBounceHit) * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 bounceHitBuffer, bounceHitMemory);
+    // this frame's, last frame's, and the ReSTIR pass's result for the spatial pass
+    createBuffer(sizeof(GpuReservoir) * 3 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory);
     createBuffer(sizeof(GpuRestirSurface) * 2 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory);
@@ -406,6 +409,8 @@ void Application::destroyRayTracingImages() {
     vkFreeMemory(device, radianceImageMemory, nullptr);
     vkDestroyBuffer(device, primaryHitBuffer, nullptr);
     vkFreeMemory(device, primaryHitMemory, nullptr);
+    vkDestroyBuffer(device, bounceHitBuffer, nullptr);
+    vkFreeMemory(device, bounceHitMemory, nullptr);
     vkDestroyBuffer(device, reservoirBuffer, nullptr);
     vkFreeMemory(device, reservoirMemory, nullptr);
     vkDestroyBuffer(device, restirSurfaceBuffer, nullptr);
@@ -418,8 +423,8 @@ void Application::createRayTracingDescriptors() {
     // 11: specular albedo table, 12: per-instance motion and matrices, 13-17: motion vectors, diffuse albedo,
     // specular albedo, normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages,
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
-    // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces
-    std::vector<VkDescriptorSetLayoutBinding> bindings(28);
+    // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass
+    std::vector<VkDescriptorSetLayoutBinding> bindings(29);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -446,6 +451,7 @@ void Application::createRayTracingDescriptors() {
     bindings[25] = {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[26] = {26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[27] = {27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[28] = {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuTextures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -469,7 +475,7 @@ void Application::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -530,12 +536,13 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorBufferInfo primaryHitInfo{primaryHitBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo reservoirInfo{reservoirBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo restirSurfaceInfo{restirSurfaceBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bounceHitInfo{bounceHitBuffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuTextures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(28);
+    std::vector<VkWriteDescriptorSet> writes(29);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -591,6 +598,8 @@ void Application::updateRayTracingDescriptorSet() {
     writes[26].pBufferInfo = &reservoirInfo;
     writes[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[27].pBufferInfo = &restirSurfaceInfo;
+    writes[28].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[28].pBufferInfo = &bounceHitInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -609,12 +618,12 @@ void Application::createRayTracingPipeline() {
 
     VkShaderModule shaderModule = createShaderModule(readFile("raytrace.comp.spv"));
 
-    // Three pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
-    // (CACHE_UPDATE_PASS = 1) and ReSTIR DI's camera rays and candidates (RESTIR_PASS = 1). The constants let the compiler
-    // drop the other passes' code from each.
-    VkPipeline* pipelines[] = {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline};
-    for (uint32_t pass = 0; pass < 3; pass++) {
-        uint32_t constants[2] = {pass == 1 ? 1u : 0u, pass == 2 ? 1u : 0u};
+    // Four pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
+    // (CACHE_UPDATE_PASS = 1), ReSTIR DI's camera rays and candidates (RESTIR_PASS = 1) and its spatial reuse
+    // (RESTIR_PASS = 2). The constants let the compiler drop the other passes' code from each.
+    VkPipeline* pipelines[] = {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline, &rtRestirSpatialPipeline};
+    for (uint32_t pass = 0; pass < 4; pass++) {
+        uint32_t constants[2] = {pass == 1 ? 1u : 0u, pass >= 2 ? pass - 1 : 0u};
         VkSpecializationMapEntry entries[2] = {{0, 0, sizeof(uint32_t)}, {1, sizeof(uint32_t), sizeof(uint32_t)}};
         VkSpecializationInfo specialization{2, entries, sizeof(constants), constants};
         VkComputePipelineCreateInfo pipelineInfo{};
@@ -638,7 +647,8 @@ void Application::createRayTracingPipeline() {
     if (pipelineStatisticsSupported) {
         rtPipelineStatistics = "Image paths:\n" + readPipelineStatistics(rtPipeline) +
                                "Cache update paths:\n" + readPipelineStatistics(rtCacheUpdatePipeline) +
-                               "ReSTIR candidates:\n" + readPipelineStatistics(rtRestirPipeline);
+                               "ReSTIR candidates:\n" + readPipelineStatistics(rtRestirPipeline) +
+                               "ReSTIR spatial reuse:\n" + readPipelineStatistics(rtRestirSpatialPipeline);
         std::cout << "Trace shader statistics (from the driver):\n" << rtPipelineStatistics << std::flush;
     }
 }
@@ -734,8 +744,14 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
     uniforms.textureMipmaps = settings.textureMipmaps ? 1 : 0;
     uniforms.normalMapFiltering = settings.normalMapFiltering ? 1 : 0;
-    // ReSTIR DI: candidates of each kind of light there is. Debug views trace their own camera ray.
-    uniforms.restirDi = settings.restirDi && uniforms.debugView == 0 ? 1 : 0;
+    // Hit debug views overwrite the radiance image. Guide views are drawn by the display pass from the guide
+    // images, while the trace shader path traces as usual.
+    uniforms.debugView = isGuideView(settings.debugView) ? 0 : static_cast<uint32_t>(settings.debugView);
+    // ReSTIR DI: candidates of each kind of light there is. Debug views trace their own camera ray (except the one
+    // showing ReSTIR's reservoirs).
+    bool restirView = uniforms.debugView == static_cast<uint32_t>(DebugView::RestirM) ||
+                      uniforms.debugView == static_cast<uint32_t>(DebugView::RestirLight);
+    uniforms.restirDi = settings.restirDi(settings.renderMode) && (uniforms.debugView == 0 || restirView) ? 1 : 0;
     bool sampleTriangles = !emissiveTriangles.empty() && settings.emissiveSampling != static_cast<int>(EmissiveSampling::BouncesOnly);
     uint32_t lightCandidates = static_cast<uint32_t>(std::max(settings.restirLightCandidates, 1));
     uniforms.restirTriangleCandidates = sampleTriangles ? lightCandidates : 0;
@@ -748,6 +764,10 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.restirMinRoughness = settings.restirMinRoughness;
     uniforms.restirTemporal = settings.restirTemporal ? (settings.restirTemporalVisibility ? 2 : 1) : 0;
     uniforms.restirMaxHistory = settings.restirMaxHistory;
+    uniforms.restirSpatialNeighbors = settings.restirSpatial ? static_cast<uint32_t>(std::max(settings.restirSpatialNeighbors, 0)) : 0;
+    uniforms.restirSpatialRadius = settings.restirSpatialRadius;
+    uniforms.restirSpatialVisibility = settings.restirSpatialVisibility ? 1 : 0;
+    uniforms.restirDisocclusionNeighbors = settings.restirSpatial ? static_cast<uint32_t>(std::max(settings.restirDisocclusionNeighbors, 0)) : 0;
     // How much of the scene one ray stands for (the start of its ray cone, see uvFootprint in the shader): half an
     // output pixel, vertically (pixels are square). The image ends up sharper than one render pixel: accumulation
     // averages many offsets within each pixel, and DLSS adds detail up to the output resolution (NVIDIA's guide
@@ -755,9 +775,6 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.pixelSpreadAngle = 0.5f * std::atan(2.0f * uniforms.tanHalfFov / static_cast<float>(outputExtent.height));
     // DLSS mode: every frame on its own (DLSS does the averaging over time), plus the guides it needs
     uniforms.accumulate = settings.accumulate && !dlssActive() ? 1 : 0;
-    // Hit debug views overwrite the radiance image. Guide views are drawn by the display pass from the guide
-    // images, while the trace shader path traces as usual.
-    uniforms.debugView = isGuideView(settings.debugView) ? 0 : static_cast<uint32_t>(settings.debugView);
     uniforms.farDistance = Configuration::cameraFar;
     uniforms.writeGuides = dlssActive() || isGuideView(settings.debugView) ? 1 : 0;
     uniforms.cacheQuery = settings.radianceCache && !cacheQueriesSuspended ? 1 : 0;
@@ -803,18 +820,26 @@ SceneUniforms Application::buildSceneUniforms() {
     permutationHash ^= permutationHash >> 13;
     uniforms.restirPermutation = settings.restirPermutation ? 16u | (permutationHash & 15u) : 0;
     uniforms.previousCameraPosition = glm::vec4(previousCameraPosition, 1.0f);
+    // Bounce light clamp (DLSS modes, see clampBounceLight in the shader). The limit is set on screen, so it is
+    // divided by the exposure: the GPU's from a few frames ago (exposureInfo), or the manual one. After the
+    // comparison above: it changes every frame with the auto exposure.
+    float shownExposure = settings.autoExposure
+                          ? (exposureInfoValid ? exposureInfo.exposure * std::exp2(settings.exposureCompensation) : 0.0f)
+                          : settings.exposure;
+    uniforms.bounceLightClamp = settings.clampBounceLight && dlssActive() && shownExposure > 0.0f
+                                ? settings.bounceLightClampLevel / shownExposure : 0.0f;
     if (uniforms.restirDi != 0) {
         restirCurrentHalf = 1 - restirCurrentHalf;  // this frame's half is last frame's half next frame
     }
     restirHistoryAvailable = uniforms.restirDi != 0;
     previousCameraPosition = camera.position;
     // Jitter (DLSS mode): a different sub-pixel offset of the whole image every frame, so DLSS sees every part of
-    // each pixel over a few frames. In pixels, -0.5..0.5. NVIDIA recommends 8 phases per output pixel, so more
-    // when each render pixel covers several output pixels.
+    // each pixel over a few frames. In pixels, -0.5..0.5. DLSS SR's guide asks for 8 phases per output pixel (more
+    // when each render pixel covers several output pixels); RR's for "at least 32", as it has no reason to limit them.
     frameJitter = glm::vec2(0.0f);
     if (dlssActive()) {
         float scale = static_cast<float>(outputExtent.width) / static_cast<float>(renderExtent.width);
-        uint32_t sequenceLength = std::max(8u, static_cast<uint32_t>(std::lround(8.0f * scale * scale)));
+        uint32_t sequenceLength = std::max(32u, static_cast<uint32_t>(std::lround(8.0f * scale * scale)));
         jitterIndex = jitterIndex % sequenceLength + 1;
         frameJitter = glm::vec2(halton(jitterIndex, 2), halton(jitterIndex, 3)) - 0.5f;
     }
@@ -921,6 +946,13 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
         hitsBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &hitsBarrier, 0, nullptr, 0, nullptr);
+        // Spatial reuse: reads the ReSTIR pass's reservoirs (a part of their own), writes this frame's
+        if (uniforms.restirSpatialNeighbors + uniforms.restirDisocclusionNeighbors > 0) {
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtRestirSpatialPipeline);
+            vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &hitsBarrier, 0, nullptr, 0, nullptr);
+        }
     }
     writeTimestamp(commandBuffer, 2);
 
@@ -1051,6 +1083,7 @@ void Application::cleanupRayTracing() {
     vkDestroyPipeline(device, rtPipeline, nullptr);
     vkDestroyPipeline(device, rtCacheUpdatePipeline, nullptr);
     vkDestroyPipeline(device, rtRestirPipeline, nullptr);
+    vkDestroyPipeline(device, rtRestirSpatialPipeline, nullptr);
     destroyRadianceCache();
     vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, rtDescriptorPool, nullptr);

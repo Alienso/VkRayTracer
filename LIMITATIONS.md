@@ -120,7 +120,8 @@ with one or a few lights are unchanged (Cornell box), and so is Bistro Interior,
 "By power" in Rendering brings back the old way, for comparison.
 - Where: `buildLightTree` (source/Lights.cpp), `lightTreeImportance` / `pickFromLightTree` /
   `lightPickProbability` (shaders/raytrace.comp).
-- Fix: ReSTIR DI (reuse good samples between neighbouring pixels and frames, which takes visibility into account).
+- Partly fixed by ReSTIR DI (below) at the first surface the camera sees, in the DLSS modes: its reuse keeps the
+  samples that turned out visible. Deeper bounces, and Accumulation by default, still pick by the tree alone.
 
 ### Sun of size 0
 A sun with angular radius 0 can only be found by shadow rays: mirrors don't show it, and the camera sees a
@@ -129,7 +130,7 @@ disc clamped to a minimum size.
 ### Punctual lights: all of them, or one at random
 Lights from the files (KHR_lights_punctual) get a shadow ray each at every surface, up to 8 lights. With more,
 one is picked at random per surface (uniformly, not by how much it matters there), so scenes with many lamps get
-noisy. They are not in the light tree that glowing triangles have (a tree over both would fix this). They have no size: sharp shadows,
+noisy (ReSTIR DI, below, picks among them better at the first surface). They are not in the light tree that glowing triangles have (a tree over both would fix this). They have no size: sharp shadows,
 and mirrors don't show them (no ray can hit a point). When an object is scaled (or fitted to 2 units), its lights'
 intensity is scaled by the square of that, so the model stays lit the same. A point light touching geometry (a bulb
 inside its lamp) makes those surfaces extremely bright a few centimeters away: speckles everywhere, as paths find
@@ -158,6 +159,27 @@ The map is kept at full size as 32-bit floats (128 MB for a 4k map) without mip 
 average over many directions. The analytic Sun is independent of the map: a map with its own sun lights the scene
 twice unless the Sun is switched off. Only equirectangular .hdr (Radiance) files are read (stb_image).
 - Fix: estimate the map's sun (brightest cells) and offer to replace it by the analytic one; EXR via tinyexr.
+
+### ReSTIR DI: first surface only, with shortcuts
+ReSTIR DI (RESTIR_DI_PLAN.md) picks the direct light at the first surface the camera sees from many candidates,
+reused from last frame and from nearby pixels. On by default in the DLSS modes, off in Accumulation (which stays
+the plain path tracer, the reference; it can be switched on there). Measured at 1600x900 under DLAA, noise x GPU
+time: Bistro at night −47%, by day −44%, Sponza with an HDR sky −46%; it costs 5-7 ms (Sponza) to 12 ms (Bistro)
+of extra GPU time. It is unbiased (brightness within 0.02% of ReSTIR off). Its shortcuts:
+- Only the first surface, and only rough ones (roughness >= 0.25, no glass): mirrors and deeper bounces keep the
+  usual light sampling. Only the first sample per pixel uses it.
+- The sun isn't in it: it keeps its own shadow ray everywhere (it would crowd out every other light).
+- History is dropped for a frame whenever the light lists are rebuilt (any object moves, a material changes): the
+  samples name lights by index. A moving glowing object keeps ReSTIR without history.
+- Reuse costs shadow rays to stay unbiased (2 for last frame's samples, up to 1 per neighbor); without them, areas
+  near shadows came out up to 10% too dark (Sponza). The UI's "Unbiased" boxes turn them off for comparison.
+- Neighbors share samples: their errors are alike over a few pixels. Under DLSS this looks calmer (less flicker
+  and ghosting than without ReSTIR), but in Bistro at night the error after 8 still frames is 10-25% higher than
+  without the neighbors. A lucky bright sample can be held for up to 5 frames ("Max. history").
+- Memory: about 190 bytes per render pixel (270 MB at 1600x900: reservoirs, surfaces, camera and bounce hits).
+- Where: "ReSTIR DI" in `shaders/raytrace.comp` (`restirPass`, `restirTemporal`, `restirSpatial`), Rendering →
+  ReSTIR DI in the UI; debug views "ReSTIR M" and "ReSTIR light".
+- Fix: ReSTIR GI for the bounces; a shared reservoir for the sun when it is large or partly blocked.
 
 ## Radiance cache
 

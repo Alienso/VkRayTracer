@@ -84,6 +84,11 @@ struct SceneUniforms {
     uint32_t restirHistoryValid;     // 0: last frame's reservoirs can't be used (see buildSceneUniforms)
     uint32_t restirCurrentHalf;      // which half of the reservoir and surface buffers is this frame's
     uint32_t restirPermutation;      // shuffle of last frame's pixels: bit 4 = on, bits 0-3 = this frame's offset
+    uint32_t restirSpatialNeighbors; // neighbors' reservoirs each pixel resamples; 0 (and the next 0) = no spatial pass
+    float restirSpatialRadius;       // within this many render pixels
+    uint32_t restirDisocclusionNeighbors;  // as many for pixels that found no history
+    uint32_t restirSpatialVisibility;      // 1 = unbiased spatial reuse (shadow rays from the neighbors' surfaces)
+    float bounceLightClamp;          // 0 = off; else the most light one sample of bounce light adds (luminance)
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
@@ -102,6 +107,20 @@ struct GpuPrimaryHit {
     glm::vec2 barycentrics;
     float t;
     uint32_t seed;
+};
+
+// One per render pixel, binding 28: the image path's first bounce at a ReSTIR surface, traced by the ReSTIR pass as
+// its BRDF candidate. Must match BounceHit in shaders/raytrace.comp.
+struct GpuBounceHit {
+    uint32_t meshIndex;
+    uint32_t instanceIndex;
+    int32_t primitive;
+    glm::vec2 barycentrics;
+    float t;
+    glm::vec3 direction;
+    uint32_t weightRG;
+    uint32_t weightBRoughness;
+    float pdf;
 };
 
 // Two per render pixel (this frame's and last frame's), binding 26: ReSTIR DI's light sample. Must match Reservoir in
@@ -305,6 +324,8 @@ enum class DebugView : int {
     None = 0, Normals, TexCoords, MeshIndex, MaterialIndex,
     BaseColor, Metallic, Roughness, Transmission, Emissive, Tangents,
     RadianceCache,  // the cached light of the cell at the first hit (with exposure, like the image)
+    RestirM,        // how many candidates each pixel's ReSTIR reservoir stands for (history and neighbors)
+    RestirLight,    // which kind of light each pixel's ReSTIR reservoir picked
     GuideDepth, GuideMotionVectors, GuideDiffuseAlbedo, GuideSpecularAlbedo, GuideNormals, GuideRoughness,
     GuideSpecularHitDistance, GuideReprojectionError
 };
@@ -440,7 +461,13 @@ struct RenderSettings {
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
     float cacheHistoryFrames = 32.0f;  // old cache samples fade out over about this many frames
-    bool restirDi = false;  // ReSTIR DI (work in progress, RESTIR_DI_PLAN.md): direct light at the first surface
+    // ReSTIR DI (RESTIR_DI_PLAN.md): direct light at the first surface. Set separately for Accumulation (off: the
+    // plain path tracer stays the reference) and the DLSS modes (on: less noise and flicker for DLSS to work with).
+    bool restirDiAccumulation = false;
+    bool restirDiDlss = true;
+    bool& restirDi(int mode) {
+        return mode == static_cast<int>(RenderMode::Accumulation) ? restirDiAccumulation : restirDiDlss;
+    }
     int restirLightCandidates = 4;   // candidate samples of glowing triangles per pixel (of punctual lights: up to this)
     int restirSkyCandidates = 2;     // of the sky, when it is light-sampled
     int restirBrdfCandidates = 1;    // directions picked by the surface's reflection (a ray each)
@@ -452,6 +479,17 @@ struct RenderSettings {
     // patches flicker under DLSS: a lucky bright sample held for many frames, then lost (8x more flickering pixels
     // in Bistro at night than 5); the noise was the same.
     float restirMaxHistory = 5.0f;
+    bool restirSpatial = true;         // reuse neighbors' samples (spatial pass): less ghosting and flicker under DLSS
+    int restirSpatialNeighbors = 3;
+    float restirSpatialRadius = 30.0f;   // render pixels
+    int restirDisocclusionNeighbors = 8;  // for pixels without history (just uncovered)
+    bool restirSpatialVisibility = true;  // unbiased: else Sponza ends up 9.7% too dark (neighbors within 30 pixels)
+    // DLSS modes: light that reached the first surface via another one (bounce light) is limited per sample, so a
+    // rare very bright path doesn't stand out for DLSS to smear over many frames. Biased (a little darker). Off: in
+    // Bistro at night (DLAA) it changed neither the noise nor how long a still image keeps changing, only made it
+    // darker (the street: -2% at 4, -5% at 1). Kept for judging by eye in motion.
+    bool clampBounceLight = false;
+    float bounceLightClampLevel = 4.0f;  // the limit on screen: brightness after exposure, before tone mapping
     float cacheMinSamples = 4.0f;   // a cell is used once it has this much sample weight
     bool accumulate = true;
 
@@ -631,6 +669,8 @@ private:
     RenderImage guideHistoryImage;        // RGBA16F: last frame's diffuse albedo, for the reprojection error view
     VkBuffer primaryHitBuffer = VK_NULL_HANDLE;  // GpuPrimaryHit per render pixel (ReSTIR: camera rays traced first)
     VkDeviceMemory primaryHitMemory = VK_NULL_HANDLE;
+    VkBuffer bounceHitBuffer = VK_NULL_HANDLE;   // GpuBounceHit per render pixel (ReSTIR: first bounce traced early)
+    VkDeviceMemory bounceHitMemory = VK_NULL_HANDLE;
     VkBuffer reservoirBuffer = VK_NULL_HANDLE;   // GpuReservoir per render pixel, this frame's and last frame's
     VkDeviceMemory reservoirMemory = VK_NULL_HANDLE;
     VkBuffer restirSurfaceBuffer = VK_NULL_HANDLE;  // GpuRestirSurface per render pixel, this frame's and last frame's
@@ -659,6 +699,7 @@ private:
     VkPipeline rtPipeline;
     VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
     VkPipeline rtRestirPipeline;       // the same shader with RESTIR_PASS = 1: camera rays and ReSTIR DI candidates
+    VkPipeline rtRestirSpatialPipeline;  // RESTIR_PASS = 2: ReSTIR DI's spatial reuse
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;

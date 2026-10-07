@@ -273,7 +273,7 @@ void Application::finishNoiseMeasurement() {
     char line[256];
     std::snprintf(line, sizeof(line), "measured %s%s%s: trace %.2f ms (ReSTIR %.2f), DLSS %.2f ms per frame",
                   renderModeName(noiseMeasureMode), settings.radianceCache ? " + radiance cache" : "",
-                  settings.restirDi ? " + ReSTIR DI" : "", traceMs, restirMs, dlssMs);
+                  settings.restirDi(noiseMeasureMode) ? " + ReSTIR DI" : "", traceMs, restirMs, dlssMs);
     noiseStatus = line;
     std::cout << "noise: " << line << std::endl;
     std::cout << "noise: frame  relMSE      rel. RMSE  brightness  region" << std::endl;

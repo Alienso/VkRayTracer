@@ -200,16 +200,20 @@ void Application::buildRenderingUi() {
     ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
 }
 
-// ReSTIR DI (work in progress, see RESTIR_DI_PLAN.md)
+// ReSTIR DI (see RESTIR_DI_PLAN.md)
 void Application::buildRestirUi() {
     ImGui::SeparatorText("ReSTIR DI");
-    ImGui::Checkbox("ReSTIR DI", &settings.restirDi);
+    bool& restirDi = settings.restirDi(settings.renderMode);
+    bool accumulation = settings.renderMode == static_cast<int>(RenderMode::Accumulation);
+    ImGui::Checkbox(accumulation ? "ReSTIR DI (Accumulation)" : "ReSTIR DI (DLSS modes)", &restirDi);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Direct light at the first surface the camera sees (if rough enough): several candidate light\n"
-                          "samples per pixel, the most promising one kept and reused by the next frame. Less noise with\n"
-                          "many lights (Bistro at night). The sun keeps its own shadow ray.");
+                          "samples per pixel, the most promising one kept and reused by the next frame and nearby\n"
+                          "pixels. Less noise with many lights (Bistro at night). The sun keeps its own shadow ray.\n"
+                          "Set separately for Accumulation (off by default: the plain path tracer, the reference)\n"
+                          "and the DLSS modes (on by default).");
     }
-    ImGui::BeginDisabled(!settings.restirDi);
+    ImGui::BeginDisabled(!restirDi);
     ImGui::SliderInt("Light candidates", &settings.restirLightCandidates, 1, 16);
     ImGui::SliderInt("Sky candidates", &settings.restirSkyCandidates, 1, 8);
     ImGui::SliderInt("BRDF candidates", &settings.restirBrdfCandidates, 0, 4);
@@ -239,6 +243,26 @@ void Application::buildRestirUi() {
                           "less noise on still images, slower reaction to changes.");
     }
     ImGui::EndDisabled();
+    ImGui::Checkbox("Reuse neighbors", &settings.restirSpatial);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Each pixel also resamples a few nearby pixels' samples (a pass of its own, ~3 ms in Bistro).\n"
+                          "Less noise, flicker and ghosting, above all where the camera uncovers something (no\n"
+                          "history there).");
+    }
+    ImGui::BeginDisabled(!settings.restirSpatial);
+    ImGui::SameLine();
+    ImGui::Checkbox("Unbiased##spatial", &settings.restirSpatialVisibility);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Shadow rays from the neighbors' surfaces when a pixel keeps its own sample. Without them,\n"
+                          "areas near shadows come out too dark (Sponza with the sky: 9.7%% at a radius of 30).");
+    }
+    ImGui::SliderInt("Neighbors", &settings.restirSpatialNeighbors, 0, 8);
+    ImGui::SliderFloat("Radius", &settings.restirSpatialRadius, 2.0f, 60.0f, "%.0f px");
+    ImGui::SliderInt("Neighbors (uncovered)", &settings.restirDisocclusionNeighbors, 0, 16);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Neighbors for pixels that found no history (just uncovered by the camera or an object).");
+    }
+    ImGui::EndDisabled();
     ImGui::EndDisabled();
 }
 
@@ -246,13 +270,17 @@ void Application::buildDebugUi() {
     ImGui::Combo("Debug view", &settings.debugView,
                  "Off (path traced)\0Normals\0Texture coordinates\0Mesh index\0Material index\0"
                  "Base color\0Metallic\0Roughness\0Transmission\0Emissive\0Tangents\0"
-                 "Radiance cache\0"
+                 "Radiance cache\0ReSTIR M\0ReSTIR light\0"
                  "DLSS input: depth\0DLSS input: motion vectors\0DLSS input: diffuse albedo\0"
                  "DLSS input: specular albedo\0DLSS input: normals\0DLSS input: roughness\0"
                  "DLSS input: specular hit distance\0DLSS input: reprojection error\0");
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Radiance cache: the indirect light the cache holds for what the camera sees, cell by cell\n"
                           "(magenta: no cell yet, dark red: too few samples).\n"
+                          "ReSTIR M: how many candidates each pixel's light sample stands for, from this frame's only\n"
+                          "(red) through yellow and green to 64x (blue). Grey: no ReSTIR there.\n"
+                          "ReSTIR light: the kind of light each pixel's sample is on: glowing triangle (orange),\n"
+                          "punctual light (purple), sky (blue), none found (dark red), blocked (black, W = 0).\n"
                           "DLSS inputs: the images DLSS will get, written during normal path tracing.\n"
                           "Depth / hit distance: grey = near to far, light blue = sky, black = unknown.\n"
                           "Motion vectors: grey = still, red/green = moving left/up.\n"

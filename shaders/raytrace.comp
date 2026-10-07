@@ -12,6 +12,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // pipeline only contains the code it needs. Both 0: the image. CACHE_UPDATE_PASS = 1: the radiance cache's update
 // paths (a few full-length paths that fill the cache, see "Radiance cache" below). RESTIR_PASS = 1: the camera
 // rays, stored for the image pass (see "Primary hits"), and ReSTIR DI's light samples (see "ReSTIR DI").
+// RESTIR_PASS = 2: ReSTIR DI's spatial reuse (restirSpatial), between those two.
 layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
 layout(constant_id = 1) const uint RESTIR_PASS = 0;
 
@@ -86,7 +87,12 @@ layout(binding = 3) uniform SceneUniforms {
     uint restirHistoryValid;        // 0: last frame's reservoirs are unusable (first frame, lights changed, ...)
     uint restirCurrentHalf;         // which half of the reservoir and surface buffers is this frame's (0/1)
     uint restirPermutation;         // shuffle of last frame's pixels: bit 4 = on, this frame's offset x in bits 0-1, y in 2-3
-    vec4 previousCameraPosition;    // last frame's (for last frame's view directions)
+    uint restirSpatialNeighbors;    // neighbors' reservoirs each pixel resamples (restirSpatial); 0 = no spatial pass
+    float restirSpatialRadius;      // within this many render pixels
+    uint restirDisocclusionNeighbors;  // as many for pixels that found no history
+    uint restirSpatialVisibility;   // 1 = the spatial reuse is unbiased (shadow rays from the neighbors, see restirSpatial)
+    float bounceLightClamp;         // 0 = off; else the most one sample of bounce light may add (luminance, see tracePath)
+    vec4 previousCameraPosition;   // last frame's (for last frame's view directions)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -196,6 +202,21 @@ struct PrimaryHit {
     uint seed;           // the pixel's random numbers after the ray (cut-outs use some), for the image pass to go on with
 };
 layout(binding = 25, scalar) buffer PrimaryHits { PrimaryHit primaryHits[]; };
+// The first bounce of the image path at a ReSTIR surface, picked and traced by the RESTIR_PASS as its BRDF
+// candidate (see restirCandidates), one per render pixel. Must match GpuBounceHit in Application.h.
+struct BounceHit {
+    uint meshIndex;      // ~0: the ray left the scene, BOUNCE_NONE: no bounce (the path ends at the first surface)
+    uint instanceIndex;
+    int primitive;
+    vec2 barycentrics;
+    float t;
+    vec3 direction;      // exact: the hit's position is rebuilt as origin + direction * t
+    uint weightRG;       // the sample's weight (BRDF * cos / pdf), half floats
+    uint weightBRoughness;  // weight.b (half), lobe roughness (8 bits), flags (8 bits: 1 transmitted, 2 specular lobe)
+    float pdf;
+};
+layout(binding = 28, scalar) buffer BounceHits { BounceHit bounceHits[]; };
+const uint BOUNCE_NONE = 0xFFFFFFFEu;
 const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
@@ -685,6 +706,22 @@ float luminance(vec3 color) {
 
 // glTF's roughness is perceptual; the GGX formulas use alpha = roughness^2. A perfect mirror (alpha 0) would
 // need its own special case, a tiny minimum makes it an extremely sharp but still "normal" lobe.
+// Bounce light clamp (DLSS modes): light that reached the camera after reflecting off two or more surfaces (the
+// first surface's indirect light) adds at most scene.bounceLightClamp per sample. Such light is found by chance
+// (a bounce ray that happens to hit a small bright lamp): rare, very bright samples that DLSS can't tell from
+// detail, so it keeps them for many frames (ghosting) and the image settles slowly. Direct light at the first
+// surface (ReSTIR, the shadow rays, lamps seen in a glossy reflection) is never clamped. The limit is set on screen
+// (RayTracer.cpp), so it means the same at night and by day. Biased: the clamped light is lost.
+vec3 clampBounceLight(vec3 light, uint reflections) {
+    if (CACHE_UPDATE_PASS == 0 && scene.bounceLightClamp > 0.0 && reflections >= 2) {
+        float l = luminance(light);
+        if (l > scene.bounceLightClamp) {
+            light *= scene.bounceLightClamp / l;
+        }
+    }
+    return light;
+}
+
 float ggxAlpha(float roughness) {
     return max(roughness * roughness, 1e-3);
 }
@@ -1451,7 +1488,11 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
 // scene, a pixel's reservoir soon stands for the candidates of many frames (up to restirMaxHistory times this
 // frame's), and the shadow ray in the RESTIR_PASS (visibility reuse) keeps blocked samples from being passed on.
 //
-// Buffers: reservoirs and surfaces have two halves, this frame's and last frame's, swapped every frame.
+// Spatial reuse (restirSpatial): each pixel also resamples a few nearby pixels' reservoirs, in a pass of its own.
+//
+// Buffers: reservoirs and surfaces have two halves, this frame's and last frame's, swapped every frame. Reservoirs
+// have a third part with the spatial pass: the RESTIR_PASS's result (restirTemporalIndex), which the spatial pass
+// reads, writing this frame's half.
 
 const uint RESTIR_NOT_USED = 0xFFFFFFFFu;  // Reservoir.light: this pixel's first surface does its own light sampling
 const uint LIGHT_KIND_NONE = 0;            // nothing could light the surface
@@ -1466,7 +1507,7 @@ struct Reservoir {
     float W;      // the kept sample's weight: its light * W estimates the direct light (0: nothing)
     float M;      // how many candidates it stands for
 };
-layout(binding = 26, scalar) buffer Reservoirs { Reservoir reservoirs[]; };  // 2 halves of one per render pixel
+layout(binding = 26, scalar) buffer Reservoirs { Reservoir reservoirs[]; };  // 3 parts of one per render pixel
 
 // What the reuse needs to know about a pixel's first surface: enough for its target (restirTarget) without its
 // textures. 32 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Application.h.
@@ -1489,6 +1530,16 @@ uint restirPixelCount() {
 uint restirIndex(ivec2 pixel, bool previousFrame) {
     uint part = previousFrame ? 1u - scene.restirCurrentHalf : scene.restirCurrentHalf;
     return part * restirPixelCount() + uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
+}
+
+// Whether the spatial pass runs (restirSpatial)
+bool restirSpatialOn() {
+    return scene.restirSpatialNeighbors + scene.restirDisocclusionNeighbors > 0;
+}
+
+// Where the RESTIR_PASS leaves a pixel's reservoir for the spatial pass (reservoirs only)
+uint restirTemporalIndex(ivec2 pixel) {
+    return 2u * restirPixelCount() + uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
 }
 
 // Unit vectors in 32 bits: the octahedron folded flat (Cigolle et al. 2014)
@@ -1625,6 +1676,9 @@ float restirTarget(Hit hit, vec3 v, LightSample s, out float brdfPdf) {
     return luminance(s.light * evaluateBrdfWorld(hit, hit.normal, v, s.direction, brdfPdf) * abs(cosLight));
 }
 
+bool isGlassAt(uint materialIndex, vec2 uv);
+uint primaryHitIndex(ivec2 pixel);
+
 // Whether a candidate hit stops a ray the way it stops shadow rays (see shadowTransmittance): holes of cut-outs
 // (by chance, for see-through ones) and glass let it through.
 bool blocksLight(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
@@ -1638,7 +1692,12 @@ bool blocksLight(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
     if (opacity < 1.0 && (opacity <= 0.0 || randomFloat(seed) >= opacity)) {
         return false;
     }
-    Material material = materials[mesh.materialIndex];
+    return !isGlassAt(mesh.materialIndex, uv);
+}
+
+// Glass: lets light through without being metal (shadow rays and the BRDF candidates' rays pass it)
+bool isGlassAt(uint materialIndex, vec2 uv) {
+    Material material = materials[materialIndex];
     float transmission = material.transmission;
     if (transmission > 0.0 && material.transmissionTexture >= 0) {
         transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
@@ -1647,7 +1706,39 @@ bool blocksLight(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
     if (transmission > 0.0 && material.metallicRoughnessTexture >= 0) {
         metallic *= sampleTextureFull(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
     }
-    return transmission <= 0.0 || metallic >= 1.0;
+    return transmission > 0.0 && metallic < 1.0;
+}
+
+bool isGlassHit(Intersection hit) {
+    MeshInfo mesh = meshInfos[hit.meshIndex];
+    if (materials[mesh.materialIndex].transmission <= 0.0) {
+        return false;  // almost every hit: no vertex or texture reads
+    }
+    uint firstIndex = mesh.indexOffset + uint(hit.primitive) * 3;
+    vec2 uv0 = vertices[mesh.vertexOffset + indices[firstIndex + 0]].uv;
+    vec2 uv1 = vertices[mesh.vertexOffset + indices[firstIndex + 1]].uv;
+    vec2 uv2 = vertices[mesh.vertexOffset + indices[firstIndex + 2]].uv;
+    vec2 uv = uv0 * (1.0 - hit.barycentrics.x - hit.barycentrics.y) + uv1 * hit.barycentrics.x
+              + uv2 * hit.barycentrics.y;
+    return isGlassAt(mesh.materialIndex, uv);
+}
+
+// The image path's first bounce at this pixel's ReSTIR surface (see BounceHit). bounces = false: the path ends.
+void storeBounceHit(bool bounces, bool found, Intersection hit, vec3 direction, vec3 weight, float pdf,
+                    float lobeRoughness, bool transmitted, bool specularLobe) {
+    BounceHit stored;
+    stored.meshIndex = !bounces ? BOUNCE_NONE : found ? hit.meshIndex : ~0u;
+    stored.instanceIndex = hit.instanceIndex;
+    stored.primitive = hit.primitive;
+    stored.barycentrics = hit.barycentrics;
+    stored.t = hit.t;
+    stored.direction = direction;
+    stored.weightRG = packHalf2x16(weight.rg);
+    stored.weightBRoughness = (packHalf2x16(vec2(weight.b, 0.0)) & 0xFFFFu)
+                              | (uint(round(clamp(lobeRoughness, 0.0, 1.0) * 255.0)) << 16)
+                              | ((transmitted ? 1u : 0u) << 24) | ((specularLobe ? 2u : 0u) << 24);
+    stored.pdf = pdf;
+    bounceHits[primaryHitIndex(ivec2(gl_GlobalInvocationID.xy))] = stored;
 }
 
 // The BRDF candidates' ray: the first surface that isn't glass. Through glass like the shadow rays, so the BRDF
@@ -1719,17 +1810,39 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             vec3 l, weight;
             float pdf, lobeRoughness;
             bool transmitted, specularLobe;
+            Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0);
             if (!sampleBrdf(hit, toLocal(frame, v), seed, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
+                if (i == lightCandidates) {
+                    storeBounceHit(false, false, none, vec3(0.0), vec3(0.0), 0.0, 0.0, false, false);
+                }
                 continue;
             }
             vec3 direction = toWorld(frame, l);
             float side = dot(direction, hit.geometricNormal);
+            // The first BRDF candidate's ray is also the image path's first bounce: traced like a path ray (it
+            // stops at glass) and stored, so the image pass doesn't trace its own (part C4)
+            bool pathBounce = i == lightCandidates;
             if (l.z < 0.0 ? side >= 0.0 : side <= 0.0) {
+                if (pathBounce) {
+                    storeBounceHit(false, false, none, direction, weight, pdf, lobeRoughness, transmitted, specularLobe);
+                }
                 continue;  // on the wrong side of the real triangle (see tracePath)
             }
             Intersection found;
             vec3 origin = hit.position + hit.geometricNormal * (side < 0.0 ? -0.001 : 0.001);
-            if (intersectTowardsLight(origin, direction, seed, found)) {
+            bool foundSurface;
+            if (pathBounce) {
+                foundSurface = intersectClosest(origin, direction, seed, found);
+                storeBounceHit(true, foundSurface, found, direction, weight, pdf, lobeRoughness, transmitted,
+                               specularLobe);
+                // The candidate goes on through glass, as shadow rays do (rare: one more ray)
+                if (foundSurface && isGlassHit(found)) {
+                    foundSurface = intersectTowardsLight(origin + direction * found.t, direction, seed, found);
+                }
+            } else {
+                foundSurface = intersectTowardsLight(origin, direction, seed, found);
+            }
+            if (foundSurface) {
                 int firstLight = instanceFirstLight[found.instanceIndex];
                 if (triangles == 0 || firstLight < 0) {
                     continue;
@@ -1799,6 +1912,64 @@ float restirTargetOf(Reservoir r, Hit hit, vec3 v) {
     return restirTarget(hit, v, s, brdfPdf);
 }
 
+// A reservoir's sample without the surface it lights: what restirLightSample looks up (the triangle, its emission
+// texture, the sky map), once, for targets at several surfaces (restirTargetAt). The spatial pass needs 3k + 1
+// targets of only k + 1 samples.
+struct RestirLightPoint {
+    uint kind;        // LIGHT_KIND_*
+    uint index;       // punctual lights: which
+    vec3 position;    // triangles: the point; the sky: the direction towards it
+    vec3 normal;      // triangles'
+    vec3 emission;    // triangles: the emitted light; the sky: its light
+};
+
+RestirLightPoint restirLightPoint(Reservoir r) {
+    RestirLightPoint p;
+    p.kind = r.light >> 30;
+    p.index = r.light & 0x3FFFFFFFu;
+    p.position = vec3(0.0);
+    p.normal = vec3(0.0, 1.0, 0.0);
+    p.emission = vec3(0.0);
+    if (p.kind == LIGHT_KIND_TRIANGLE) {
+        EmissiveTriangle triangle = emissiveTriangles[p.index];
+        vec2 bary = unpackUnorm2x16(r.point);
+        vec3 weights = vec3(max(1.0 - bary.x - bary.y, 0.0), bary);
+        p.position = triangle.p0 * weights.x + triangle.p1 * weights.y + triangle.p2 * weights.z;
+        p.normal = normalize(cross(triangle.p1 - triangle.p0, triangle.p2 - triangle.p0));
+        p.emission = emissionAt(triangle.materialIndex,
+                                triangle.uv0 * weights.x + triangle.uv1 * weights.y + triangle.uv2 * weights.z);
+    } else if (p.kind == LIGHT_KIND_SKY) {
+        p.position = decodeSkyPoint(r.point);
+        p.emission = environmentLight(p.position);
+    }
+    return p;
+}
+
+// restirTargetOf from a looked-up sample (the same value)
+float restirTargetAt(RestirLightPoint p, Hit hit, vec3 v) {
+    vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+    LightSample s = noLightSample();
+    if (p.kind == LIGHT_KIND_TRIANGLE) {
+        vec3 toLight = p.position - surfacePoint;
+        float distance = length(toLight);
+        s.direction = toLight / distance;
+        float cosLight = abs(dot(p.normal, s.direction));
+        if (cosLight <= 1e-6) {
+            return 0.0;
+        }
+        s.light = p.emission * (cosLight / (distance * distance));
+    } else if (p.kind == LIGHT_KIND_PUNCTUAL) {
+        s = punctualLightSample(punctualLights[p.index], surfacePoint);
+    } else if (p.kind == LIGHT_KIND_SKY) {
+        s.direction = p.position;
+        s.light = p.emission;
+    } else {
+        return 0.0;
+    }
+    float brdfPdf;
+    return restirTarget(hit, v, s, brdfPdf);
+}
+
 // ---------------------------------------------------------------------------------------------
 
 // DLSS inputs
@@ -1822,15 +1993,15 @@ vec2 motionVector(vec4 current, vec4 previous) {
     return projectToPixel(scene.previousViewProjection, previous) - projectToPixel(scene.viewProjection, current);
 }
 
-// Rays that hit nothing: far away, moving only with the camera's rotation. Diffuse albedo 1, so the sky's light
-// passes unchanged if DLSS divides by it. The normal faces the camera (DLSS wants a normalized one).
+// Rays that hit nothing: far away, moving only with the camera's rotation. The other guides as DLSS RR's guide
+// recommends for the sky: albedo 0.5, no specular, normal and roughness 0, the largest half float as hit distance.
 void storeSkyGuides(ivec2 pixel, vec3 direction) {
     imageStore(linearDepthImage, pixel, vec4(scene.farDistance));
     imageStore(motionVectorImage, pixel, vec4(motionVector(vec4(direction, 0.0), vec4(direction, 0.0)), 0.0, 0.0));
-    imageStore(diffuseAlbedoImage, pixel, vec4(1.0));
+    imageStore(diffuseAlbedoImage, pixel, vec4(0.5, 0.5, 0.5, 1.0));
     imageStore(specularAlbedoImage, pixel, vec4(0.0, 0.0, 0.0, 1.0));
-    imageStore(normalRoughnessImage, pixel, vec4(-direction, 1.0));
-    imageStore(specularHitDistanceImage, pixel, vec4(0.0));
+    imageStore(normalRoughnessImage, pixel, vec4(0.0));
+    imageStore(specularHitDistanceImage, pixel, vec4(65504.0));
 }
 
 // The first surface. The albedos split its response the way evaluateBrdf does: the diffuse layer gets what the
@@ -1846,6 +2017,13 @@ void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction) {
     vec3 diffuseAlbedo = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * (1.0 - hit.transmission)
                          * mix(hit.albedo, hit.diffuseTransmissionColor, hit.diffuseTransmission);
     vec3 specularAlbedo = mix(vec3(energy.dielectricAlbedo), energy.metalAlbedo, hit.metallic) + base * hit.transmission;
+    // Glowing surfaces: white, no specular. DLSS divides the light by the albedo and multiplies it back; a lamp's
+    // own light divided by its (often dark) material color became a huge, noisy value. Bistro at night (DLAA):
+    // 54% less error after 8 frames, 23% after 64, the fairy lights less smeared in motion.
+    if (luminance(hit.emissive) > 0.0) {
+        diffuseAlbedo = vec3(1.0);
+        specularAlbedo = vec3(0.0);
+    }
     imageStore(diffuseAlbedoImage, pixel, vec4(diffuseAlbedo, 1.0));
     imageStore(specularAlbedoImage, pixel, vec4(specularAlbedo, 1.0));
     imageStore(normalRoughnessImage, pixel, vec4(hit.normal, hit.roughness));
@@ -2007,7 +2185,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     int previousVertex = -1;
     bool endInCache = false;     // image paths: the cell of this surface has its indirect light
     vec3 cachedLight = vec3(0.0);
-#define ADD_LIGHT_EXCEPT(light, skipped) { vec3 light_ = (light); radiance += light_; \
+    // Reflections so far (passes through glass don't count): light found at a hit has made this many, light
+    // reflected by the current surface one more (clampBounceLight)
+    uint reflections = 0;
+#define ADD_LIGHT_EXCEPT(light, skipped) { vec3 light_ = (light); radiance += clampBounceLight(light_, clampDepth); \
         if (CACHE_UPDATE_PASS != 0) { for (int i_ = 0; i_ < int(cacheVertices); i_++) { \
             if (i_ != (skipped)) { cacheLight[i_] += light_ * cacheInverseThroughput[i_]; } } } }
 #define ADD_LIGHT(light) ADD_LIGHT_EXCEPT(light, -1)
@@ -2040,17 +2221,28 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // sampling can find (glowing triangles, punctual lights, the sampled sky), behind glass or not. Its bounce ray
     // then counts only what light sampling can't pick.
     bool restirReflection = false;
+    // The first bounce was picked and traced by the RESTIR_PASS (its BRDF candidate, see BounceHit)
+    bool sharedBounce = false;
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
     // by bouncing would be one bounce short, and the methods wouldn't agree.
     for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
+        uint clampDepth = reflections;  // light found at this hit (the sky, the sun, a glowing surface)
         // (not traceClosest: one copy of the code that builds a Hit, called once here, keeps the shader smaller)
         Intersection intersection;
         bool found;
         if (bounce == 0 && usePrimaryHit) {
             found = loadPrimaryHit(pixel, seed, intersection);
+        } else if (bounce == 1 && sharedBounce) {
+            BounceHit stored = bounceHits[primaryHitIndex(pixel)];
+            found = stored.meshIndex != ~0u;
+            intersection.meshIndex = stored.meshIndex;
+            intersection.instanceIndex = stored.instanceIndex;
+            intersection.primitive = stored.primitive;
+            intersection.barycentrics = stored.barycentrics;
+            intersection.t = stored.t;
         } else {
             found = intersectClosest(origin, direction, seed, intersection);
         }
@@ -2062,7 +2254,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         previousVertex = currentVertex;
         currentVertex = -1;
         if (bounce == 1 && firstBounceSpecular) {
-            imageStore(specularHitDistanceImage, pixel, vec4(hit.found ? hit.t : scene.farDistance));
+            imageStore(specularHitDistanceImage, pixel, vec4(hit.found ? hit.t : 65504.0));  // the sky: as above
         }
 
         if (!hit.found) {
@@ -2185,6 +2377,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // once in the compiled shader. In world space: a shading frame would take 9 more registers across the
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
+            clampDepth = reflections + 1;  // light this surface reflects
             uint lightSlots = restirVertex && scene.restirPunctualCandidates > 0 ? 3 : 3 + punctualLightSamples();
             [[dont_unroll]] for (uint slot = 0; slot < lightSlots; slot++) {
                 LightSample s = noLightSample();
@@ -2248,6 +2441,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 if (s.shadowed) {
                     vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
                     transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
+                    // The reservoir's sample is blocked: kept with W = 0, so every sample handed on to the next
+                    // frame is known to be seen from its own surface (restirTemporal counts on that)
+                    if (restirVertex && slot == 2 && all(equal(transmittance, vec3(0.0)))) {
+                        reservoirs[restirIndex(pixel, false)].W = 0.0;
+                    }
                 }
                 // Behind glass, bounce rays don't find the light (they are bent), so the shadow ray counts it fully.
                 // Ending in the cache, no bounce ray looks for it either.
@@ -2261,7 +2459,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             }
 
             if (endInCache) {
-                radiance += throughput * cachedLight;  // all the light reflected here that came via other surfaces
+                // all the light reflected here that came via other surfaces
+                radiance += clampBounceLight(throughput * cachedLight, reflections + 2);
                 break;
             }
         }
@@ -2278,6 +2477,22 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 break;
             }
             transmitted = true;  // in or out, the path stays "through glass" for the light rules above
+        } else if (restirVertex && scene.restirBrdfCandidates > 0 && scene.accumulate == 0) {
+            // Picked and traced already: the ReSTIR pass's BRDF candidate (same sampling, its own random numbers).
+            // Not when accumulating: the bounce then shares its direction with the light choice, which changes how
+            // the noise averages out over frames (Sponza: the same single-frame error, but 29% more after 8 frames,
+            // 13% after 64, equal after 512; no bias). Under DLSS it is as good or better, and saves a ray.
+            BounceHit stored = bounceHits[primaryHitIndex(pixel)];
+            if (stored.meshIndex == BOUNCE_NONE) {
+                break;
+            }
+            sharedBounce = true;
+            l = toLocal(frame, stored.direction);
+            weight = vec3(unpackHalf2x16(stored.weightRG), unpackHalf2x16(stored.weightBRoughness).x);
+            bouncePdf = stored.pdf;
+            lobeRoughness = float((stored.weightBRoughness >> 16) & 0xFFu) / 255.0;
+            transmitted = (stored.weightBRoughness & (1u << 24)) != 0u;
+            specularLobe = (stored.weightBRoughness & (2u << 24)) != 0u;
         } else {
             // Indirect light: continue the path in a direction picked by the surface's reflection (mostly where
             // it reflects the most light), or through it. The throughput is multiplied by BRDF * cos / pdf.
@@ -2294,7 +2509,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         if (bounce == 0 && wantGuides) {
             firstBounceSpecular = specularLobe;
         }
-        direction = toWorld(frame, l);
+        direction = sharedBounce && bounce == 0 ? bounceHits[primaryHitIndex(pixel)].direction : toWorld(frame, l);
         // Around the smooth normal, a direction can still end up on the wrong side of the actual triangle.
         // Such a path ends: on the real surface, this light would be blocked.
         bool throughSurface = l.z < 0.0;
@@ -2312,6 +2527,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             throughGlass = false;
             throughSolidGlass = false;
             reflectedOnce = true;
+            reflections++;
             restirReflection = restirVertex;
             reflectionPdf = bouncePdf;
             reflectionPosition = hit.position;
@@ -2444,9 +2660,11 @@ bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
 // frame's camera. Targets ignore what blocks the light. That's a bias: a sample this frame's surface sees but last
 // frame's doesn't (last frame's ray hit elsewhere in the pixel, close to a shadow's edge) gets a share of its MIS
 // weight for last frame's surface, which could never have produced it: too dark near shadow edges (Sponza with the
-// sky: 3.7%, taking history from up to 3 pixels away). With restirTemporal = 2 (the default), both targets at last frame's surface include whether it sees the sample
-// (a shadow ray each): last frame's own sample needs one too, it may come from older frames and never have been
-// tested from there. Then the weights add up to 1 for every sample either surface can produce: no bias.
+// sky: 3.7%, taking history from up to 3 pixels away). With restirTemporal = 2 (the default), both targets at last
+// frame's surface include whether it sees the sample. This frame's sample needs a shadow ray from there. Last
+// frame's own sample doesn't: it may come from older frames, but the image pass tested it from that surface and
+// set W = 0 if blocked (without that test the merge came out too bright: Sponza +2.6%). Then the weights add up to
+// 1 for every sample either surface can produce: no bias.
 Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
     if (scene.restirTemporal == 0 || scene.restirHistoryValid == 0) {
         return r;
@@ -2512,10 +2730,8 @@ Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
         currentThere = 0.0;
     }
     float previousHere = restirTargetOf(previous, hit, v);
-    float previousThere = restirTargetOf(previous, previousHit, previousV);
-    if (scene.restirTemporal == 2 && previousThere > 0.0 && previous.W > 0.0 && !restirVisible(previous, previousHit, seed)) {
-        previousThere = 0.0;
-    }
+    // Last frame's own sample needs no ray: the image pass tested it from that surface and set W = 0 if blocked
+    float previousThere = previous.W > 0.0 ? restirTargetOf(previous, previousHit, previousV) : 0.0;
     float currentSum = r.M * currentHere + previousM * currentThere;
     float previousSum = r.M * previousHere + previousM * previousThere;
     float currentWeight = currentSum > 0.0 ? r.M * currentHere / currentSum * currentHere * r.W : 0.0;
@@ -2556,7 +2772,9 @@ void restirPass(ivec2 pixel, ivec2 size) {
             // not depend on which light was picked)
             uint candidateSeed = pcgHash(seed ^ 0x9e3779b9u);
             reservoir = restirCandidates(hit, -direction, candidateSeed);
-            // Visibility reuse: a blocked sample gets W = 0, so it isn't passed on to the next frame (or neighbors)
+            // Visibility reuse: a blocked sample gets W = 0, so it isn't passed on to the next frame (or neighbors).
+            // Before the merge, not after: tested only after it, a blocked fresh candidate could win over a visible
+            // history sample, and that history would be lost (part C3: 1.7-3.7x the single-frame error)
             if (reservoir.W > 0.0) {
                 vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
                 float toSolidAngle;
@@ -2574,7 +2792,213 @@ void restirPass(ivec2 pixel, ivec2 size) {
             restirSurfaces[restirIndex(pixel, false)] = packRestirSurface(hit);
         }
     }
-    reservoirs[restirIndex(pixel, false)] = reservoir;
+    reservoirs[restirSpatialOn() ? restirTemporalIndex(pixel) : restirIndex(pixel, false)] = reservoir;
+}
+
+// The number of candidates a reservoir starts with (its M before any reuse)
+float restirFreshCount() {
+    return float(scene.restirTriangleCandidates + scene.restirPunctualCandidates + scene.restirSkyCandidates
+                 + scene.restirBrdfCandidates);
+}
+
+// A neighbor of the spatial pass: the n-th point of the R2 sequence (Roberts 2018) in a disc of restirSpatialRadius,
+// shifted by the pixel's random start (per pixel and frame). Evenly spread, few duplicates; (0, 0) for none.
+ivec2 restirNeighborOffset(uint n, vec2 start) {
+    vec2 u = fract(start + float(n + 1) * vec2(0.7548776662, 0.5698402910));
+    float radius = scene.restirSpatialRadius * sqrt(u.x);
+    float angle = 2.0 * PI * u.y;
+    return ivec2(round(radius * vec2(cos(angle), sin(angle))));
+}
+
+// The canonical sample's MIS weight (see restirSpatial) with visibility: a neighbor whose surface doesn't see the
+// sample could never have produced it (its own sample was dropped if blocked), so its comparison goes wholly to the
+// canonical reservoir. One shadow ray per neighbor whose target there isn't 0.
+float restirSpatialCanonicalMis(Reservoir canonical, RestirLightPoint canonicalPoint, float canonicalHere,
+                                float canonicalM, float mSum, ivec2 pixel, vec2 start, uint used, uint wanted,
+                                inout uint seed) {
+    float mis = 0.0;
+    for (uint n = 0; n < wanted; n++) {
+        if ((used & (1u << n)) == 0u) {
+            continue;
+        }
+        ivec2 neighbor = pixel + restirNeighborOffset(n, start);
+        float M = reservoirs[restirTemporalIndex(neighbor)].M;
+        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
+        float canonicalThere = restirTargetAt(canonicalPoint, surface, normalize(scene.cameraPosition.xyz - surface.position));
+        if (canonicalThere > 0.0 && !restirVisible(canonical, surface, seed)) {
+            canonicalThere = 0.0;
+        }
+        mis += (M + canonicalM) / mSum * canonicalM * canonicalHere / (M * canonicalThere + canonicalM * canonicalHere);
+    }
+    return mis;
+}
+
+// RESTIR_PASS = 2: spatial reuse. The pixel's reservoir (after the temporal merge) and those of a few pixels nearby,
+// resampled for this pixel's surface. A neighbor is used if its surface is like this one: as in restirTemporal
+// (shading normals within 60 degrees, view depths within 10%), plus roughness within 0.25 (a glossy and a rough
+// surface want different lights). A rejected one isn't replaced: the cost stays fixed. Pixels that found no history
+// (just uncovered) take more neighbors (restirDisocclusionNeighbors).
+//
+// MIS: pairwise (Bitterli 2022; Lin et al. 2022). Instead of comparing every reservoir with every other one (the
+// generalized balance heuristic of restirTemporal: (k + 1)^2 targets), each of the k neighbors is compared only with
+// the pixel's own ("canonical") reservoir c. With p_j the target at reservoir j's surface and M_j its count:
+//     neighbor i's sample x:  m_i(x) = s_i * M_i p_i(x) / (M_i p_i(x) + M_c/k p_c(x))
+//     the canonical sample:   m_c(x) = sum over i of s_i * M_c/k p_c(x) / (M_i p_i(x) + M_c/k p_c(x))
+// with s_i = (M_i + M_c/k) / (M_c + the sum of the M_i). They add up to 1 for every x, and with equal targets each
+// reservoir's weight is its share of the M, as with the balance heuristic. 3k + 1 targets (of k + 1 samples, each
+// looked up once: restirLightPoint). All surfaces are this
+// frame's, seen by this frame's camera.
+//
+// Targets ignore what blocks the light. That's a bias near shadows: a neighbor that can't see the canonical sample
+// still takes a share of its MIS weight, as if it could have produced it (Sponza with the sky: 1.6% too dark with
+// neighbors within 3 pixels, 4.7% within 10, 9.7% within 30). With restirSpatialVisibility the kept sample's MIS
+// weight includes visibility, and W is scaled by its weight with visibility / without. Picking with the weights
+// without visibility is fine: the result's expected value is the sum over the reservoirs of (weight with
+// visibility) * (light) / (target), whichever way they are picked, as long as no weight with visibility is > 0 where
+// the one without is 0. The weights with visibility: each target times whether its surface sees the sample. A kept
+// neighbor sample needs no ray from here (if this surface doesn't see it, the image pass's shadow ray finds no light
+// whatever its weight), but one from the neighbor's surface: a sample from that pixel's history was tested from last
+// frame's surface, not this one (assuming it seen made Sponza 1.9% too bright). The kept canonical sample needs a ray
+// from each neighbor (restirSpatialCanonicalMis).
+void restirSpatial(ivec2 pixel, ivec2 size) {
+    uint ownIndex = restirIndex(pixel, false);
+    Reservoir canonical = reservoirs[restirTemporalIndex(pixel)];
+    if (canonical.light == RESTIR_NOT_USED) {
+        reservoirs[ownIndex] = canonical;
+        return;
+    }
+    Hit hit = unpackRestirSurface(restirSurfaces[ownIndex]);
+    vec3 v = normalize(scene.cameraPosition.xyz - hit.position);
+    float depth = dot(hit.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+    uint seed = pcgHash(pixelSeed(pixel) ^ 0x2545f491u);
+    vec2 start = vec2(randomFloat(seed), randomFloat(seed));
+    bool disoccluded = canonical.M <= restirFreshCount() + 0.5;
+    uint wanted = min(disoccluded ? max(scene.restirDisocclusionNeighbors, scene.restirSpatialNeighbors)
+                                  : scene.restirSpatialNeighbors, 16u);
+
+    // First which neighbors are used, and their M: the weights need k and the sum of the M
+    uint used = 0;
+    float k = 0.0;
+    float mSum = canonical.M;
+    for (uint n = 0; n < wanted; n++) {
+        ivec2 neighbor = pixel + restirNeighborOffset(n, start);
+        if (neighbor == pixel || any(lessThan(neighbor, ivec2(0))) || any(greaterThanEqual(neighbor, size))) {
+            continue;
+        }
+        Reservoir r = reservoirs[restirTemporalIndex(neighbor)];
+        if (r.light == RESTIR_NOT_USED) {
+            continue;
+        }
+        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
+        float neighborDepth = dot(surface.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+        if (dot(surface.normal, hit.normal) >= 0.5 && abs(neighborDepth - depth) <= 0.1 * max(neighborDepth, depth)
+                && abs(surface.roughness - hit.roughness) <= 0.25) {
+            used |= 1u << n;
+            k += 1.0;
+            mSum += r.M;
+        }
+    }
+    if (k == 0.0) {
+        reservoirs[ownIndex] = canonical;
+        return;
+    }
+
+    float canonicalM = canonical.M / k;  // the canonical reservoir's count in each comparison
+    RestirLightPoint canonicalPoint = restirLightPoint(canonical);
+    float canonicalHere = canonical.W > 0.0 ? restirTargetAt(canonicalPoint, hit, v) : 0.0;
+    float canonicalMis = 0.0;
+    float weightSum = 0.0;
+    Reservoir result = canonical;
+    float keptTarget = canonicalHere;
+    uint keptNeighbor = 0xFFFFFFFFu;
+    for (uint n = 0; n < wanted; n++) {
+        if ((used & (1u << n)) == 0u) {
+            continue;
+        }
+        ivec2 neighbor = pixel + restirNeighborOffset(n, start);
+        Reservoir r = reservoirs[restirTemporalIndex(neighbor)];
+        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
+        vec3 neighborV = normalize(scene.cameraPosition.xyz - surface.position);
+        float share = (r.M + canonicalM) / mSum;
+        // The canonical sample's weight for this comparison
+        if (canonicalHere > 0.0) {
+            float canonicalThere = restirTargetAt(canonicalPoint, surface, neighborV);
+            canonicalMis += share * canonicalM * canonicalHere / (r.M * canonicalThere + canonicalM * canonicalHere);
+        }
+        // The neighbor's sample
+        if (r.W > 0.0) {
+            RestirLightPoint point = restirLightPoint(r);
+            float here = restirTargetAt(point, hit, v);
+            if (here > 0.0) {
+                float there = restirTargetAt(point, surface, neighborV);
+                float denominator = r.M * there + canonicalM * here;
+                float weight = denominator > 0.0 ? share * r.M * there / denominator * here * r.W : 0.0;
+                weightSum += weight;
+                if (randomFloat(seed) * weightSum < weight) {
+                    result.light = r.light;
+                    result.point = r.point;
+                    keptTarget = here;
+                    keptNeighbor = n;
+                }
+            }
+        }
+    }
+    float canonicalWeight = canonicalMis * canonicalHere * canonical.W;
+    weightSum += canonicalWeight;
+    float correction = 1.0;  // the kept sample's MIS weight with visibility / without
+    if (randomFloat(seed) * weightSum < canonicalWeight) {
+        result.light = canonical.light;
+        result.point = canonical.point;
+        keptTarget = canonicalHere;
+        if (scene.restirSpatialVisibility != 0) {
+            correction = restirSpatialCanonicalMis(canonical, canonicalPoint, canonicalHere, canonicalM, mSum, pixel,
+                                                   start, used, wanted, seed) / canonicalMis;
+        }
+    } else if (scene.restirSpatialVisibility != 0 && keptNeighbor != 0xFFFFFFFFu) {
+        // A kept neighbor sample: its own surface may not see it. Then that reservoir's weight for it is 0.
+        ivec2 neighbor = pixel + restirNeighborOffset(keptNeighbor, start);
+        if (!restirVisible(result, unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]), seed)) {
+            correction = 0.0;
+        }
+    }
+    result.W = keptTarget > 0.0 && weightSum > 0.0 ? weightSum * correction / keptTarget : 0.0;
+    result.M = mSum;
+    reservoirs[ownIndex] = result;
+}
+
+// Debug view "ReSTIR light": the kind of light each pixel's sample is on. Glowing triangle: orange, punctual light:
+// purple, sky: blue, none found: dark red, blocked (W = 0, set by the image pass's shadow ray): black. Grey: no ReSTIR.
+vec3 restirDebugLight(ivec2 pixel) {
+    if (scene.restirDi == 0) {
+        return vec3(0.05);
+    }
+    Reservoir r = reservoirs[restirIndex(pixel, false)];
+    if (r.light == RESTIR_NOT_USED) {
+        return vec3(0.05);
+    }
+    uint kind = r.light >> 30;
+    if (kind == LIGHT_KIND_NONE) {
+        return vec3(0.3, 0.0, 0.0);
+    }
+    if (!(r.W > 0.0)) {
+        return vec3(0.0);
+    }
+    return kind == LIGHT_KIND_TRIANGLE ? vec3(1.0, 0.5, 0.1) : kind == LIGHT_KIND_PUNCTUAL ? vec3(0.7, 0.2, 1.0)
+                                                                                         : vec3(0.2, 0.5, 1.0);
+}
+
+// Debug view "ReSTIR M": how many candidates each pixel's reservoir stands for, relative to one frame's (log scale):
+// red = this frame's only (no history, no neighbors), through yellow and green to blue = 64 x. Grey: no ReSTIR there.
+vec3 restirDebugM(ivec2 pixel) {
+    if (scene.restirDi == 0) {
+        return vec3(0.05);
+    }
+    Reservoir r = reservoirs[restirIndex(pixel, false)];
+    if (r.light == RESTIR_NOT_USED) {
+        return vec3(0.05);
+    }
+    float t = clamp(log2(max(r.M, 1.0) / max(restirFreshCount(), 1.0)) / 6.0, 0.0, 1.0);
+    return clamp(abs(fract(t * 0.66 + vec3(0.0, 2.0, 1.0) / 3.0) * 6.0 - 3.0) - 1.0, 0.0, 1.0);  // hue: red to blue
 }
 
 void main() {
@@ -2587,13 +3011,21 @@ void main() {
     if (pixel.x >= size.x || pixel.y >= size.y) {
         return;  // the last tiles can stick out past the image edge
     }
-    if (RESTIR_PASS != 0) {
+    if (RESTIR_PASS == 1) {
         restirPass(pixel, size);
+        return;
+    }
+    if (RESTIR_PASS == 2) {
+        restirSpatial(pixel, size);
         return;
     }
 
     uint seed = pixelSeed(pixel);
 
+    if (scene.debugView == 12 || scene.debugView == 13) {
+        imageStore(radianceImage, pixel, vec4(scene.debugView == 12 ? restirDebugM(pixel) : restirDebugLight(pixel), 1.0));
+        return;
+    }
     if (scene.debugView != 0) {
         vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed);
         imageStore(radianceImage, pixel, vec4(color, 1.0));

@@ -608,6 +608,17 @@ void Application::buildRenderModeUi() {
                           dlssCnnVersion ? "--dlss-cnn: CNN A-C, transformer D-E"
                                          : "transformer D-F; start with --dlss-cnn for the CNN models");
     }
+    ImGui::Checkbox("Clamp bounce light", &settings.clampBounceLight);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+    ImGui::SliderFloat("##bounceClamp", &settings.bounceLightClampLevel, 0.25f, 64.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("DLSS modes: one sample of light that reached the first surface via another surface adds at\n"
+                          "most this much on screen (after exposure, 1 = white before tone mapping). Rare very bright\n"
+                          "samples (a bounce ray that happens to find a lamp) otherwise stand out, and DLSS smears\n"
+                          "them over many frames: ghosting, and an image that settles slowly. Biased: a bit darker.\n"
+                          "Measured in Bistro at night: no less noise or drift, so off by default.");
+    }
     ImGui::EndDisabled();
     if (!dlssSupported) {
         ImGui::TextDisabled("DLSS unavailable: %s", dlssStatus.c_str());
