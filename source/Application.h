@@ -89,6 +89,19 @@ struct SceneUniforms {
     uint32_t restirDisocclusionNeighbors;  // as many for pixels that found no history
     uint32_t restirSpatialVisibility;      // 1 = unbiased spatial reuse (shadow rays from the neighbors' surfaces)
     float bounceLightClamp;          // 0 = off; else the most light one sample of bounce light adds (luminance)
+    uint32_t restirGi;               // 1 = ReSTIR GI: the first bounce's light at ReSTIR surfaces is a sample (GI passes)
+    float restirGiMinRoughness;      // second surfaces at least this rough give a GI sample
+    uint32_t restirGiTemporal;       // 1 = reuse last frame's GI reservoirs
+    float restirGiMaxHistory;        // last frame's GI reservoir counts for at most this many times this frame's samples
+    uint32_t restirGiMaxAge;         // GI samples older than this many frames are dropped
+    uint32_t restirGiHistoryValid;   // 0: last frame's GI reservoirs can't be used (see buildSceneUniforms)
+    uint32_t restirGiPermutation;    // 1 = shuffle last frame's pixels (offset in restirPermutation's bits 0-3)
+    uint32_t restirGiSpatialNeighbors;     // neighbors' GI reservoirs each pixel resamples; 0 (and the next 0) = none
+    float restirGiSpatialRadius;           // within this many render pixels
+    uint32_t restirGiDisocclusionNeighbors;  // as many for pixels that found no history
+    uint32_t restirGiSpatialVisibility;    // 1 = rays from the neighbors' surfaces for the kept sample
+    float restirGiBoilingFilter;     // 0 = off; else its strength (drops reservoirs far brighter than their neighbors')
+    float restirGiRadianceClamp;     // 0 = off; else the most a GI sample's light may be (luminance)
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
@@ -130,6 +143,17 @@ struct GpuReservoir {
     uint32_t point;
     float W;
     float M;
+};
+
+// Three per render pixel (this frame's, last frame's, the image pass's fresh samples), binding 29: ReSTIR GI's sample.
+// Must match GiReservoir in shaders/raytrace.comp.
+struct GpuGiReservoir {
+    glm::vec3 position;
+    uint32_t normal;
+    glm::vec3 radiance;
+    float W;
+    float M;
+    uint32_t unused;
 };
 
 // Two per render pixel, binding 27: the first surface, packed, for ReSTIR's reuse. Must match RestirSurface in
@@ -484,6 +508,27 @@ struct RenderSettings {
     float restirSpatialRadius = 30.0f;   // render pixels
     int restirDisocclusionNeighbors = 8;  // for pixels without history (just uncovered)
     bool restirSpatialVisibility = true;  // unbiased: else Sponza ends up 9.7% too dark (neighbors within 30 pixels)
+    // ReSTIR GI (RESTIR_GI_PLAN.md): light reaching the first surface via a second one. Independent of ReSTIR DI,
+    // set separately for Accumulation and the DLSS modes as it is (off in Accumulation: the reference).
+    bool restirGiAccumulation = false;
+    bool restirGiDlss = true;
+    bool& restirGi(int mode) {
+        return mode == static_cast<int>(RenderMode::Accumulation) ? restirGiAccumulation : restirGiDlss;
+    }
+    float restirGiMinRoughness = 0.0f;  // second surfaces at least this rough give samples (0: all but glass, as RTXDI)
+    bool restirGiTemporal = true;       // reuse last frame's samples
+    bool restirGiPermutation = true;    // from shuffled pixels (as DI; RTXDI's default is off, DLSS RR's guide asks for it)
+    float restirGiMaxHistory = 8.0f;    // RTXDI's default; to be set by the flicker test as DI's
+    int restirGiMaxAge = 30;            // frames (RTXDI's default)
+    bool restirGiSpatial = true;        // reuse neighbors' samples
+    int restirGiSpatialNeighbors = 2;   // RTXDI's defaults
+    float restirGiSpatialRadius = 32.0f;
+    int restirGiDisocclusionNeighbors = 4;  // for pixels without history
+    bool restirGiSpatialVisibility = true;   // rays for the kept sample: half the darkening of RTXDI's "basic" (none)
+    bool restirGiBoilingFilter = true;       // drop reservoirs far brighter than their neighbors' (RTXDI)
+    float restirGiBoilingStrength = 0.2f;    // RTXDI's default: dropped above 41 x the average
+    bool restirGiClampRadiance = false;      // limit a sample's light, set on screen as the bounce light clamp
+    float restirGiRadianceClampLevel = 8.0f; // brightness on screen (after exposure, before tone mapping)
     // DLSS modes: light that reached the first surface via another one (bounce light) is limited per sample, so a
     // rare very bright path doesn't stand out for DLSS to smear over many frames. Biased (a little darker). Off: in
     // Bistro at night (DLAA) it changed neither the noise nor how long a still image keeps changing, only made it
@@ -675,10 +720,13 @@ private:
     VkDeviceMemory reservoirMemory = VK_NULL_HANDLE;
     VkBuffer restirSurfaceBuffer = VK_NULL_HANDLE;  // GpuRestirSurface per render pixel, this frame's and last frame's
     VkDeviceMemory restirSurfaceMemory = VK_NULL_HANDLE;
+    VkBuffer giReservoirBuffer = VK_NULL_HANDLE;  // GpuGiReservoir per render pixel, three parts
+    VkDeviceMemory giReservoirMemory = VK_NULL_HANDLE;
     // Last frame's reservoirs can be reused: ReSTIR ran, at this size, with the same lights
     bool restirHistoryAvailable = false;
     bool restirLightsChanged = false;  // this frame uploads new lights (their indices may have changed)
     uint32_t restirCurrentHalf = 0;
+    bool restirGiHistoryAvailable = false;  // ReSTIR GI ran last frame, at this size
     glm::vec3 previousCameraPosition = glm::vec3(0.0f);
 
     // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
@@ -700,6 +748,9 @@ private:
     VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
     VkPipeline rtRestirPipeline;       // the same shader with RESTIR_PASS = 1: camera rays and ReSTIR DI candidates
     VkPipeline rtRestirSpatialPipeline;  // RESTIR_PASS = 2: ReSTIR DI's spatial reuse
+    VkPipeline rtRestirGiShadePipeline;  // RESTIR_PASS = 3: ReSTIR GI's shading, after the image pass
+    VkPipeline rtRestirGiTemporalPipeline;  // RESTIR_PASS = 4: ReSTIR GI's temporal reuse, before its shading
+    VkPipeline rtRestirGiSpatialPipeline;   // RESTIR_PASS = 5: ReSTIR GI's spatial reuse, between those two
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;

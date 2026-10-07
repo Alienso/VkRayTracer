@@ -264,6 +264,68 @@ void Application::buildRestirUi() {
     }
     ImGui::EndDisabled();
     ImGui::EndDisabled();
+
+    // ReSTIR GI (see RESTIR_GI_PLAN.md)
+    ImGui::SeparatorText("ReSTIR GI");
+    bool& restirGi = settings.restirGi(settings.renderMode);
+    ImGui::Checkbox(accumulation ? "ReSTIR GI (Accumulation)" : "ReSTIR GI (DLSS modes)", &restirGi);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Light reaching the first surface via another one (bounce light), at the surfaces ReSTIR DI\n"
+                          "would use (Min. roughness above): where the first bounce went and the light found there\n"
+                          "become a sample, reused by the next frame and nearby pixels. Independent of ReSTIR DI.\n"
+                          "Set separately for Accumulation (off by default: the reference) and the DLSS modes (on).");
+    }
+    ImGui::BeginDisabled(!restirGi);
+    ImGui::SliderFloat("Min. roughness (bounce)", &settings.restirGiMinRoughness, 0.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Second surfaces at least this rough give a sample (0: all but glass). The light a smooth\n"
+                          "surface sends depends on where it is seen from: reused by another pixel it is a little off.");
+    }
+    ImGui::Checkbox("Reuse last frame##gi", &settings.restirGiTemporal);
+    ImGui::BeginDisabled(!settings.restirGiTemporal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Shuffle pixels##gi", &settings.restirGiPermutation);
+    ImGui::SliderFloat("Max. history##gi", &settings.restirGiMaxHistory, 1.0f, 50.0f, "%.0f x");
+    ImGui::SliderInt("Max. age##gi", &settings.restirGiMaxAge, 1, 100, "%d frames");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Max. history: last frame's samples count for at most this many times this frame's.\n"
+                          "Max. age: a sample is dropped after this many frames (its light may be out of date).");
+    }
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Reuse neighbors##gi", &settings.restirGiSpatial);
+    ImGui::BeginDisabled(!settings.restirGiSpatial);
+    ImGui::SameLine();
+    ImGui::Checkbox("Unbiased##gispatial", &settings.restirGiSpatialVisibility);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Rays from the neighbors' surfaces for the kept sample, as ReSTIR DI's. Off (RTXDI's\n"
+                          "default): areas near occluders can come out a little too dark.");
+    }
+    ImGui::SliderInt("Neighbors##gi", &settings.restirGiSpatialNeighbors, 0, 8);
+    ImGui::SliderFloat("Radius##gi", &settings.restirGiSpatialRadius, 2.0f, 60.0f, "%.0f px");
+    ImGui::SliderInt("Neighbors (uncovered)##gi", &settings.restirGiDisocclusionNeighbors, 0, 16);
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Boiling filter", &settings.restirGiBoilingFilter);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Drops a sample that brings far more light than the others nearby, so one lucky sample\n"
+                          "doesn't spread into a blotch that lasts for frames. Stronger: drops more (takes light away).");
+    }
+    ImGui::BeginDisabled(!settings.restirGiBoilingFilter);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::SliderFloat("Strength##boiling", &settings.restirGiBoilingStrength, 0.01f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+    ImGui::Checkbox("Clamp sample light", &settings.restirGiClampRadiance);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Limits the light of one GI sample to this brightness on screen (after exposure). Fewer\n"
+                          "bright blotches, a little darker.");
+    }
+    ImGui::BeginDisabled(!settings.restirGiClampRadiance);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::SliderFloat("##giClamp", &settings.restirGiRadianceClampLevel, 0.25f, 64.0f, "%.2f",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
 }
 
 void Application::buildDebugUi() {
