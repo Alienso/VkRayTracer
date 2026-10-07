@@ -235,18 +235,30 @@ void Application::updateScene() {
         geometryUploaded = true;
         geometryDirty = false;
         builtInstances.clear();  // instances point at the old BLASes: the TLAS must be rebuilt
+        builtObjects.clear();    // and the instances remade (new mesh infos)
         dlssReset = true;        // a different scene: DLSS's history is useless
         if (rtDescriptorSet != VK_NULL_HANDLE) {
             updateRayTracingDescriptorSet();
         }
     }
 
-    // 2: objects -> TLAS instances. An object becomes one instance per part of its model.
-    frameInstances.clear();
-    frameInstanceTransforms.clear();
-    frameGpuInstances.clear();
-    frameInstanceMeshes.clear();
-    primitiveCount = 0;
+    // 2: objects -> TLAS instances. An object becomes one instance per part of its model. Only remade when an object
+    //    or a material changed, or something moved last time (its motion matrices are then out of date).
+    std::vector<BuiltObject> objects;
+    objects.reserve(sceneObjects.size());
+    for (const SceneObject& object : sceneObjects) {
+        objects.push_back({object.modelIndex, object.visible, object.originalSize, object.transform(), object.hiddenParts});
+    }
+    bool rebuild = builtWithMotion || materialsDirty || !(objects == builtObjects);
+    builtWithMotion = false;
+    if (rebuild) {
+        frameInstances.clear();
+        frameInstanceTransforms.clear();
+        frameGpuInstances.clear();
+        frameInstanceMeshes.clear();
+        primitiveCount = 0;
+        instanceUploadPending = true;
+    }
     for (SceneObject& object : sceneObjects) {
         glm::mat4 objectTransform = object.transform();
         // Motion vectors need where each point was last frame. A part's world matrix is object * fit * part,
@@ -256,8 +268,11 @@ void Application::updateScene() {
                                                        : glm::mat4(1.0f);
         object.previousTransform = objectTransform;
         object.hasPreviousTransform = true;
-        if (!object.visible) {
+        if (!rebuild || !object.visible) {
             continue;
+        }
+        if (motion != glm::mat4(1.0f)) {
+            builtWithMotion = true;
         }
 
         const SceneModel& model = sceneModels[object.modelIndex];
@@ -274,8 +289,8 @@ void Application::updateScene() {
             instance.instanceShaderBindingTableRecordOffset = 0;
             instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             // Cut-out (alpha) materials are "not opaque": every ray asks the shader whether a hit on them counts.
-            // Everything else stays on the fast path where the hardware decides alone. Read every frame, so
-            // switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
+            // Everything else stays on the fast path where the hardware decides alone. A material change remakes
+            // the instances, so switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
             const Material& material = sceneMaterials[meshInfos[part.meshIndex].materialIndex].material;
             instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
                                                      : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
@@ -287,6 +302,9 @@ void Application::updateScene() {
             frameInstanceMeshes.push_back(part.meshIndex);
             primitiveCount += meshInfos[part.meshIndex].indexCount / 3;
         }
+    }
+    if (rebuild) {
+        builtObjects = std::move(objects);
     }
 
     // 3: not enough room in the TLAS -> make a bigger one. Its handle changes, so the descriptor set
@@ -303,9 +321,9 @@ void Application::updateScene() {
     }
 
     // 4: anything moved (or appeared/disappeared)? Then the TLAS gets rebuilt in this frame's command buffer.
-    if (frameInstances.size() != builtInstances.size() ||
+    if (rebuild && (frameInstances.size() != builtInstances.size() ||
         std::memcmp(frameInstances.data(), builtInstances.data(),
-                    frameInstances.size() * sizeof(VkAccelerationStructureInstanceKHR)) != 0) {
+                    frameInstances.size() * sizeof(VkAccelerationStructureInstanceKHR)) != 0)) {
         tlasDirty = true;
     }
 
@@ -497,13 +515,18 @@ void Application::buildSceneUi() {
 
         if (model.parts.size() > 1 && ImGui::TreeNode("parts", "Parts (%zu)", model.parts.size())) {
             object.hiddenParts.resize(model.parts.size(), false);
-            for (size_t p = 0; p < model.parts.size(); p++) {
-                ImGui::PushID(static_cast<int>(p));
-                bool visible = !object.hiddenParts[p];
-                if (ImGui::Checkbox(sceneMeshes[model.parts[p].meshIndex].name.c_str(), &visible)) {
-                    object.hiddenParts[p] = !visible;
+            // Only the rows in view are drawn: scenes with vegetation have millions of parts
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(model.parts.size()));
+            while (clipper.Step()) {
+                for (int p = clipper.DisplayStart; p < clipper.DisplayEnd; p++) {
+                    ImGui::PushID(p);
+                    bool visible = !object.hiddenParts[p];
+                    if (ImGui::Checkbox(sceneMeshes[model.parts[p].meshIndex].name.c_str(), &visible)) {
+                        object.hiddenParts[p] = !visible;
+                    }
+                    ImGui::PopID();
                 }
-                ImGui::PopID();
             }
             ImGui::TreePop();
         }

@@ -244,9 +244,9 @@ static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructu
 void Application::createTopLevelAccelerationStructure(uint32_t capacity) {
     tlasCapacity = capacity;
 
-    // Per instance: last frame's position from this frame's (motion vectors) and its matrices, filled every frame
-    createBuffer(sizeof(GpuInstance) * capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, instanceDataBuffer, instanceDataMemory);
+    // Per instance: last frame's position from this frame's (motion vectors) and its matrices, uploaded when they change
+    createStreamedBuffer(instanceData, sizeof(GpuInstance) * capacity);
+    instanceUploadPending = true;  // the new buffer is empty
 
     // Instance buffers stay mapped: the CPU writes the instances right before the build is recorded.
     instanceBuffers.resize(Configuration::maxFramesInFlight);
@@ -277,8 +277,7 @@ void Application::createTopLevelAccelerationStructure(uint32_t capacity) {
 
 void Application::destroyTopLevelAccelerationStructure() {
     destroyAccelerationStructure(tlas);
-    vkDestroyBuffer(device, instanceDataBuffer, nullptr);
-    vkFreeMemory(device, instanceDataMemory, nullptr);
+    destroyStreamedBuffer(instanceData);
     vkDestroyBuffer(device, tlasScratchBuffer, nullptr);
     vkFreeMemory(device, tlasScratchMemory, nullptr);
     for (size_t i = 0; i < instanceBuffers.size(); i++) {
@@ -524,7 +523,7 @@ void Application::updateRayTracingDescriptorSet() {
     VkDescriptorBufferInfo emissiveTriangleInfo{emissiveTriangleBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo instanceLightInfo{instanceLightBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo specularAlbedoInfo{specularAlbedoBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo instanceDataInfo{instanceDataBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo instanceDataInfo{instanceData.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo guideInfos[5] = {
             {VK_NULL_HANDLE, motionVectorImage.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, diffuseAlbedoImage.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1104,36 +1103,14 @@ void Application::writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index) 
                         currentFrame * timestampsPerFrame + index);
 }
 
-// frameGpuInstances -> instanceDataBuffer. Like the uniforms, through the command buffer (vkCmdUpdateBuffer,
-// at most 64 KB per call), after the previous frame's shader is done reading it.
+// frameGpuInstances -> instanceData, when updateScene remade them (after the previous frame's shader is done reading)
 void Application::recordInstanceUpload(VkCommandBuffer commandBuffer) {
-    if (frameGpuInstances.empty()) {
+    if (!instanceUploadPending || frameGpuInstances.empty()) {
         return;
     }
-    VkBufferMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.buffer = instanceDataBuffer;
-    barrier.offset = 0;
-    barrier.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 1, &barrier, 0, nullptr);
-
-    const VkDeviceSize totalSize = sizeof(GpuInstance) * frameGpuInstances.size();
-    const VkDeviceSize chunkSize = 65536;
-    const char* data = reinterpret_cast<const char*>(frameGpuInstances.data());
-    for (VkDeviceSize offset = 0; offset < totalSize; offset += chunkSize) {
-        vkCmdUpdateBuffer(commandBuffer, instanceDataBuffer, offset, std::min(chunkSize, totalSize - offset),
-                          data + offset);
-    }
-
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, nullptr, 1, &barrier, 0, nullptr);
+    recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(),
+                         sizeof(GpuInstance) * frameGpuInstances.size());
+    instanceUploadPending = false;
 }
 
 void Application::cleanupRayTracing() {

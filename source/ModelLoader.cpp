@@ -3,8 +3,8 @@
 //
 // A glTF file is a tree of nodes. Each node has a transform and may point at a mesh; a mesh is a list of
 // primitives (triangles + one material). We turn every primitive into one Mesh and every node that uses
-// a mesh into instances, with the node's transform multiplied down from its parents. Nodes with a light
-// (KHR_lights_punctual) become PunctualLights the same way.
+// a mesh into instances, with the node's transform multiplied down from its parents (EXT_mesh_gpu_instancing: one
+// per entry of the node's instance arrays). Nodes with a light (KHR_lights_punctual) become PunctualLights the same way.
 // Materials and the images they use are loaded along the way; images are decoded with stb_image.
 //
 
@@ -14,6 +14,8 @@
 
 #include "ModelLoader.h"
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
@@ -785,7 +787,41 @@ static void addNodeInstances(const cgltf_data* data, const cgltf_node* node, con
     cgltf_node_transform_local(node, local);  // column major, like glm
     glm::mat4 transform = parentTransform * glm::make_mat4(local);
 
-    if (node->mesh) {
+    if (node->mesh && node->has_mesh_gpu_instancing) {
+        // EXT_mesh_gpu_instancing: the mesh once per entry of the node's TRANSLATION / ROTATION / SCALE arrays (each
+        // may be missing), placed by node transform * T * R * S. For scenes with many copies (vegetation).
+        std::vector<float> translations, rotations, scales;
+        size_t count = 0;
+        for (cgltf_size i = 0; i < node->mesh_gpu_instancing.attributes_count; i++) {
+            const cgltf_attribute& attribute = node->mesh_gpu_instancing.attributes[i];
+            std::string name = attribute.name ? attribute.name : "";
+            count = attribute.data->count;
+            if (name == "TRANSLATION") {
+                translations = readFloats(attribute.data);
+            } else if (name == "ROTATION") {
+                rotations = readFloats(attribute.data);  // x, y, z, w
+            } else if (name == "SCALE") {
+                scales = readFloats(attribute.data);
+            }
+        }
+        size_t gltfMeshIndex = node->mesh - data->meshes;
+        for (size_t k = 0; k < count; k++) {
+            glm::mat4 instance(1.0f);
+            if (!translations.empty()) {
+                instance = glm::translate(instance, glm::make_vec3(&translations[k * 3]));
+            }
+            if (!rotations.empty()) {
+                const float* q = &rotations[k * 4];
+                instance *= glm::mat4_cast(glm::normalize(glm::quat(q[3], q[0], q[1], q[2])));  // glm: w first
+            }
+            if (!scales.empty()) {
+                instance = glm::scale(instance, glm::make_vec3(&scales[k * 3]));
+            }
+            for (uint32_t meshIndex : meshesOfGltfMesh[gltfMeshIndex]) {
+                model.instances.push_back({meshIndex, transform * instance});
+            }
+        }
+    } else if (node->mesh) {
         size_t gltfMeshIndex = node->mesh - data->meshes;
         for (uint32_t meshIndex : meshesOfGltfMesh[gltfMeshIndex]) {
             model.instances.push_back({meshIndex, transform});

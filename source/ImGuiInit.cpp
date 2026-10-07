@@ -71,7 +71,7 @@ void Application::buildImGui() {
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
     ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
                 gpuPassTimes[0], gpuPassTimes[1], gpuPassTimes[2], gpuPassTimes[3], gpuPassTimes[4], gpuPassTimes[5]);
-    ImGui::Text("%u triangles", primitiveCount);
+    ImGui::Text("%llu triangles", static_cast<unsigned long long>(primitiveCount));
     if (settings.accumulate && !dlssActive()) {
         ImGui::Text("%u frames accumulated", accumulatedFrames);
     }

@@ -328,6 +328,25 @@ against the app's daylight (Blender's export gave 21740 cd); the Exterior's dire
 has its own sun). Emissive strength is 1 unless given.
 In the Wine scene, liquids touch or sit inside their glasses (Falcor uses nested priorities), see "Volumes assume closed meshes".
 
+### Jungle Ruins is a cut-out of the jungle
+Intel's Jungle Ruins has about 8.7 million plants (USD point instancers) on 8 x 8 km of terrain: one TLAS entry
+each would not fit. `tools/jungle/convert_jungle.py` keeps each kind of plant within its own distance of the
+default camera: trees 400 m, seedlings 100 m, the pyramid's moss and grass all of it (90 m), grass and shrubs
+60 m, terrain tiles 1 km. That leaves about 2.6 million copies of 34 plant meshes (EXT_mesh_gpu_instancing), 2.9
+million TLAS instances in the app. Beyond those distances the hills are bare. The converter's options change the
+distances, or keep only a share of a plant type (`--keep Moss=0.5`).
+Leaves and grass get diffuse transmission 0.5 (as the Bistro's, by name); the USD materials have none and don't
+use the translucency textures that come with some plants. The river is clear thin water (transmission 1, IOR
+1.333). The swaying trees keep their first pose. Textures larger than 4K (the terrain's 8K) are scaled down.
+- Fix: per-instance level of detail, or a TLAS with only the instances near the camera, rebuilt as it moves.
+
+### Instances are remade only when something changes
+An object's instances (one per part of its model) and their shader data are rebuilt on the CPU and uploaded
+only when an object, a part's visibility or a material changed, or something moved the frame before: with
+millions of instances doing it every frame would cost tens of milliseconds. Moving an object in a scene that
+large is slow (every instance is remade per frame while it moves).
+- Where: `updateScene` (source/Scene.cpp).
+
 ### Unsupported glTF features
 - Second UV set (`TEXCOORD_1`): the first set is used instead (a warning is printed).
 - KTX2 / WebP images: the texture is skipped, the constant is used.

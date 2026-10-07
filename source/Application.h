@@ -658,10 +658,25 @@ private:
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
     std::vector<glm::mat4> frameInstanceTransforms;  // world transform of each of frameInstances
     std::vector<GpuInstance> frameGpuInstances;      // per instance: motion and matrices for the shader
-    VkBuffer instanceDataBuffer = VK_NULL_HANDLE;    // frameGpuInstances on the GPU, room for tlasCapacity
-    VkDeviceMemory instanceDataMemory = VK_NULL_HANDLE;
+    StreamedBuffer instanceData;                     // frameGpuInstances on the GPU, room for tlasCapacity
+    bool instanceUploadPending = false;              // frameGpuInstances changed since the last upload
     std::vector<uint32_t> frameInstanceMeshes;       // mesh of each of frameInstances
     bool tlasDirty = true;
+    // What the frame* lists above were made from. They are only remade when this changes (or something moved last
+    // time): scenes with vegetation have millions of instances, too many to go through every frame.
+    struct BuiltObject {
+        uint32_t modelIndex;
+        bool visible;
+        bool originalSize;
+        glm::mat4 transform;
+        std::vector<bool> hiddenParts;
+        bool operator==(const BuiltObject& o) const {
+            return modelIndex == o.modelIndex && visible == o.visible && originalSize == o.originalSize &&
+                   transform == o.transform && hiddenParts == o.hiddenParts;
+        }
+    };
+    std::vector<BuiltObject> builtObjects;
+    bool builtWithMotion = false;  // some object moved in that frame: its motion matrices are only right for that frame
 
     // Light list for sampling emissive surfaces. Rebuilt on the CPU when instances or materials change.
     std::vector<EmissiveTriangle> emissiveTriangles;
@@ -872,7 +887,7 @@ private:
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
     VkDeviceMemory uniformBufferMemory;
-    uint32_t primitiveCount = 0;  // triangles over all instances
+    uint64_t primitiveCount = 0;  // triangles over all instances (billions with vegetation)
 
     Camera camera;
     RenderSettings settings;
