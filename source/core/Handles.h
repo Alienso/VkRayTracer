@@ -15,7 +15,7 @@ struct Handle {
     uint32_t index = invalidIndex;
     uint32_t generation = 0;
 
-    bool valid() const { return index != invalidIndex; }
+    [[nodiscard]] bool valid() const { return index != invalidIndex; }
     bool operator==(const Handle& other) const { return index == other.index && generation == other.generation; }
     bool operator!=(const Handle& other) const { return !(*this == other); }
 };

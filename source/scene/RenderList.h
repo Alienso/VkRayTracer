@@ -50,7 +50,7 @@ public:
     SceneEnvironment environment;  // copied every frame (its map: AssetStore::environmentMap)
 
     // Goes up whenever instances or motions were remade. The renderer compares it with what it built from.
-    uint64_t instanceRevision() const { return revision; }
+    [[nodiscard]] uint64_t instanceRevision() const { return revision; }
 
 private:
     friend class Scene;

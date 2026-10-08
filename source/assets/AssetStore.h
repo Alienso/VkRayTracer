@@ -71,11 +71,11 @@ public:
 
     // The model files found in the models directory (subfolders too), built-in test scenes first
     void scanModelFiles();
-    const std::vector<std::string>& modelFiles() const { return files; }
+    [[nodiscard]] const std::vector<std::string>& modelFiles() const { return files; }
 
     // The built-in floor: model 0, always loaded, so there is always at least one mesh and material
     ModelHandle addFloor();
-    ModelHandle floor() const { return floorModel; }
+    [[nodiscard]] ModelHandle floor() const { return floorModel; }
 
     // The model of that file (or built-in name), loading it first if it isn't yet. Throws if it can't be loaded.
     // Takes no reference: the caller acquires it (a model never acquired stays loaded).
@@ -85,13 +85,13 @@ public:
     // invalid from then on (isLoaded says false, even once the slot holds another model).
     void acquire(ModelHandle model);
     void release(ModelHandle model);
-    bool isLoaded(ModelHandle handle) const {
+    [[nodiscard]] bool isLoaded(ModelHandle handle) const {
         return handle.index < slots.size() && slots[handle.index].loaded &&
                slots[handle.index].generation == handle.generation;
     }
 
     SceneModel& model(ModelHandle handle) { return slots[handle.index].model; }
-    const SceneModel& model(ModelHandle handle) const { return slots[handle.index].model; }
+    [[nodiscard]] const SceneModel& model(ModelHandle handle) const { return slots[handle.index].model; }
     // Calls f(const SceneModel&) for every loaded model
     template <typename F> void forEachModel(F f) const {
         for (const Slot& slot : slots) {
@@ -100,43 +100,43 @@ public:
             }
         }
     }
-    size_t modelCount() const { return loadedModels; }
+    [[nodiscard]] size_t modelCount() const { return loadedModels; }
 
     // All models' meshes, materials and textures. The renderer frees textures' pixels once uploaded, and the
     // editor edits materials in place (then calls materialsChanged).
     std::vector<Mesh>& meshes() { return meshList; }
-    const std::vector<Mesh>& meshes() const { return meshList; }
+    [[nodiscard]] const std::vector<Mesh>& meshes() const { return meshList; }
     std::vector<SceneMaterial>& materials() { return materialList; }
-    const std::vector<SceneMaterial>& materials() const { return materialList; }
+    [[nodiscard]] const std::vector<SceneMaterial>& materials() const { return materialList; }
     std::vector<TextureData>& textures() { return textureList; }
-    const std::vector<TextureData>& textures() const { return textureList; }
+    [[nodiscard]] const std::vector<TextureData>& textures() const { return textureList; }
     // A number per mesh / texture (parallel to meshes() / textures()) that stays the same while it is loaded, even
     // when its index changes, and is never given to another one. The renderer keys its GPU copies by these.
-    const std::vector<uint64_t>& meshIds() const { return meshIdList; }
-    const std::vector<uint64_t>& textureIds() const { return textureIdList; }
+    [[nodiscard]] const std::vector<uint64_t>& meshIds() const { return meshIdList; }
+    [[nodiscard]] const std::vector<uint64_t>& textureIds() const { return textureIdList; }
 
     // Goes up whenever meshes, materials or textures are added or removed. The renderer compares it with the
     // revision it last uploaded.
-    uint64_t revision() const { return contentRevision; }
+    [[nodiscard]] uint64_t revision() const { return contentRevision; }
 
     // Materials are edited in place (materials()); call this after an edit so the renderer uploads them. Goes up
     // only for edits: loading and unloading move revision() on, and the renderer re-uploads everything then anyway.
     void materialsChanged() { materialRevisionCounter++; }
-    uint64_t materialRevision() const { return materialRevisionCounter; }
+    [[nodiscard]] uint64_t materialRevision() const { return materialRevisionCounter; }
 
     // Environment maps: the .hdr files there are, and the loaded ones. Same lifetime rules as models: the last
     // release unloads the map (the renderer keeps its GPU copy until it gets another one).
     void scanEnvironmentFiles();
-    const std::vector<std::string>& environmentFiles() const { return environmentFileList; }
+    [[nodiscard]] const std::vector<std::string>& environmentFiles() const { return environmentFileList; }
     EnvironmentHandle findOrLoadEnvironment(const std::string& fileName);  // throws if it can't be loaded
     void acquire(EnvironmentHandle map);
     void release(EnvironmentHandle map);
-    bool isLoaded(EnvironmentHandle handle) const {
+    [[nodiscard]] bool isLoaded(EnvironmentHandle handle) const {
         return handle.index < environmentSlots.size() && environmentSlots[handle.index].loaded &&
                environmentSlots[handle.index].generation == handle.generation;
     }
     EnvironmentMap& environmentMap(EnvironmentHandle handle) { return environmentSlots[handle.index].map; }
-    const EnvironmentMap& environmentMap(EnvironmentHandle handle) const { return environmentSlots[handle.index].map; }
+    [[nodiscard]] const EnvironmentMap& environmentMap(EnvironmentHandle handle) const { return environmentSlots[handle.index].map; }
 
     // At most this many textures in total (the renderer's descriptor array); loading past it throws
     void setTextureLimit(uint32_t limit) { textureLimit = limit; }

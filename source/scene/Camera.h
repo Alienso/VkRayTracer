@@ -15,16 +15,16 @@ public:
     float pitch = 0.0f;  // degrees, positive looks up, clamped to +-89
     float fov = 60.0f;   // vertical, degrees
 
-    glm::vec3 forward() const;
-    glm::vec3 right() const;
-    glm::vec3 up() const;
+    [[nodiscard]] glm::vec3 forward() const;
+    [[nodiscard]] glm::vec3 right() const;
+    [[nodiscard]] glm::vec3 up() const;
 
     void lookAt(const glm::vec3& target);
 
     // Matrices matching the rays the path tracer shoots (Vulkan clip space: y down, depth 0..1), without jitter.
     // Rays don't need them; motion vectors and DLSS do.
-    glm::mat4 viewMatrix() const;
-    glm::mat4 projectionMatrix(float aspectRatio, float nearPlane, float farPlane) const;
+    [[nodiscard]] glm::mat4 viewMatrix() const;
+    [[nodiscard]] glm::mat4 projectionMatrix(float aspectRatio, float nearPlane, float farPlane) const;
 };
 
 #endif //VULKANDEMO_CAMERA_H

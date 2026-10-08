@@ -30,7 +30,7 @@ struct SceneObject {
     bool originalSize = false;  // skip the model's fit: keep the file's own size and position (glTF: meters)
     std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
 
-    glm::mat4 transform() const;           // translate * rotate * scale
+    [[nodiscard]] glm::mat4 transform() const;           // translate * rotate * scale
     glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors
     bool hasPreviousTransform = false;              // false in the object's first frame (no motion then)
 };
@@ -59,13 +59,13 @@ public:
     void buildRenderList(RenderList& list);
 
     std::vector<SceneObject>& objects() { return objectList; }
-    const std::vector<SceneObject>& objects() const { return objectList; }
+    [[nodiscard]] const std::vector<SceneObject>& objects() const { return objectList; }
 
     Camera& camera() { return sceneCamera; }
-    const Camera& camera() const { return sceneCamera; }
+    [[nodiscard]] const Camera& camera() const { return sceneCamera; }
 
     SceneEnvironment& environment() { return sceneEnvironment; }
-    const SceneEnvironment& environment() const { return sceneEnvironment; }
+    [[nodiscard]] const SceneEnvironment& environment() const { return sceneEnvironment; }
     // The background map: loads that file if it isn't yet (throws if it can't be: nothing changes then) and releases
     // the previous map
     void setEnvironmentMap(const std::string& fileName);

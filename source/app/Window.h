@@ -14,13 +14,13 @@ public:
     void create(int width, int height, const char* title);
     void destroy();
 
-    GLFWwindow* handle() const { return window; }
-    bool shouldClose() const { return glfwWindowShouldClose(window); }
+    [[nodiscard]] GLFWwindow* handle() const { return window; }
+    [[nodiscard]] bool shouldClose() const { return glfwWindowShouldClose(window); }
     void requestClose() { glfwSetWindowShouldClose(window, GLFW_TRUE); }
 
     // Borderless fullscreen on the monitor it is on; off: the windowed position and size come back
     void setFullscreen(bool on);
-    bool isFullscreen() const { return fullscreen; }
+    [[nodiscard]] bool isFullscreen() const { return fullscreen; }
 
     // True once after the framebuffer changed size (dragging, maximizing, fullscreen), then false until it changes again
     bool takeResized();
