@@ -815,8 +815,11 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.writeGuides = dlssActive() || isGuideView(settings.debugView) ? 1 : 0;
     uniforms.cacheQuery = settings.radianceCache && !cacheQueriesSuspended ? 1 : 0;
     uniforms.cacheCapacity = cacheCapacity;
-    // A cell about cacheCellPixels render pixels wide at distance 1, growing with the distance
-    uniforms.cacheCellScale = 2.0f * uniforms.tanHalfFov / static_cast<float>(renderExtent.height) * settings.cacheCellPixels;
+    // A cell about cacheCellPixels render pixels wide at distance 1, growing with the distance. Pixels as rendered
+    // for the window's size: a bigger output (a 4K capture) keeps the same cells, else it would need many more.
+    float windowRenderRows = static_cast<float>(renderExtent.height) * static_cast<float>(swapChainExtent.height)
+                             / static_cast<float>(std::max(outputExtent.height, 1u));
+    uniforms.cacheCellScale = 2.0f * uniforms.tanHalfFov / std::max(windowRenderRows, 1.0f) * settings.cacheCellPixels;
     uniforms.cacheMinWeight = settings.cacheMinSamples;
     uniforms.cacheUpdateTile = static_cast<uint32_t>(std::max(settings.cacheUpdateTile, 1));
 
@@ -1062,7 +1065,7 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 2, blitBarriers);
 
-    // 8: blit (output size = swapchain size, so this is a copy plus format conversion)
+    // 8: blit: a copy plus format conversion, or shrunk to fit the window (output bigger than it, filtered)
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {(int32_t) outputExtent.width, (int32_t) outputExtent.height, 1};
@@ -1071,7 +1074,8 @@ void Application::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBlitImage(commandBuffer,
                    displayImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    swapChainImages[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &blit, VK_FILTER_NEAREST);
+                   1, &blit, outputExtent.width == swapChainExtent.width && outputExtent.height == swapChainExtent.height
+                             ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
 
     // 9: the "Capture" button: the display image (without the UI) into a buffer for a PNG
     recordCapture(commandBuffer);

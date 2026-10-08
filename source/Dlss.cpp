@@ -587,6 +587,18 @@ void Application::buildRenderModeUi() {
     const char* models[] = {"Transformer F (newest)", "Transformer E", "Transformer D", "CNN A", "CNN B", "CNN C"};
     ImGui::BeginDisabled(!dlssSupported);
     ImGui::Combo("Renderer", &settings.renderMode, modes, static_cast<int>(std::size(modes)));
+    ImGui::EndDisabled();
+    const char* sizes[] = {"Window", "1080p", "1440p", "2160p (4K)"};
+    static_assert(std::size(sizes) == std::size(outputHeights));
+    ImGui::Combo("Image size", &settings.outputSize, sizes, static_cast<int>(std::size(sizes)));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The size of the image, and of what Capture saves. Bigger than the window: shown shrunk\n"
+                          "to fit, and slower in proportion (4K has 5.8x the pixels of 1600 x 900). Keeps the\n"
+                          "window's shape. For a sharp 4K capture: Accumulation, let it settle, then Capture.");
+    }
+    ImGui::TextDisabled("traces %u x %u, image %u x %u", renderExtent.width, renderExtent.height, outputExtent.width,
+                        outputExtent.height);
+    ImGui::BeginDisabled(!dlssSupported);
     // Models the loaded DLSS version doesn't have are shown but can't be picked
     if (ImGui::BeginCombo("DLSS model", models[settings.dlssModel])) {
         for (int i = 0; i < static_cast<int>(std::size(models)); i++) {

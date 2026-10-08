@@ -134,6 +134,7 @@ void Application::mainLoop() {
         updateScene();  // apply object/model changes made in the UI
         updateEnvironment();  // a new HDR map, or new sky colors to sample by
         applyRenderMode();  // accumulation <-> DLSS modes: new render size
+        applyOutputSize();  // window size <-> e.g. 4K: new images
 
         drawFrame();
     }

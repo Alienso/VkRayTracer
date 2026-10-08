@@ -417,6 +417,18 @@ Only glTF / GLB is loaded; FBX scenes go through Blender first (see "Bistro conv
 
 ## Display
 
+### Image size bigger than the window: a plain shrink, and per-pixel settings
+"Image size" (Rendering) makes the image 1080, 1440 or 2160 rows tall, as wide as the window's shape, for Capture
+(a 4K PNG of a 1600 x 900 window). Everything per pixel grows with it: 2160 rows cost about 5.8x the time and
+memory of 1600 x 900 (a heavy scene's single frame can then near Windows' 2-second GPU timeout; keep samples per
+pixel at 1 and let it accumulate). The window shows it shrunk by a linear blit, which only blends 2 x 2 pixels:
+fine edges shimmer in the preview, not in the capture. The radiance cache's cells stay sized for the window (else
+they would get smaller and many more); ReSTIR's spatial radius stays in render pixels, so it covers less of the
+scene at a bigger size.
+- Where: `chooseExtents`, `applyOutputSize` (source/Display.cpp), the blit in `recordRayTracing` and
+  `cacheCellScale` in `buildSceneUniforms` (source/RayTracer.cpp).
+- Fix (preview): a proper downscale filter (a compute pass averaging all covered pixels).
+
 ### Auto exposure meters like a camera
 The exposure is measured from the finished HDR image and applied by the display pass in the same frame.
 Like a real light meter, it maps the average to middle grey, so a mostly white scene

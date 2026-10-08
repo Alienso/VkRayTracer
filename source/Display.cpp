@@ -7,7 +7,9 @@
 //
 
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include "Application.h"
@@ -19,11 +21,30 @@ static const VkFormat displayFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // Same format as the radiance image, so exposure and display read either through the same descriptors
 static const VkFormat dlssOutputFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 
-// Output = the window. Render = what the path tracer traces: the same in accumulation mode, smaller in the DLSS
-// modes (the size DLSS asks for, e.g. 67% per axis for Quality).
+// Output = the window, or a fixed number of rows (e.g. 2160 for a 4K capture) as wide as the window's shape: it is
+// shrunk to fit the window when shown, and Capture saves it at full size. Render = what the path tracer traces: the
+// same in accumulation mode, smaller in the DLSS modes (the size DLSS asks for, e.g. 67% per axis for Quality).
 void Application::chooseExtents() {
     outputExtent = swapChainExtent;
+    uint32_t rows = outputHeights[std::clamp(activeOutputSize, 0, static_cast<int>(std::size(outputHeights)) - 1)];
+    if (rows > 0 && swapChainExtent.height > 0) {
+        double aspect = static_cast<double>(swapChainExtent.width) / swapChainExtent.height;
+        outputExtent = {static_cast<uint32_t>(std::lround(rows * aspect / 2.0)) * 2, rows};  // even, like video sizes
+    }
     renderExtent = dlssActive() ? dlssRenderExtent(activeRenderMode, outputExtent) : outputExtent;
+}
+
+// A new Settings::outputSize: new images. Called once per frame before drawing.
+void Application::applyOutputSize() {
+    settings.outputSize = std::clamp(settings.outputSize, 0, static_cast<int>(std::size(outputHeights)) - 1);
+    if (settings.outputSize == activeOutputSize) {
+        return;
+    }
+    vkp.deviceWaitIdle(device);
+    freeDlssResources();  // made for the old size
+    activeOutputSize = settings.outputSize;
+    recreateRenderImages();
+    hasPreviousViewProjection = false;
 }
 
 // Everything whose size depends on the window or the render mode. The GPU must be idle.

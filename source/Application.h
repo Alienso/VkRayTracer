@@ -568,6 +568,9 @@ struct RenderSettings {
     bool toneMapping = true;
     int debugView = static_cast<int>(DebugView::None);
     int renderMode = static_cast<int>(RenderMode::Accumulation);  // RenderMode, picked in the UI
+    // The image's size (what Capture saves): 0 = the window's, else this many rows (outputHeights), as wide as the
+    // window's shape allows. Shown shrunk to fit the window.
+    int outputSize = 0;
     int dlssModel = static_cast<int>(DlssModel::TransformerF);     // DlssModel
 };
 
@@ -729,9 +732,10 @@ private:
     std::string loadError;
 
     // Two sizes (chooseExtents): the path tracer renders at renderExtent, the display pass writes outputExtent
-    // (the window). Equal for now; DLSS will render smaller and upscale.
+    // (the window, or bigger: Settings::outputSize). Equal in accumulation mode; DLSS renders smaller and upscales.
     VkExtent2D renderExtent{};
     VkExtent2D outputExtent{};
+    int activeOutputSize = 0;  // the Settings::outputSize the images are built for
 
     // Ray tracing output at render size, recreated with the swapchain
     VkImage radianceImage;  // linear HDR: running average while accumulating, else this frame (or a debug view)
@@ -1063,6 +1067,9 @@ private:
 
     // Display.cpp
     void chooseExtents();
+    void applyOutputSize();
+    // Settings::outputSize -> rows of the output image (0: the window's); names in buildRenderModeUi
+    static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
     void recreateRenderImages();
     VkImageView displayedHdrView() const;  // what exposure and display read: DLSS output or the radiance image
     void createDisplayImages();
