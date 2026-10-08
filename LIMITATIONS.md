@@ -111,8 +111,8 @@ has 20,600), slow for scenes with many glowing meshes or one moving every frame.
 ### The light tree doesn't know what blocks the light
 The tree picks glowing triangles by a guess of how much light they could send to the point: power, distance, and
 whether the surface faces them. A lamp behind a wall looks just as good as one in plain view, so a room next to a
-bright street still sends many shadow rays at the street. Large lamps close to a surface still give some
-speckles, as a random point on them can be very close (that's the area sampling, not the tree). Emitters are
+bright street still sends many shadow rays at the street. (Large lamps close to a surface: see "Points on glowing
+triangles by solid angle" below; that is about the point on a triangle, not the tree.) Emitters are
 treated as shining both ways, so there is no "which way does the light face" test in the tree. The median split
 is simple; a split by cost (SAH-like, as in BVHs) would group lights better. Measured at night in Bistro Exterior
 (2048-frame reference, 64 frames): street views 2.3x to 4.4x less noise, and up to 8x per unit of GPU time. Scenes
@@ -122,6 +122,22 @@ with one or a few lights are unchanged (Cornell box), and so is Bistro Interior,
   `lightPickProbability` (shaders/raytrace.comp).
 - Partly fixed by ReSTIR DI (below) at the first surface the camera sees, in the DLSS modes: its reuse keeps the
   samples that turned out visible. Deeper bounces, and Accumulation by default, still pick by the tree alone.
+
+### Points on glowing triangles by solid angle, without the surface's cosine
+Once a glowing triangle is picked, the point on it is chosen so that its directions spread evenly over the
+triangle's solid angle seen from the surface (Arvo 1995, as in pbrt-v4), for the path's shadow rays and for ReSTIR
+DI's candidates. Evenly by area ("Glowing triangles by solid angle" off) puts most samples on the far part of a
+large panel close to the surface, though the near part fills most of the surface's view of it. Triangles under
+3e-4 sr (most of them, seen from afar) and above 6.22 sr are still picked by area: the same there, and the spherical
+formulas lose precision. Checked against area sampling: the same 1024-frame references (within 0.01%) in Zero-Day
+and Bistro at night. In those two scenes it makes little difference. In Zero-Day, after 64 frames, the error is 14%
+lower in Accumulation and 4-8% lower under DLSS Quality. Bistro at night is better in single frames and after 8, but
+7-10% worse after 64 (that error is mostly a few persistent fireflies), whatever the size limit (also tried 0.01 and
+0.05 sr, so it isn't the precision). Neither scene has the case it is for: big glowing panels next to lit surfaces
+(Zero-Day's light reaches most surfaces indirectly). In a numerical test of one large triangle close to a point,
+the error was 7-30x lower than by area. It ignores the cosine at the surface and the emissive texture.
+- Where: `sphericalSolidAngle`, `sampleSphericalTriangle`, `pointOnTriangle`, `lightPdf` (shaders/raytrace.comp).
+- Fix: projected solid angle sampling (Peters 2021) adds the surface's cosine.
 
 ### Sun of size 0
 A sun with angular radius 0 can only be found by shadow rays: mirrors don't show it, and the camera sees a
@@ -241,6 +257,24 @@ cache's update paths.
   comes from ReSTIR DI, whose candidates use white noise. Giving those candidates blue-noise numbers is the place
   it could still pay off.
 - Where: `pathSample`, `startPathSamples`, `blueNoiseAt` (shaders/raytrace.comp).
+
+### Rays leave surfaces by their rounding error
+New rays start just off the surface by a fixed number of float steps of the hit's coordinates (Wachter & Binder,
+Ray Tracing Gems 2019): tiny near the origin, larger far out, so the scene's size doesn't matter. The hit's
+position comes from the triangle (barycentrics through the instance's matrix), not origin + t * direction, whose
+error grows with the ray's length. Shadow rays towards a glowing triangle, and ReSTIR GI's visibility rays, stop
+short of the far point by its own rounding error. Rays have no length limit. This replaced a fixed 1 mm offset plus
+1 mm minimum distance, a 1000 m limit, and shadow rays stopping 0.1% short of the light. What changed:
+- Jungle Ruins seen from 60 m up: the far hills and the river beyond 1000 m showed the sky's ground color.
+- Bistro at night is 0.4% darker (4.4% on the right side of the street). 0.1% short of a lamp 15 m away skipped
+  whatever lay within the last 1.5 cm before its glowing triangles, which bounce rays never skip. It is closer
+  to a bounce-rays-only render now.
+- Sponza: the curtains' tops are a little brighter where they touch the rod; elsewhere only noise changed.
+What is left: surfaces lying on top of each other (decals, overlapping cloth) can now shadow each other, where
+2 mm used to hide them. Smooth normals on coarse meshes still give the jagged shadow edge of the "shadow
+terminator" problem; nothing handles that. Rays towards point lights still stop 0.1% short.
+- Where: `offsetRay`, `stopShortOf`, `shadowRayStart`, `hitFromIntersection` (shaders/raytrace.comp); the
+  instance's translation in `GpuInstance` (source/Application.h).
 
 ## Radiance cache
 

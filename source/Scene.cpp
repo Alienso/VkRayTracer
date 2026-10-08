@@ -297,8 +297,7 @@ void Application::updateScene() {
             instance.accelerationStructureReference = blases[part.meshIndex].address;
             frameInstances.push_back(instance);
             frameInstanceTransforms.push_back(world);
-            glm::mat3 objectToWorld(world);
-            frameGpuInstances.push_back({motion, objectToWorld, glm::inverse(objectToWorld)});
+            frameGpuInstances.push_back({motion, glm::mat4x3(world), glm::inverse(glm::mat3(world))});
             frameInstanceMeshes.push_back(part.meshIndex);
             primitiveCount += meshInfos[part.meshIndex].indexCount / 3;
         }

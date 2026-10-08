@@ -109,6 +109,7 @@ layout(binding = 3) uniform SceneUniforms {
     float restirGiRadianceClamp;    // 0 = off; else the most a GI sample's Lo may be (luminance)
     uint restirGiTemporalVisibility;  // 1 = the temporal reuse is unbiased (a ray from last frame's surface)
     uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
+    uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see triangleSolidAngle), 0 = by area
     vec4 previousCameraPosition;   // last frame's (for last frame's view directions)
 } scene;
 
@@ -204,8 +205,8 @@ layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbed
 struct InstanceData {
     mat4 motion;         // takes a point on it from this frame's world position to last frame's (object motion);
                          // identity for objects that didn't move
-    mat3 objectToWorld;  // without the translation (what directions and normals need). Used instead of the ray
-    mat3 worldToObject;  // query's matrices, so a stored hit (see "Primary hits") is rebuilt the same way
+    mat4x3 objectToWorld;  // used instead of the ray query's matrices, so a stored hit (see "Primary hits") is
+    mat3 worldToObject;    // rebuilt the same way. Without the translation (what normals need)
 };
 layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
 
@@ -227,7 +228,7 @@ struct BounceHit {
     int primitive;
     vec2 barycentrics;
     float t;
-    vec3 direction;      // exact: the hit's position is rebuilt as origin + direction * t
+    vec3 direction;      // exact: the hit is rebuilt with it (which side was hit, texture footprint)
     uint weightRG;       // the sample's weight (BRDF * cos / pdf), half floats
     uint weightBRoughness;  // weight.b (half), lobe roughness (8 bits), flags (8 bits: 1 transmitted, 2 specular lobe)
     float pdf;
@@ -277,7 +278,8 @@ struct LightTreeNode {
 layout(binding = 24, scalar) readonly buffer LightTree { LightTreeNode lightTreeNodes[]; };
 
 const float PI = 3.14159265359;
-const float SKY_DISTANCE = 1e5;  // shadow rays towards the sun or the sky: anything closer blocks them
+const float RAY_FAR = 1e30;          // how far rays go: no limit, whatever the scene's size
+const float SKY_DISTANCE = RAY_FAR;  // shadow rays towards the sun or the sky: anything on the way blocks them
 
 // ---------------------------------------------------------------------------------------------
 // Random numbers (PCG hash)
@@ -431,6 +433,34 @@ vec3 randomDirectionInCone(vec3 axis, float cosMaxAngle, vec2 u) {
 
 // ---------------------------------------------------------------------------------------------
 // Tracing
+
+// Where a new ray leaves a surface point p: just off the surface, on the side n points to (Wachter & Binder, "A
+// Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing Gems 2019). p, computed in floats, is off the
+// real surface by some rounding error, which grows with p's size: the step is a fixed number of float steps (ulps)
+// of each coordinate, so it is as small as it can safely be anywhere: tiny near the origin, larger far out. Near
+// the origin, where float steps get extremely small, a fixed tiny distance instead. A fixed distance everywhere
+// would be too small far out (the ray hits its own surface: shadow acne) or too big near (it starts behind a
+// nearby surface: light leaks through corners and thin walls). The rays then start at t = 0.
+// p must come from the triangle (barycentrics, see hitFromIntersection), not origin + t * direction, whose error
+// grows with the ray's length too.
+vec3 offsetRay(vec3 p, vec3 n) {
+    const float nearOrigin = 1.0 / 32.0;
+    const float floatScale = 1.0 / 65536.0;
+    const float intScale = 256.0;
+    ivec3 steps = ivec3(intScale * n);
+    vec3 stepped = intBitsToFloat(floatBitsToInt(p) + ivec3(p.x < 0.0 ? -steps.x : steps.x,
+                                                            p.y < 0.0 ? -steps.y : steps.y,
+                                                            p.z < 0.0 ? -steps.z : steps.z));
+    return vec3(abs(p.x) < nearOrigin ? p.x + floatScale * n.x : stepped.x,
+                abs(p.y) < nearOrigin ? p.y + floatScale * n.y : stepped.y,
+                abs(p.z) < nearOrigin ? p.z + floatScale * n.z : stepped.z);
+}
+
+// How far short of a point p on a surface (normal n) a ray must stop not to hit that surface, coming in at cosine
+// cosTheta to it: p's rounding error as in offsetRay, along the ray. (Nearly edge-on, at most 100 times that.)
+float stopShortOf(vec3 p, vec3 n, float cosTheta) {
+    return dot(offsetRay(p, n) - p, n) / max(abs(cosTheta), 0.01);
+}
 
 struct Hit {
     bool found;
@@ -614,7 +644,7 @@ struct Intersection {
 // The closest hit along a ray (cut-outs decided with seed, see traverse). false: nothing hit.
 bool intersectClosest(vec3 origin, vec3 direction, inout uint seed, out Intersection hit) {
     rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.001, direction, 1000.0);
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.0, direction, RAY_FAR);
     traverse(rayQuery, seed);
     if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
         return false;
@@ -627,9 +657,9 @@ bool intersectClosest(vec3 origin, vec3 direction, inout uint seed, out Intersec
     return true;
 }
 
-// The surface at an intersection of the ray from origin along direction: position, normals, material.
+// The surface at an intersection of a ray along direction: position, normals, material.
 // coneWidth, coneSpread: the ray's cone at its origin (see uvFootprint); 0, 0 reads every texture at full size.
-Hit hitFromIntersection(Intersection intersection, vec3 origin, vec3 direction, float coneWidth, float coneSpread) {
+Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWidth, float coneSpread) {
     Hit hit;
     hit.found = true;
     hit.meshIndex = intersection.meshIndex;
@@ -647,7 +677,6 @@ Hit hitFromIntersection(Intersection intersection, vec3 origin, vec3 direction, 
     vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
 
     hit.t = intersection.t;
-    hit.position = origin + direction * hit.t;
     vec2 uv0 = vertices[corner.x].uv;
     vec2 uv1 = vertices[corner.y].uv;
     vec2 uv2 = vertices[corner.z].uv;
@@ -659,14 +688,16 @@ Hit hitFromIntersection(Intersection intersection, vec3 origin, vec3 direction, 
     // The matrices are read from the instance buffer where they are used: kept in registers from the start, they
     // would take 18 of them across the texture reads below.
 
-    // Flat normal from the triangle's edges
+    // The position from the triangle: as exact as floats allow (offsetRay counts on it), unlike origin + t *
+    // direction. Flat normal from the triangle's edges.
     vec3 p0 = vertices[corner.x].position;
     vec3 edge1 = vertices[corner.y].position - p0;
     vec3 edge2 = vertices[corner.z].position - p0;
+    hit.position = instances[hit.instanceIndex].objectToWorld * vec4(p0 + edge1 * bary.x + edge2 * bary.y, 1.0);
     hit.geometricNormal = normalize(cross(edge1, edge2) * instances[hit.instanceIndex].worldToObject);
 
     float footprintWidth = scene.textureMipmaps != 0 ? coneWidth + coneSpread * hit.t : 0.0;
-    mat3 objectToWorld = instances[hit.instanceIndex].objectToWorld;
+    mat3 objectToWorld = mat3(instances[hit.instanceIndex].objectToWorld);
     uvFootprint(objectToWorld * edge1, objectToWorld * edge2, uv1 - uv0, uv2 - uv0, direction, footprintWidth,
                 hit.uvFootprintX, hit.uvFootprintY);
     evaluateMaterial(hit);
@@ -686,7 +717,7 @@ Hit hitFromIntersection(Intersection intersection, vec3 origin, vec3 direction, 
         if (mesh.hasTangents != 0) {
             vec4 tangent = vertices[corner.x].tangent * weights.x + vertices[corner.y].tangent * weights.y
                            + vertices[corner.z].tangent * weights.z;
-            mat3 objectToWorld = instances[hit.instanceIndex].objectToWorld;
+            mat3 objectToWorld = mat3(instances[hit.instanceIndex].objectToWorld);
             vec3 t = objectToWorld * tangent.xyz;
             t -= hit.normal * dot(hit.normal, t);  // interpolation bends it slightly off the surface
             // Broken tangents in the file (along the normal, or corners pointing opposite ways so the blend
@@ -771,7 +802,7 @@ Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, 
         hit.found = false;
         return hit;
     }
-    return hitFromIntersection(intersection, origin, direction, coneWidth, coneSpread);
+    return hitFromIntersection(intersection, direction, coneWidth, coneSpread);
 }
 
 // Where a direction lands on the environment map, and back. u goes around the horizon (the same way as in
@@ -1178,7 +1209,7 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout u
     crossedSolidGlass = false;
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
-                          origin, 0.001, direction, maxDistance);
+                          origin, 0.0, direction, max(maxDistance, 0.0));
     vec3 tint = vec3(1.0);
     vec3 opticalDepth = vec3(0.0);
     while (rayQueryProceedEXT(rayQuery)) {
@@ -1276,13 +1307,109 @@ float misWeight(float pdfThis, float pdfOther) {
     return a + b > 0.0 ? a / (a + b) : 0.0;
 }
 
-// pdf (per solid angle) of light sampling choosing the point `distance` away on triangle `light`, seen at
-// `cosLight` (angle between the triangle's normal and the direction towards the surface point).
-// Per area it is probability / area; a small patch far away or seen edge-on covers a small solid angle,
-// hence distance^2 / cos to convert.
+// Where on a picked glowing triangle the shadow ray goes. Evenly by area is simple, but a large triangle close to
+// the point looks very different from there: its near part fills most of the point's view of it, its far part is a
+// sliver, and yet the far part gets most of the samples (more area). Picking directions evenly over the triangle's
+// solid angle (the patch of the point's sky it covers) instead puts the samples where the light comes from (Arvo
+// 1995, "Stratified Sampling of Spherical Triangles"; as in pbrt-v4). Its pdf is 1 / solid angle, the same in every
+// direction. (It ignores the cosine at the surface, which Peters 2021 also accounts for, at more cost.)
+// Tiny triangles (most of them, seen from afar) are sampled by area: the same result there, and the spherical
+// formulas lose precision; so are huge ones (nearly around the point). The limits are pbrt-v4's.
+const float SPHERICAL_MIN = 3e-4;  // steradians
+const float SPHERICAL_MAX = 6.22;
+
+// The solid angle of a triangle seen from p, if it is to be sampled by solid angle; 0: by area
+float sphericalSolidAngle(EmissiveTriangle light, vec3 p) {
+    if (scene.emissiveSolidAngle == 0) {
+        return 0.0;
+    }
+    vec3 a = light.p0 - p, b = light.p1 - p, c = light.p2 - p;
+    float la = length(a), lb = length(b), lc = length(c);
+    if (min(la, min(lb, lc)) <= 0.0) {
+        return 0.0;
+    }
+    a /= la;
+    b /= lb;
+    c /= lc;
+    // Van Oosterom & Strackee 1983
+    float solidAngle = abs(2.0 * atan(dot(a, cross(b, c)), 1.0 + dot(a, b) + dot(a, c) + dot(b, c)));
+    return solidAngle > SPHERICAL_MIN && solidAngle < SPHERICAL_MAX ? solidAngle : 0.0;
+}
+
+// The angle between unit vectors, precise near 0 and PI too (unlike acos of the dot product)
+float angleBetween(vec3 x, vec3 y) {
+    return dot(x, y) < 0.0 ? PI - 2.0 * asin(min(length(x + y) * 0.5, 1.0)) : 2.0 * asin(min(length(y - x) * 0.5, 1.0));
+}
+
+// A point on the triangle (v0, v1, v2) whose direction from p is spread evenly over the triangle's solid angle
+// (Arvo 1995, written as in pbrt-v4's SampleSphericalTriangle), as barycentric weights. u.x picks how much of the
+// solid angle lies on one side of the direction (a sub-triangle of that area, sharing the corner at v0), u.y
+// where along the sub-triangle's far edge. false: too thin to tell.
+bool sampleSphericalTriangle(vec3 v0, vec3 v1, vec3 v2, vec3 p, vec2 u, out vec3 weights) {
+    weights = vec3(1.0 / 3.0);
+    vec3 a = normalize(v0 - p), b = normalize(v1 - p), c = normalize(v2 - p);
+    // the planes through p and each edge, and the triangle's angles between them
+    vec3 nab = cross(a, b), nbc = cross(b, c), nca = cross(c, a);
+    if (dot(nab, nab) == 0.0 || dot(nbc, nbc) == 0.0 || dot(nca, nca) == 0.0) {
+        return false;
+    }
+    nab = normalize(nab);
+    nbc = normalize(nbc);
+    nca = normalize(nca);
+    float alpha = angleBetween(nab, -nca);
+    float beta = angleBetween(nbc, -nab);
+    float gamma = angleBetween(nca, -nbc);
+    // the sub-triangle's area (+ PI), and its corner c' on the edge from a to c
+    float subArea = mix(PI, alpha + beta + gamma, u.x);
+    float cosAlpha = cos(alpha), sinAlpha = sin(alpha);
+    float sinPhi = sin(subArea) * cosAlpha - cos(subArea) * sinAlpha;
+    float cosPhi = cos(subArea) * cosAlpha + sin(subArea) * sinAlpha;
+    float k1 = cosPhi + cosAlpha;
+    float k2 = sinPhi - sinAlpha * dot(a, b);
+    float cosB = clamp((k2 + (k2 * cosPhi - k1 * sinPhi) * cosAlpha) / ((k2 * sinPhi + k1 * cosPhi) * sinAlpha), -1.0, 1.0);
+    vec3 cPrime = cosB * a + sqrt(max(1.0 - cosB * cosB, 0.0)) * normalize(c - dot(c, a) * a);
+    // a direction between b and c', evenly over the arc's share of the solid angle
+    float cosTheta = 1.0 - u.y * (1.0 - dot(cPrime, b));
+    vec3 w = cosTheta * b + sqrt(max(1.0 - cosTheta * cosTheta, 0.0)) * normalize(cPrime - dot(cPrime, b) * b);
+    // where that direction meets the triangle (Moller-Trumbore)
+    vec3 e1 = v1 - v0, e2 = v2 - v0;
+    vec3 s1 = cross(w, e2);
+    float divisor = dot(s1, e1);
+    if (divisor == 0.0) {
+        return false;
+    }
+    vec3 s = p - v0;
+    vec2 bary = clamp(vec2(dot(s, s1), dot(w, cross(s, e1))) / divisor, 0.0, 1.0);
+    bary /= max(bary.x + bary.y, 1.0);
+    if (any(isnan(bary))) {
+        return false;
+    }
+    weights = vec3(1.0 - bary.x - bary.y, bary);
+    return true;
+}
+
+// A point on glowing triangle `light` for the surface point p: by solid angle or by area (see above). u: two
+// random numbers. false: none (a degenerate triangle).
+bool pointOnTriangle(EmissiveTriangle light, vec3 p, vec2 u, out vec3 weights) {
+    if (sphericalSolidAngle(light, p) > 0.0) {
+        return sampleSphericalTriangle(light.p0, light.p1, light.p2, p, u, weights);
+    }
+    float r1 = sqrt(u.x);  // evenly over the area (the square root keeps points from bunching up in one corner)
+    weights = vec3(1.0 - r1, r1 * (1.0 - u.y), r1 * u.y);
+    return true;
+}
+
+// pdf (per solid angle) of light sampling choosing the point `distance` away from p on triangle `light`, seen at
+// `cosLight` (angle between the triangle's normal and the direction towards p). By solid angle it is
+// 1 / solid angle. By area it is 1 / area per area; a small patch far away or seen edge-on covers a small solid
+// angle, hence distance^2 / cos to convert.
 // pickProbability: the chance that this triangle was picked (lightPickProbability).
-float lightPdf(int lightIndex, float pickProbability, float distance, float cosLight) {
+float lightPdf(int lightIndex, float pickProbability, vec3 p, float distance, float cosLight) {
     EmissiveTriangle light = emissiveTriangles[lightIndex];
+    float solidAngle = sphericalSolidAngle(light, p);
+    if (solidAngle > 0.0) {
+        return pickProbability / solidAngle;
+    }
     return pickProbability / max(light.area, 1e-12) * distance * distance / max(cosLight, 1e-6);
 }
 
@@ -1460,6 +1587,15 @@ struct LightSample {
     bool shadowed;    // false: no shadow ray (the sun with "Shadows" off)
 };
 
+// Where a shadow ray towards light sample s starts: just off the surface (offsetRay), on the side the light is
+// (behind: the far side, light passing through a thin surface). s.distance is measured from the hit itself, so the
+// ray gets shorter by how much closer to the light it starts.
+vec3 shadowRayStart(Hit hit, bool behind, inout LightSample s) {
+    vec3 origin = offsetRay(hit.position, behind ? -hit.geometricNormal : hit.geometricNormal);
+    s.distance -= dot(origin - hit.position, s.direction);
+    return origin;
+}
+
 LightSample noLightSample() {
     LightSample s;
     s.direction = vec3(0.0, 1.0, 0.0);
@@ -1501,7 +1637,7 @@ int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, float pick, out float pi
     return pickProbability > 0.0 ? lightIndex : -1;
 }
 
-// One randomly picked point on the glowing triangles. surfacePoint: where the shadow ray starts. random: x picks the
+// One randomly picked point on the glowing triangles, seen from surfacePoint. random: x picks the
 // triangle, y and z the point.
 LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, vec3 random) {
     LightSample s = noLightSample();
@@ -1514,10 +1650,11 @@ LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, 
     }
     EmissiveTriangle light = emissiveTriangles[lightIndex];
 
-    // 2: a uniformly random point on it (the square root keeps points from bunching up in one corner)
-    float r1 = sqrt(random.y);
-    float r2 = random.z;
-    vec3 weights = vec3(1.0 - r1, r1 * (1.0 - r2), r1 * r2);
+    // 2: a point on it
+    vec3 weights;
+    if (!pointOnTriangle(light, surfacePoint, random.yz, weights)) {
+        return s;
+    }
     vec3 lightPoint = light.p0 * weights.x + light.p1 * weights.y + light.p2 * weights.z;
     vec2 lightUv = light.uv0 * weights.x + light.uv1 * weights.y + light.uv2 * weights.z;
 
@@ -1529,8 +1666,8 @@ LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, 
     if (cosLight <= 1e-6) {
         return s;  // seen exactly edge-on
     }
-    s.distance = distance * 0.999;  // stop just short of the light itself, it would count as a blocker otherwise
-    s.pdf = lightPdf(lightIndex, pickProbability, distance, cosLight);
+    s.distance = distance - stopShortOf(lightPoint, lightNormal, cosLight);  // the light itself would count as a blocker
+    s.pdf = lightPdf(lightIndex, pickProbability, surfacePoint, distance, cosLight);
     s.light = emissionAt(light.materialIndex, lightUv) / s.pdf;
     s.mis = scene.emissiveSampling == EMISSIVE_MIS ? MIS_UNLESS_GLASS : MIS_NONE;
     s.shadowed = true;
@@ -1799,9 +1936,10 @@ vec3 decodeSkyPoint(uint point) {
     return environmentDirection((float(column) + within.x) / float(width), mix(cos0, cos1, within.y));
 }
 
-// The sample a stored light and point stand for, with shadow rays from surfacePoint. s.light: the light arriving at
+// The sample a stored light and point stand for, seen from surfacePoint. s.light: the light arriving at
 // a surface facing it per unit of the light's measure (see above; not divided by any pdf). s.pdf: per unit of that
-// measure, the chance of picking this point once the light is picked (triangles: evenly over their area, 1 / area;
+// measure, the chance of picking this point once the light is picked (triangles: by solid angle cos / (distance^2 *
+// solid angle), or by area 1 / area, see pointOnTriangle;
 // the sky: its sampling; punctual lights: 1). toSolidAngle: solid angle per unit of the measure (triangles:
 // cos / distance^2, else 1), to turn a pdf per solid angle (BRDF sampling) into one per unit of the measure.
 LightSample restirLightSample(uint light, uint point, vec3 surfacePoint, out float toSolidAngle) {
@@ -1823,9 +1961,10 @@ LightSample restirLightSample(uint light, uint point, vec3 surfacePoint, out flo
         if (cosLight <= 1e-6) {
             return noLightSample();  // seen exactly edge-on
         }
-        s.distance = distance * 0.999;  // stop just short of the light itself
+        s.distance = distance - stopShortOf(lightPoint, lightNormal, cosLight);  // the light itself would block it
         toSolidAngle = cosLight / (distance * distance);
-        s.pdf = 1.0 / max(triangle.area, 1e-12);
+        float solidAngle = sphericalSolidAngle(triangle, surfacePoint);
+        s.pdf = solidAngle > 0.0 ? toSolidAngle / solidAngle : 1.0 / max(triangle.area, 1e-12);
         s.light = emissionAt(triangle.materialIndex, lightUv) * toSolidAngle;
     } else if (kind == LIGHT_KIND_PUNCTUAL) {
         s = punctualLightSample(punctualLights[index], surfacePoint);
@@ -1925,7 +2064,7 @@ void storeBounceHit(bool bounces, bool found, Intersection hit, vec3 direction, 
 // behind a window would otherwise get the BRDF share of its weight but never be found by a BRDF ray).
 bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Intersection hit) {
     rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.001, direction, 1000.0);
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.0, direction, RAY_FAR);
     while (rayQueryProceedEXT(rayQuery)) {
         if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
             blocksLight(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
@@ -1948,7 +2087,7 @@ bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Int
 // The RESTIR_PASS's candidates for a surface seen from direction v. Streaming RIS: each candidate replaces the
 // kept one with a chance of its weight / the sum of the weights so far.
 Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
-    vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+    vec3 surfacePoint = hit.position;
     bool twoSided = hit.diffuseTransmission > 0.0;
     uint triangles = scene.restirTriangleCandidates;
     uint punctual = scene.restirPunctualCandidates;
@@ -1970,9 +2109,12 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             if (index < 0) {
                 continue;
             }
-            float r1 = sqrt(randomFloat(seed));  // evenly over the triangle, as in sampleEmissiveLight
-            float r2 = randomFloat(seed);
-            point = packUnorm2x16(vec2(r1 * (1.0 - r2), r1 * r2));
+            vec3 weights;  // as in sampleEmissiveLight
+            if (!pointOnTriangle(emissiveTriangles[index], surfacePoint, vec2(randomFloat(seed), randomFloat(seed)),
+                                 weights)) {
+                continue;
+            }
+            point = packUnorm2x16(weights.yz);
             light = (LIGHT_KIND_TRIANGLE << 30) | uint(index);
         } else if (i < triangles + punctual) {
             uint count = scene.punctualLightCount;
@@ -2010,7 +2152,7 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
                 continue;  // on the wrong side of the real triangle (see tracePath)
             }
             Intersection found;
-            vec3 origin = hit.position + hit.geometricNormal * (side < 0.0 ? -0.001 : 0.001);
+            vec3 origin = offsetRay(hit.position, side < 0.0 ? -hit.geometricNormal : hit.geometricNormal);
             bool foundSurface;
             if (pathBounce) {
                 foundSurface = intersectClosest(origin, direction, seed, found);
@@ -2089,7 +2231,7 @@ float restirTargetOf(Reservoir r, Hit hit, vec3 v) {
         return 0.0;
     }
     float toSolidAngle, brdfPdf;
-    LightSample s = restirLightSample(r.light, r.point, hit.position + hit.geometricNormal * 0.001, toSolidAngle);
+    LightSample s = restirLightSample(r.light, r.point, hit.position, toSolidAngle);
     return restirTarget(hit, v, s, brdfPdf);
 }
 
@@ -2128,7 +2270,7 @@ RestirLightPoint restirLightPoint(Reservoir r) {
 
 // restirTargetOf from a looked-up sample (the same value)
 float restirTargetAt(RestirLightPoint p, Hit hit, vec3 v) {
-    vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+    vec3 surfacePoint = hit.position;
     LightSample s = noLightSample();
     if (p.kind == LIGHT_KIND_TRIANGLE) {
         vec3 toLight = p.position - surfacePoint;
@@ -2436,7 +2578,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         Hit hit;
         hit.found = found;
         if (found) {
-            hit = hitFromIntersection(intersection, origin, direction, coneWidth, coneSpread);
+            hit = hitFromIntersection(intersection, direction, coneWidth, coneSpread);
         }
         previousVertex = currentVertex;
         currentVertex = -1;
@@ -2499,7 +2641,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     float cosLight = abs(dot(hit.geometricNormal, direction));
                     float pickProbability = lightPickProbability(hit.lightIndex, reflectionPosition, reflectionNormal,
                                                                  reflectionTwoSided);
-                    weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, pickProbability, hit.t, cosLight));
+                    weight = misWeight(bouncePdf, lightPdf(hit.lightIndex, pickProbability, reflectionPosition, hit.t,
+                                                           cosLight));
                 }
             }
             // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
@@ -2624,9 +2767,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     }
                 } else if (slot == 2) {
                     if (restirVertex) {
-                        s = restirReservoirSample(pixel, hit.position + hit.geometricNormal * 0.001);
+                        s = restirReservoirSample(pixel, hit.position);
                     } else if (sampleLights) {
-                        s = sampleEmissiveLight(hit, hit.normal, hit.position + hit.geometricNormal * 0.001,
+                        s = sampleEmissiveLight(hit, hit.normal, hit.position,
                                                 pathSample(bounce, SAMPLE_EMISSIVE, seed).xyz);
                     }
                 } else {
@@ -2653,7 +2796,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 bool crossedGlass = false, crossedSolidGlass = false;
                 vec3 transmittance = vec3(1.0);
                 if (s.shadowed) {
-                    vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
+                    vec3 shadowOrigin = shadowRayStart(hit, behind, s);
                     transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
                     // The reservoir's sample is blocked: kept with W = 0, so every sample handed on to the next
                     // frame is known to be seen from its own surface (restirTemporal counts on that)
@@ -2734,7 +2877,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         }
         throughput *= weight;
         // Continue from just off the surface, on the side the new ray goes to.
-        origin = hit.position + hit.geometricNormal * (throughSurface ? -0.001 : 0.001);
+        origin = offsetRay(hit.position, throughSurface ? -hit.geometricNormal : hit.geometricNormal);
         if (transmitted) {
             throughGlass = true;
             throughSolidGlass = throughSolidGlass || hit.solid;
@@ -2879,9 +3022,9 @@ vec3 sampleCameraRay(ivec2 pixel, ivec2 size, inout uint seed) {
 // Whether a reservoir's sample is seen from a surface (a shadow ray; through glass counts as seen)
 bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
     float toSolidAngle;
-    LightSample s = restirLightSample(r.light, r.point, hit.position + hit.geometricNormal * 0.001, toSolidAngle);
+    LightSample s = restirLightSample(r.light, r.point, hit.position, toSolidAngle);
     bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
-    vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
+    vec3 shadowOrigin = shadowRayStart(hit, behind, s);
     bool crossedGlass, crossedSolidGlass;
     vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
     return any(greaterThan(transmittance, vec3(0.0)));
@@ -3010,7 +3153,7 @@ void restirPass(ivec2 pixel, ivec2 size) {
     reservoir.M = 0.0;
     if (found) {
         // The same surface the image pass will see (see tracePath's first bounce)
-        Hit hit = hitFromIntersection(intersection, scene.cameraPosition.xyz, direction, 0.0, scene.pixelSpreadAngle);
+        Hit hit = hitFromIntersection(intersection, direction, 0.0, scene.pixelSpreadAngle);
         tiltTowardsViewer(hit, direction);
         if (restirSurface(hit) && scene.restirDi != 0) {
             // Random numbers of their own: the image pass goes on with the pixel's (its bounce directions must
@@ -3021,11 +3164,11 @@ void restirPass(ivec2 pixel, ivec2 size) {
             // Before the merge, not after: tested only after it, a blocked fresh candidate could win over a visible
             // history sample, and that history would be lost (part C3: 1.7-3.7x the single-frame error)
             if (reservoir.W > 0.0) {
-                vec3 surfacePoint = hit.position + hit.geometricNormal * 0.001;
+                vec3 surfacePoint = hit.position;
                 float toSolidAngle;
                 LightSample s = restirLightSample(reservoir.light, reservoir.point, surfacePoint, toSolidAngle);
                 bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
-                vec3 shadowOrigin = hit.position + hit.geometricNormal * (behind ? -0.001 : 0.001);
+                vec3 shadowOrigin = shadowRayStart(hit, behind, s);
                 bool crossedGlass, crossedSolidGlass;
                 vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, candidateSeed,
                                                          crossedGlass, crossedSolidGlass);
@@ -3241,7 +3384,7 @@ float restirGiTarget(Hit hit, vec3 v, GiReservoir r) {
 // fallback search), so near edges and far away they often do: Sponza's side aisle, lit through gaps, came out 6%
 // too dark (whole image, Accumulation). With restirGiTemporalVisibility, as DI's: a ray from last frame's surface
 // to the fresh sample. Last frame's own sample needs none: shading dropped it (W = 0) if its surface didn't see it.
-bool restirGiVisible(Hit hit, vec3 x2, inout uint seed);
+bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed);
 GiReservoir restirGiTemporal(GiReservoir r, ivec2 pixel) {
     Hit hit = unpackRestirSurface(restirSurfaces[restirIndex(pixel, false)]);
     uint seed = pcgHash(pixelSeed(pixel) ^ 0x68e31da4u);
@@ -3268,7 +3411,7 @@ GiReservoir restirGiTemporal(GiReservoir r, ivec2 pixel) {
                        ? restirGiTarget(previousHit, previousV, r) * restirGiGeometry(previousHit.position, r) / geometry
                        : 0.0;
         if (scene.restirGiTemporalVisibility != 0 && currentThere > 0.0
-                && !restirGiVisible(previousHit, r.position, seed)) {
+                && !restirGiVisible(previousHit, r.position, r.normal, seed)) {
             currentThere = 0.0;
         }
     }
@@ -3353,16 +3496,22 @@ void restirGiTemporalPass(ivec2 pixel, bool inside) {
     }
 }
 
-// Whether a first surface sees a GI sample's x2. Glass blocks it: a bounce ray that hits glass gives no sample (the
-// path goes on through it and counts that light itself), so x2 behind glass is not one this surface could have.
-bool restirGiVisible(Hit hit, vec3 x2, inout uint seed) {
+// Whether a first surface sees a GI sample's x2 (geometric normal x2Normal, octahedral). Glass blocks it: a bounce
+// ray that hits glass gives no sample (the path goes on through it and counts that light itself), so x2 behind glass
+// is not one this surface could have.
+bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed) {
     float side = dot(x2 - hit.position, hit.geometricNormal);
-    vec3 origin = hit.position + hit.geometricNormal * (side < 0.0 ? -0.001 : 0.001);
+    vec3 origin = offsetRay(hit.position, side < 0.0 ? -hit.geometricNormal : hit.geometricNormal);
     vec3 toSample = x2 - origin;
     float distance = length(toSample);
+    vec3 direction = toSample / distance;
+    vec3 n2 = decodeDirection(x2Normal);
+    float stop = distance - stopShortOf(x2, n2, dot(n2, direction));
+    if (stop <= 0.0) {
+        return true;  // closer than the rounding error: nothing fits in between
+    }
     rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.001, toSample / distance,
-                          distance * 0.999);
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, direction, stop);
     traverse(rayQuery, seed);
     return rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -3397,7 +3546,7 @@ float restirGiSpatialCanonicalMis(GiReservoir canonical, float canonicalArea, fl
         float M = giReservoirs[restirGiFreshIndex(neighbor)].M;
         Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
         float there = restirGiAreaTarget(surface, normalize(scene.cameraPosition.xyz - surface.position), canonical);
-        if (there > 0.0 && !restirGiVisible(surface, canonical.position, seed)) {
+        if (there > 0.0 && !restirGiVisible(surface, canonical.position, canonical.normal, seed)) {
             there = 0.0;
         }
         mis += (M + canonicalM) / mSum * canonicalM * canonicalArea / (M * there + canonicalM * canonicalArea);
@@ -3513,7 +3662,8 @@ void restirGiSpatial(ivec2 pixel, ivec2 size) {
     } else if (scene.restirGiSpatialVisibility != 0 && keptNeighbor < 0xFFFFFFFEu) {
         // A kept neighbor sample: its own surface may not see it (from that pixel's history)
         ivec2 neighbor = pixel + restirNeighborOffset(keptNeighbor, start, scene.restirGiSpatialRadius);
-        if (!restirGiVisible(unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]), result.position, seed)) {
+        if (!restirGiVisible(unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]), result.position,
+                             result.normal, seed)) {
             correction = 0.0;
         }
     }
@@ -3539,15 +3689,15 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
     if (!loadPrimaryHit(pixel, seed, intersection)) {
         return;
     }
-    Hit hit = hitFromIntersection(intersection, scene.cameraPosition.xyz, direction, 0.0, scene.pixelSpreadAngle);
+    Hit hit = hitFromIntersection(intersection, direction, 0.0, scene.pixelSpreadAngle);
     tiltTowardsViewer(hit, direction);
-    if ((r.age & GI_SEEN) == 0u && !restirGiVisible(hit, r.position, seed)) {
+    if ((r.age & GI_SEEN) == 0u && !restirGiVisible(hit, r.position, r.normal, seed)) {
         giReservoirs[index].W = 0.0;
         return;
     }
     // From where the bounce ray started: off the surface, on the side it went to
     float side = dot(r.position - hit.position, hit.geometricNormal);
-    vec3 l = normalize(r.position - (hit.position + hit.geometricNormal * (side < 0.0 ? -0.001 : 0.001)));
+    vec3 l = normalize(r.position - offsetRay(hit.position, side < 0.0 ? -hit.geometricNormal : hit.geometricNormal));
     float pdf;
     vec3 light = evaluateBrdfWorld(hit, hit.normal, -direction, l, pdf) * abs(dot(hit.normal, l)) * r.radiance * r.W;
     // As the image pass's: one of samplesPerPixel paths, and the running average when accumulating

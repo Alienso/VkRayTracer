@@ -179,6 +179,13 @@ void Application::buildRenderingUi() {
     ImGui::Combo("Emissive light", &settings.emissiveSampling,
                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
     ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
+    ImGui::Checkbox("Glowing triangles by solid angle", &settings.emissiveSolidAngle);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Where on a glowing triangle shadow rays (and ReSTIR's candidates) go.\n"
+                          "On: spread evenly over the triangle as the surface sees it (its solid angle, Arvo 1995).\n"
+                          "Off: evenly over its area. For a large panel close to a surface, its near part fills most of\n"
+                          "the surface's view of it but gets few samples: noisier there.");
+    }
     ImGui::Combo("Light picking", &settings.lightPicking, "By power (whole scene)\0Light tree\0");
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Which glowing triangle a shadow ray goes to. By power: the brighter and larger, the more\n"

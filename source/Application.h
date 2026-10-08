@@ -104,14 +104,15 @@ struct SceneUniforms {
     float restirGiRadianceClamp;     // 0 = off; else the most a GI sample's light may be (luminance)
     uint32_t restirGiTemporalVisibility;  // 1 = unbiased temporal GI reuse (a ray from last frame's surface)
     uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
+    uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
 struct GpuInstance {
-    glm::mat4 motion;         // this frame's world position -> last frame's (motion vectors)
-    glm::mat3 objectToWorld;  // without the translation (directions, normals): the shader reads these instead of the
-    glm::mat3 worldToObject;  // ray query's, so hits stored by the ReSTIR camera-ray pass can be rebuilt the same way
+    glm::mat4 motion;           // this frame's world position -> last frame's (motion vectors)
+    glm::mat4x3 objectToWorld;  // the shader reads these instead of the ray query's, so hits stored by the ReSTIR
+    glm::mat3 worldToObject;    // camera-ray pass can be rebuilt the same way. Without the translation (normals)
 };
 
 // One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
@@ -485,6 +486,9 @@ struct RenderSettings {
     // points shifted per pixel by a blue-noise texture (also neighboring pixels' samples differ evenly). Blue noise
     // measured no better under DLSS and 22% worse in Bistro at night when accumulating (see LIMITATIONS.md).
     int pathSampling = 1;
+    // Points on glowing triangles: spread evenly over the triangle's solid angle as the surface sees it (Arvo 1995),
+    // or evenly over its area (then a large panel close by gets most samples in its far parts)
+    bool emissiveSolidAngle = true;
     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)

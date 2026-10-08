@@ -797,6 +797,7 @@ SceneUniforms Application::buildSceneUniforms() {
     uniforms.restirGiPermutation = settings.restirGiPermutation ? 1 : 0;
     uniforms.restirGiTemporalVisibility = settings.restirGiTemporalVisibility ? 1 : 0;
     uniforms.pathSampling = static_cast<uint32_t>(std::clamp(settings.pathSampling, 0, 2));
+    uniforms.emissiveSolidAngle = settings.emissiveSolidAngle ? 1 : 0;
     bool giSpatial = settings.restirGiSpatial && uniforms.restirGi != 0;
     uniforms.restirGiSpatialNeighbors = giSpatial ? static_cast<uint32_t>(std::max(settings.restirGiSpatialNeighbors, 0)) : 0;
     uniforms.restirGiSpatialRadius = settings.restirGiSpatialRadius;
