@@ -51,7 +51,7 @@ the white furnace reaches 93% of the background at 8 bounces, 96.6% at 16.
 glTF gives the attenuation distance in the file's world units; the shader converts mesh units using the
 glTF node's scale (`MeshInfo.unitScale`). A mesh used by several nodes with different scales takes the first
 node's scale. The volume's thickness texture is not used (not needed: we trace the real geometry).
-- Where: `uploadSceneGeometry` (source/Scene.cpp).
+- Where: `uploadSceneGeometry` (source/scene/Scene.cpp).
 
 ### Shadow-ray tint uses the flat triangle normal
 The Fresnel factor of glass along a shadow ray uses the triangle's flat normal and ignores roughness and
@@ -63,7 +63,7 @@ normal maps.
 ### Energy compensation is an approximation (Turquin 2019)
 The light lost by single-bounce GGX is added back by scaling the reflection lobe. The restored light keeps the
 glossy lobe's shape (real multiple scattering is a bit wider) and the result is not exactly reciprocal.
-- Where: `reflectionEnergy` (shader), `createSpecularAlbedoTable` (source/Materials.cpp).
+- Where: `reflectionEnergy` (shader), `createSpecularAlbedoTable` (source/renderer/Materials.cpp).
 - Fix: Kulla-Conty 2017 (separate multiple-scattering lobe).
 
 ### Diffuse weighting differs from the glTF reference
@@ -98,7 +98,7 @@ Each glowing triangle is weighted by its emissive texture's average, measured at
 triangle gets probability 0 and its light is then found only by bounce rays (correct, but noisier there).
 Alpha (cut-out holes) is not part of the weight, and within a picked triangle the point is still chosen
 uniformly, not by texture brightness. Built-in models have no emissive textures.
-- Where: `computeEmissiveTextureAverages` (source/ModelLoader.cpp), `buildLightList` (source/Lights.cpp).
+- Where: `computeEmissiveTextureAverages` (source/assets/ModelLoader.cpp), `buildLightList` (source/renderer/Lights.cpp).
 - Fix: a small minimum weight for every triangle, or importance-sample texels within the triangle.
 
 ### Light list and light tree are rebuilt on the CPU
@@ -118,7 +118,7 @@ is simple; a split by cost (SAH-like, as in BVHs) would group lights better. Mea
 (2048-frame reference, 64 frames): street views 2.3x to 4.4x less noise, and up to 8x per unit of GPU time. Scenes
 with one or a few lights are unchanged (Cornell box), and so is Bistro Interior, lit mostly by its spots. Picking
 "By power" in Rendering brings back the old way, for comparison.
-- Where: `buildLightTree` (source/Lights.cpp), `lightTreeImportance` / `pickFromLightTree` /
+- Where: `buildLightTree` (source/renderer/Lights.cpp), `lightTreeImportance` / `pickFromLightTree` /
   `lightPickProbability` (shaders/raytrace.comp).
 - Partly fixed by ReSTIR DI (below) at the first surface the camera sees, in the DLSS modes: its reuse keeps the
   samples that turned out visible. Deeper bounces, and Accumulation by default, still pick by the tree alone.
@@ -151,7 +151,7 @@ and mirrors don't show them (no ray can hit a point). When an object is scaled (
 intensity is scaled by the square of that, so the model stays lit the same. A point light touching geometry (a bulb
 inside its lamp) makes those surfaces extremely bright a few centimeters away: speckles everywhere, as paths find
 them only rarely. Such files need the light moved out, or a spot that keeps the fixture outside its cone.
-- Where: `samplePunctualLights` (shaders/raytrace.comp), `buildPunctualLightList` (source/Lights.cpp).
+- Where: `samplePunctualLights` (shaders/raytrace.comp), `buildPunctualLightList` (source/renderer/Lights.cpp).
 
 ### Sky sampling doesn't know what blocks the sky
 Shadow rays pick sky directions by brightness alone. For an HDR map that is what matters (its sun gets the
@@ -163,7 +163,7 @@ by rare bounce rays alone: one frame's error 4000x higher than with sampling, an
 patches never settled. Measured with the gradient sky and sun, DLAA, On vs Auto: one-frame error -74% in that aisle
 (+0.5 ms), -44% in Sponza's hall (+3.1 ms), -51% in Bistro Exterior (no measurable cost: ReSTIR DI takes the sky
 into its reservoir at the first surface).
-- Where: source/Environment.cpp (the table), `sampleEnvironment` and the sky slot of the light loop in `tracePath`.
+- Where: source/renderer/Environment.cpp (the table), `sampleEnvironment` and the sky slot of the light loop in `tracePath`.
 - Fix: also weight by the surface's cosine (a few tables per normal direction), or learn which directions are
   open per region of the scene (path guiding).
 
@@ -274,7 +274,7 @@ What is left: surfaces lying on top of each other (decals, overlapping cloth) ca
 2 mm used to hide them. Smooth normals on coarse meshes still give the jagged shadow edge of the "shadow
 terminator" problem; nothing handles that. Rays towards point lights still stop 0.1% short.
 - Where: `offsetRay`, `stopShortOf`, `shadowRayStart`, `hitFromIntersection` (shaders/raytrace.comp); the
-  instance's translation in `GpuInstance` (source/Application.h).
+  instance's translation in `GpuInstance` (source/app/Application.h).
 
 ## Radiance cache
 
@@ -291,7 +291,7 @@ Sponza within 0.1%, the dark corner by the basin within the measurement's ±2-3%
 -0.1%. Cached values come from update paths that hit the cell at any depth, so they don't carry exactly
 `maxBounces` minus the depth of the path that reads them, and the light rules of glass and "Blur caustics"
 follow the update path's own history.
-- Where: shaders/raytrace.comp ("Radiance cache"), source/RadianceCache.cpp.
+- Where: shaders/raytrace.comp ("Radiance cache"), source/renderer/RadianceCache.cpp.
 - Workaround: the "Radiance cache" checkbox gives the plain path tracer (the noise reference always uses it).
 
 ### Dark corners look brighter with the cache than without (after the same time)
@@ -358,8 +358,8 @@ ray cone (`uvFootprint`), filtered anisotropically. Simplifications:
 - Measured: Sponza trace -15 to -30 %, Bistro Exterior ~-2 % (its cost is the geometry and the cut-out foliage),
   the helmet unchanged. Texture memory +33 % (Bistro Exterior 774 -> 1043 MB).
 - Where: `uvFootprint`, `traceClosest`, `sampleTexture` (shader), `generateMipLevels`, `getSampler`
-  (source/Materials.cpp), `pixelSpreadAngle` (source/RayTracer.cpp), `makeNormalVarianceTexture`
-  (source/ModelLoader.cpp), Rendering tab "Texture mipmaps".
+  (source/renderer/Materials.cpp), `pixelSpreadAngle` (source/renderer/RayTracer.cpp), `makeNormalVarianceTexture`
+  (source/assets/ModelLoader.cpp), Rendering tab "Texture mipmaps".
 
 ### DDS textures: no CPU copy
 DDS files (`MSFT_texture_dds`) in BC1/BC2/BC3/BC5/BC7 go to the GPU still compressed, with the mip levels the file
@@ -367,7 +367,7 @@ has (a DDS without them gets none: compressed blocks can't be averaged without d
 and Y only; the shader rebuilds Z.
 Compressed emissive textures are not decoded on the CPU, so light sampling weights their triangles by the
 emissive constant alone (noisier when only small parts glow); the Bistro converter writes PNG emissives for this reason.
-- Where: `readDds` (source/ModelLoader.cpp), `toVulkan` (source/Materials.cpp), `normalTwoChannel` (shader).
+- Where: `readDds` (source/assets/ModelLoader.cpp), `toVulkan` (source/renderer/Materials.cpp), `normalTwoChannel` (shader).
 - Fix: a small CPU BC1/BC3 decoder for the emissive averages.
 
 ### Bistro conversion is approximate
@@ -401,7 +401,17 @@ An object's instances (one per part of its model) and their shader data are rebu
 only when an object, a part's visibility or a material changed, or something moved the frame before: with
 millions of instances doing it every frame would cost tens of milliseconds. Moving an object in a scene that
 large is slow (every instance is remade per frame while it moves).
-- Where: `updateScene` (source/Scene.cpp).
+- Where: `Scene::buildRenderList` (source/scene/Scene.cpp), `updateScene` (source/renderer/SceneGpu.cpp).
+
+### Loading and unloading a model stalls a frame
+Deleting the last object of a model unloads it at once (meshes, materials, textures, their GPU copies); adding it
+again reads the file again. Either way the renderer waits for the GPU, re-packs all meshes into new vertex/index
+buffers and remakes the material buffer, the instances, the light list and the radiance cache (only BLASes and
+textures of the models that stay are kept). Fine for single models; with a big scene loaded, deleting a small object
+still costs the re-pack of the big one (all its vertices and indices copied to the GPU again).
+- Fix: per-mesh buffers or a sub-allocator (free one range, no re-pack); keep unused models for a while (a memory
+  budget) so deleting and re-adding is instant.
+- Where: `AssetStore::release` / `unload` (source/assets/AssetStore.cpp), `updateScene` (source/renderer/SceneGpu.cpp).
 
 ### Unsupported glTF features
 - Second UV set (`TEXCOORD_1`): the first set is used instead (a warning is printed).
@@ -410,7 +420,7 @@ large is slow (every instance is remade per frame while it moves).
 - Ambient occlusion and height maps are ignored on purpose (AO comes from ray tracing).
 - Other material extensions (clearcoat, sheen, specular, iridescence, anisotropy, ...) are ignored.
 - Cameras in the file are ignored (lights are read: KHR_lights_punctual).
-- Where: source/ModelLoader.cpp.
+- Where: source/assets/ModelLoader.cpp.
 
 ### No OBJ or FBX loader
 Only glTF / GLB is loaded; FBX scenes go through Blender first (see "Bistro conversion is approximate").
@@ -425,8 +435,8 @@ pixel at 1 and let it accumulate). The window shows it shrunk by a linear blit, 
 fine edges shimmer in the preview, not in the capture. The radiance cache's cells stay sized for the window (else
 they would get smaller and many more); ReSTIR's spatial radius stays in render pixels, so it covers less of the
 scene at a bigger size.
-- Where: `chooseExtents`, `applyOutputSize` (source/Display.cpp), the blit in `recordRayTracing` and
-  `cacheCellScale` in `buildSceneUniforms` (source/RayTracer.cpp).
+- Where: `chooseExtents`, `applyOutputSize` (source/renderer/Display.cpp), the blit in `recordRayTracing` and
+  `cacheCellScale` in `buildSceneUniforms` (source/renderer/RayTracer.cpp).
 - Fix (preview): a proper downscale filter (a compute pass averaging all covered pixels).
 
 ### Auto exposure meters like a camera
@@ -436,7 +446,7 @@ Like a real light meter, it maps the average to middle grey, so a mostly white s
 histogram covers luminance 2^-16 .. 2^12; darker pixels count as black and are not metered. While
 accumulating, the measurement comes from the averaged image, so early noisy frames may meter slightly
 differently from the converged result.
-- Where: shaders/exposure.comp, source/Exposure.cpp (applied in shaders/display.comp).
+- Where: shaders/exposure.comp, source/renderer/Exposure.cpp (applied in shaders/display.comp).
 - Fix (if it matters): a smarter metering mode.
 
 ### The noise measurement's reference has noise too
@@ -447,7 +457,7 @@ luminance's only (colour noise doesn't count), relative to the reference plus 1%
 In very noisy views (Sponza's dark corners) even a 8192-frame reference is ±2-3% off over an 80x180 pixel
 region; compare brightness with a control run (the same renderer against its own reference). Judge brightness
 by the HDR numbers, not by screenshots: tone mapping compresses unconverged bright pixels.
-- Where: source/Noise.cpp, shaders/noise.comp.
+- Where: source/renderer/Noise.cpp, shaders/noise.comp.
 
 ## DLSS / Streamline (Phase 7)
 
@@ -460,7 +470,7 @@ forced), DXGI or a D3D12 device in the process (tested without Streamline: no ca
 (also capped with no features requested), and the "Vulkan/OpenGL present method" setting.
 - Workaround: NVIDIA Control Panel > Manage 3D settings > Program Settings > add `vulkanDemo.exe` >
   Vertical sync = Off. Or start with `--no-dlss` when DLSS isn't needed.
-- Where: `initStreamline` (source/Dlss.cpp).
+- Where: `initStreamline` (source/renderer/Dlss.cpp).
 
 ### Specular hit distance is often unknown
 DLSS gets the distance from the first surface to what its reflection (or refraction) shows. It comes for free
@@ -475,7 +485,7 @@ With Streamline loaded (vsync off), the helmet scene takes 1.57 ms per frame ins
 Streamline function is called per frame yet. Likely the driver's handling of "DLSS games" (its overlay and
 telemetry DLLs get loaded into the process); not investigated further. Small next to the DLSS evaluation itself.
 - Workaround: start with `--no-dlss` (Streamline isn't loaded at all; no DLSS modes then).
-- Where: `initStreamline` (source/Dlss.cpp).
+- Where: `initStreamline` (source/renderer/Dlss.cpp).
 
 ### DLSS RR darkens Sponza's shade a little
 In Sponza DLSS RR comes out darker than the accumulated reference: ~7% on sunlit walls and ~17% under the
@@ -484,7 +494,7 @@ the big arch). Not changed by 4 samples per pixel, by `exposureScale` (146 vs 1)
 hit distance, or by moving everything into the diffuse albedo. The other test scenes (helmet, Cornell box,
 dragon, glass) match the reference within ~1/255. Probably DLSS's firefly suppression costing energy where the
 noisy input consists of rare bright samples.
-- Where: DLSS itself (source/Dlss.cpp only passes the inputs).
+- Where: DLSS itself (source/renderer/Dlss.cpp only passes the inputs).
 - Workarounds to try: more light paths per pixel for that light (e.g. a firefly-free estimator for the bounce
   from the sunlit floor), or exposure compensation in DLSS modes.
 

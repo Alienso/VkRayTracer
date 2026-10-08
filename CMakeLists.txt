@@ -9,6 +9,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
 
 include_directories(${PROJECT_SOURCE_DIR}/include/)
+include_directories(${PROJECT_SOURCE_DIR}/source/)  # project headers by folder: "renderer/Renderer.h"
 include_directories(${PROJECT_SOURCE_DIR}/include/imgui/)
 include_directories(C:/VulkanSDK/1.4.363.0/Include/)
 
@@ -33,24 +34,20 @@ add_executable(vulkanDemo main.cpp
 
         include/stb_image.cpp include/stb_image.h
         include/stb_image_write.cpp include/stb_image_write.h
-        source/Application.cpp source/Application.h
-        source/Configuration.cpp source/Configuration.h
-        source/VulkanInitHelper.cpp source/ImGuiInit.cpp
-        source/VulkanExtensions.cpp source/VulkanExtensions.h
-        source/RayTracer.cpp
-        source/Camera.cpp source/Camera.h
-        source/ModelLoader.cpp source/ModelLoader.h
-        source/Scene.cpp source/Materials.cpp
-        source/BuiltInModels.cpp source/BuiltInModels.h
-        source/Lights.cpp
-        source/Environment.cpp
-        source/Exposure.cpp
-        source/Noise.cpp
-        source/RadianceCache.cpp
-        source/Display.cpp
-        source/Capture.cpp
-        source/BlueNoise.cpp
-        source/Dlss.cpp
+        source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
+        source/app/CameraController.cpp source/app/CameraController.h
+        source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp
+        source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneEnvironment.h source/scene/Camera.cpp
+        source/scene/Camera.h source/scene/RenderList.h
+        source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/ModelLoader.cpp
+        source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
+        source/renderer/Renderer.cpp source/renderer/Renderer.h source/renderer/GpuAssets.h
+        source/renderer/RayTracer.cpp source/renderer/SceneGpu.cpp source/renderer/Materials.cpp
+        source/renderer/Lights.cpp source/renderer/Environment.cpp source/renderer/Display.cpp
+        source/renderer/Dlss.cpp source/renderer/Exposure.cpp source/renderer/Capture.cpp source/renderer/Noise.cpp
+        source/renderer/RadianceCache.cpp source/renderer/BlueNoise.cpp source/renderer/ImGuiInit.cpp
+        source/renderer/VulkanExtensions.cpp source/renderer/VulkanExtensions.h source/renderer/VulkanInitHelper.cpp
+        source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
         include/cgltf/cgltf.h)
 
 target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
