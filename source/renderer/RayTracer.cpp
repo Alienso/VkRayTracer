@@ -483,7 +483,7 @@ void Renderer::createRayTracingDescriptors() {
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
     // 29: ReSTIR GI reservoirs, 30: blue noise
-    std::vector<VkDescriptorSetLayoutBinding> bindings(31);
+    std::vector<VkDescriptorSetLayoutBinding> bindings(32);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -513,6 +513,7 @@ void Renderer::createRayTracingDescriptors() {
     bindings[28] = {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[29] = {29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[30] = {30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -536,7 +537,7 @@ void Renderer::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -600,12 +601,13 @@ void Renderer::updateRayTracingDescriptorSet() {
     VkDescriptorBufferInfo bounceHitInfo{bounceHitBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo giReservoirInfo{giReservoirBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo blueNoiseInfo{blueNoiseBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo portalInfo{portalBuffer.buffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
     for (const GpuTexture& texture : gpuAssets.textures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(31);
+    std::vector<VkWriteDescriptorSet> writes(32);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -667,6 +669,8 @@ void Renderer::updateRayTracingDescriptorSet() {
     writes[29].pBufferInfo = &giReservoirInfo;
     writes[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[30].pBufferInfo = &blueNoiseInfo;
+    writes[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[31].pBufferInfo = &portalInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -808,6 +812,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.environmentRotation = glm::radians(environment.mapRotation);
     uniforms.environmentIntensity = environment.mapIntensity;
     uniforms.punctualLightCount = static_cast<uint32_t>(uploadedPunctualLights.size());
+    uniforms.portalCount = static_cast<uint32_t>(uploadedPortals.size());
     uniforms.samplesPerPixel = static_cast<uint32_t>(std::max(settings.samplesPerPixel, 1));
     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
@@ -978,6 +983,9 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     }
     if (punctualLightsUploadPending) {
         recordPunctualLightUpload(commandBuffer);
+    }
+    if (portalsUploadPending) {
+        recordPortalUpload(commandBuffer);
     }
 
     // 0: upload this frame's uniforms. vkCmdUpdateBuffer copies the data into the command buffer
@@ -1206,6 +1214,7 @@ void Renderer::cleanupRayTracing() {
     vkDestroyQueryPool(device, timestampQueryPool, nullptr);
     destroyTextures();
     destroyLightBuffers();
+    destroyPortalBuffer();
     destroyEnvironment();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);

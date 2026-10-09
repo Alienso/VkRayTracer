@@ -34,6 +34,7 @@ private:
 
     // Scene tab (EditorScene.cpp)
     int selectedObject = -1;
+    int selectedPortal = -1;  // index into scene.portals()
     int modelToAdd = 0;  // index into assets.modelFiles()
     bool addAtOriginalSize = false;  // new objects keep the file's size (whole scenes like Sponza)
     std::string loadError;
@@ -52,6 +53,7 @@ private:
     void buildSceneUi();
     void buildMaterialUi(const SceneModel& model);
     void buildPunctualLightUi(SceneModel& model);
+    void buildPortalUi();
 };
 
 #endif //VULKANDEMO_EDITOR_H

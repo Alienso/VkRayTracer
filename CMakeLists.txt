@@ -38,12 +38,12 @@ add_executable(vulkanDemo main.cpp
         source/app/CameraController.cpp source/app/CameraController.h
         source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp
         source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneEnvironment.h source/scene/Camera.cpp
-        source/scene/Camera.h source/scene/RenderList.h
+        source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
         source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/ModelLoader.cpp
         source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
         source/renderer/Renderer.cpp source/renderer/Renderer.h source/renderer/GpuAssets.h
         source/renderer/RayTracer.cpp source/renderer/SceneGpu.cpp source/renderer/Materials.cpp
-        source/renderer/Lights.cpp source/renderer/Environment.cpp source/renderer/Display.cpp
+        source/renderer/Lights.cpp source/renderer/Portals.cpp source/renderer/Environment.cpp source/renderer/Display.cpp
         source/renderer/Dlss.cpp source/renderer/Exposure.cpp source/renderer/Capture.cpp source/renderer/Noise.cpp
         source/renderer/RadianceCache.cpp source/renderer/BlueNoise.cpp source/renderer/ImGuiInit.cpp
         source/renderer/VulkanExtensions.cpp source/renderer/VulkanExtensions.h source/renderer/VulkanInitHelper.cpp

@@ -141,6 +141,24 @@ void Renderer::updateScene() {
         }
     }
 
+    // 5b: portals, the same way: what the rays see changed
+    buildPortalList();
+    if (framePortals.size() != uploadedPortals.size() ||
+        std::memcmp(framePortals.data(), uploadedPortals.data(), framePortals.size() * sizeof(GpuPortal)) != 0) {
+        uploadedPortals = framePortals;
+        portalsUploadPending = true;
+        resetAccumulation = true;
+        cacheClearPending = true;
+        VkDeviceSize size = sizeof(GpuPortal) * uploadedPortals.size();
+        if (size > portalBuffer.capacity) {
+            vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+            ensureStreamedCapacity(portalBuffer, size);
+            if (rtDescriptorSet != VK_NULL_HANDLE) {
+                updateRayTracingDescriptorSet();
+            }
+        }
+    }
+
     // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list.
     if (tlasDirty || gpuAssets.materialsDirty) {
         buildLightList();  // uploaded in this frame's command buffer

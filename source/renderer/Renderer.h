@@ -103,6 +103,7 @@ struct SceneUniforms {
     uint32_t restirGiTemporalVisibility;  // 1 = unbiased temporal GI reuse (a ray from last frame's surface)
     uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
     uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
+    uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
     alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
@@ -380,6 +381,18 @@ struct GpuPunctualLight {
     float cosInnerCone;
 };
 
+// Must match Portal in shaders/raytrace.comp (scalar layout). One per end of every enabled portal pair, in world space,
+// rebuilt every frame (see updateScene); a pair's ends are entries 2k and 2k + 1.
+struct GpuPortal {
+    glm::vec3 center;
+    float halfWidth;
+    glm::vec3 normal;        // the side it faces
+    float halfHeight;
+    glm::vec3 right;         // along its width
+    uint32_t shape;          // PortalShape
+    glm::mat4x3 toPartner;   // takes points (and directions) from this end to the other one
+};
+
 // A device-local buffer the CPU refills from time to time. The CPU writes into a staging buffer of the
 // current frame in flight (the other frame may still be copying from its own), then the GPU copies it over.
 struct StreamedBuffer {
@@ -634,6 +647,11 @@ private:
     std::vector<GpuPunctualLight> uploadedPunctualLights;
     StreamedBuffer punctualLightBuffer;
     bool punctualLightsUploadPending = false;
+    // Portals (Portals.cpp): as the punctual lights
+    std::vector<GpuPortal> framePortals;
+    std::vector<GpuPortal> uploadedPortals;
+    StreamedBuffer portalBuffer;
+    bool portalsUploadPending = false;
 
     // Environment (Environment.cpp): the HDR map, and the table the shader picks sky directions from
     uint64_t uploadedEnvironmentId = 0;  // EnvironmentMap::id of what environmentTexture holds (0: none yet)
@@ -911,6 +929,12 @@ private:
     void recordLightUpload(VkCommandBuffer commandBuffer);
     void buildPunctualLightList();
     void recordPunctualLightUpload(VkCommandBuffer commandBuffer);
+
+    // Portals.cpp
+    void createPortalBuffer();
+    void destroyPortalBuffer();
+    void buildPortalList();
+    void recordPortalUpload(VkCommandBuffer commandBuffer);
 
     // Environment.cpp
     void createEnvironment();

@@ -36,6 +36,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createBlueNoiseTexture();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
     createLightBuffers();
+    createPortalBuffer();
     createEnvironment();
     updateScene();  // uploads the geometry, builds the BLASes and collects the instances (and the render list)
     updateEnvironment();  // the sky's sampling table, uploaded with the first frame

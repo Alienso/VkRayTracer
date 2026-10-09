@@ -15,6 +15,7 @@
 #include "assets/AssetStore.h"
 #include "scene/Camera.h"
 #include "core/Handles.h"
+#include "scene/Portal.h"
 #include "scene/RenderList.h"
 #include "scene/SceneEnvironment.h"
 
@@ -53,7 +54,13 @@ public:
     // Releases its model (AssetStore::release): the last object of a model unloads it.
     void removeObject(int index);
 
-    // This frame's instances, lights, camera and environment, into list. Call once per frame: it also tracks each object's last-frame
+    // A new portal pair in front of the camera: its two ends side by side, facing the camera. Returns its index.
+    int addPortalPair();
+    void removePortalPair(int index);
+    std::vector<PortalPair>& portals() { return portalList; }
+    [[nodiscard]] const std::vector<PortalPair>& portals() const { return portalList; }
+
+    // This frame's instances, lights, portals, camera and environment, into list. Call once per frame: it also tracks each object's last-frame
     // transform (motion vectors). The instances are only remade when an object changed or something moved last
     // frame (see RenderList.h); the lights every time.
     void buildRenderList(RenderList& list);
@@ -73,6 +80,8 @@ public:
 private:
     AssetStore& assets;
     std::vector<SceneObject> objectList;
+    std::vector<PortalPair> portalList;
+    int portalPairsMade = 0;  // for their names
     Camera sceneCamera;
     SceneEnvironment sceneEnvironment;
 };

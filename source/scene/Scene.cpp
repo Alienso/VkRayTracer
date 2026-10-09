@@ -1,5 +1,5 @@
 //
-// The scene's objects: adding, duplicating and removing them. See Scene.h.
+// The scene's objects and portals: adding, duplicating and removing them. See Scene.h.
 //
 
 #include "scene/Scene.h"
@@ -10,13 +10,20 @@
 #include "assets/BuiltInModels.h"
 #include "core/Configuration.h"
 
-glm::mat4 SceneObject::transform() const {
-    // Read right to left: scale first, then rotate, then move into place.
+// Read right to left: rotate, then move into place. Rotation in degrees: yaw (Y), then pitch (X), then roll (Z).
+static glm::mat4 placement(const glm::vec3& position, const glm::vec3& rotation) {
     glm::mat4 m = glm::translate(glm::mat4(1.0f), position);
     m = glm::rotate(m, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
     m = glm::rotate(m, glm::radians(rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    m = glm::rotate(m, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
-    return glm::scale(m, scale);
+    return glm::rotate(m, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+}
+
+glm::mat4 SceneObject::transform() const {
+    return glm::scale(placement(position, rotation), scale);  // scaled first
+}
+
+glm::mat4 PortalEnd::transform() const {
+    return placement(position, rotation);
 }
 
 Scene::Scene(AssetStore& assets) : assets(assets) {}
@@ -80,6 +87,28 @@ void Scene::removeObject(int index) {
     assets.release(model);  // the last object showing it: the model is unloaded
 }
 
+int Scene::addPortalPair() {
+    // 3 units ahead of the camera (level), the ends 1.5 to either side, turned to face it
+    glm::vec3 forward = sceneCamera.forward();
+    forward.y = 0.0f;
+    forward = glm::length(forward) > 1e-4f ? glm::normalize(forward) : glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+    glm::vec3 center = sceneCamera.position + forward * 3.0f;
+    float yaw = glm::degrees(std::atan2(-forward.x, -forward.z)) + 0.0f;  // +Z towards the camera (+ 0: no -0)
+
+    PortalPair pair;
+    pair.name = "Portal " + std::to_string(++portalPairsMade);
+    pair.ends[0].position = center - right * 1.5f;
+    pair.ends[1].position = center + right * 1.5f;
+    pair.ends[0].rotation = pair.ends[1].rotation = glm::vec3(0.0f, yaw, 0.0f);
+    portalList.push_back(pair);
+    return static_cast<int>(portalList.size()) - 1;
+}
+
+void Scene::removePortalPair(int index) {
+    portalList.erase(portalList.begin() + index);
+}
+
 void Scene::buildRenderList(RenderList& list) {
     std::vector<RenderList::BuiltObject> current;
     current.reserve(objectList.size());
@@ -97,6 +126,14 @@ void Scene::buildRenderList(RenderList& list) {
         list.revision++;
     }
     list.lights.clear();
+    list.portals.clear();
+    for (const PortalPair& pair : portalList) {
+        if (pair.enabled) {
+            for (const PortalEnd& end : pair.ends) {
+                list.portals.push_back({end.transform(), pair.size * 0.5f, pair.shape});
+            }
+        }
+    }
 
     for (size_t o = 0; o < objectList.size(); o++) {
         SceneObject& object = objectList[o];

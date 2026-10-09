@@ -1,6 +1,6 @@
 //
-// The editor's Scene tab: adding models, the object list, an object's transform, parts, materials and lights, and
-// the actions behind it. It changes the Scene and the assets' materials and lights; the renderer picks the changes
+// The editor's Scene tab: adding models, the object list, an object's transform, parts, materials and lights,
+// portals, and the actions behind it. It changes the Scene and the assets' materials and lights; the renderer picks the changes
 // up through the render list and the asset store's revisions.
 //
 
@@ -153,6 +153,8 @@ void Editor::buildSceneUi() {
         ImGui::PopID();
     }
 
+    buildPortalUi();
+
     ImGui::Text("%zu models, %zu meshes, %zu instances", assets.modelCount(), stats.meshes, stats.instances);
     ImGui::Text("%zu materials, %zu textures (%.1f MB)", assets.materials().size(), stats.textures,
                 stats.textureMemory / (1024.0 * 1024.0));
@@ -160,6 +162,62 @@ void Editor::buildSceneUi() {
                 stats.sampledEmissiveTriangles);
     ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
                 stats.blasBuildSize / (1024.0 * 1024.0), stats.blasSize / (1024.0 * 1024.0));
+}
+
+// Portal pairs: the list, and the selected pair's shape, size and its two ends' places
+void Editor::buildPortalUi() {
+    std::vector<PortalPair>& pairs = scene.portals();
+    if (!ImGui::TreeNode("portals", "Portals (%zu pairs)", pairs.size())) {
+        return;
+    }
+    if (ImGui::Button("Add portal pair")) {
+        selectedPortal = scene.addPortalPair();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Two openings that are one window: what goes into one comes out of the other,\n"
+                          "front to front and back to back. An end faces its +Z (rotation 0: towards +Z).\n"
+                          "Light from the sun and lamps doesn't pass through them yet, only bounced light.");
+    }
+    if (!pairs.empty() && ImGui::BeginListBox("##portalList", ImVec2(0.0f, 3.0f * ImGui::GetTextLineHeightWithSpacing()))) {
+        for (int i = 0; i < static_cast<int>(pairs.size()); i++) {
+            ImGui::PushID(i);
+            std::string label = pairs[i].name + (pairs[i].enabled ? "" : "  (off)");
+            if (ImGui::Selectable(label.c_str(), i == selectedPortal)) {
+                selectedPortal = i;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndListBox();
+    }
+
+    if (selectedPortal >= 0 && selectedPortal < static_cast<int>(pairs.size())) {
+        ImGui::PushID("selectedPortal");
+        PortalPair& pair = pairs[selectedPortal];
+        ImGui::Checkbox("Enabled", &pair.enabled);
+        static const char* shapeNames[] = {"Rectangle", "Ellipse"};
+        int shape = static_cast<int>(pair.shape);
+        if (ImGui::Combo("Shape", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
+            pair.shape = static_cast<PortalShape>(shape);
+        }
+        ImGui::DragFloat2("Size", &pair.size.x, 0.01f, 0.01f, 100.0f);
+        ImGui::SameLine();
+        ImGui::TextDisabled("width, height");
+        for (int e = 0; e < 2; e++) {
+            ImGui::PushID(e);
+            ImGui::SeparatorText(e == 0 ? "End A" : "End B");
+            ImGui::DragFloat3("Position", &pair.ends[e].position.x, 0.01f);
+            ImGui::DragFloat3("Rotation", &pair.ends[e].rotation.x, 0.5f, 0.0f, 0.0f, "%.1f");
+            ImGui::PopID();
+        }
+        if (ImGui::Button("Delete portal pair")) {
+            scene.removePortalPair(selectedPortal);
+            selectedPortal = std::min(selectedPortal, static_cast<int>(pairs.size()) - 1);
+        }
+        ImGui::PopID();
+    }
+    ImGui::TreePop();
 }
 
 // Materials belong to the model, so editing one changes every object that shows that model.

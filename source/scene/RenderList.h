@@ -6,7 +6,7 @@
 //
 // Big scenes (vegetation) have millions of instances, too many to remake every frame: the Scene remakes them only
 // when an object changed, or something moved last time (its motion is then only right for that one frame).
-// Punctual lights are few and remade every frame.
+// Punctual lights and portals are few and remade every frame.
 //
 
 #ifndef VULKANDEMO_RENDERLIST_H
@@ -18,6 +18,7 @@
 #include "scene/Camera.h"
 #include "core/Handles.h"
 #include "assets/ModelLoader.h"
+#include "scene/Portal.h"
 #include "scene/SceneEnvironment.h"
 
 // One mesh placed in the world: a visible part of a visible object
@@ -39,6 +40,13 @@ struct RenderLight {
     float scale;      // the object's (and fit's) scale: distances in the file grow by this much
 };
 
+// One end of an enabled portal pair. The pairs' ends follow each other: entries 2k and 2k + 1 are a pair.
+struct RenderPortal {
+    glm::mat4 world;      // PortalEnd::transform: the opening in its XY plane, facing +Z
+    glm::vec2 halfSize;   // half the width and height
+    PortalShape shape;
+};
+
 class RenderList {
 public:
     std::vector<RenderInstance> instances;
@@ -46,6 +54,7 @@ public:
     // its instances: a part's world matrix is object * fit * part, and only the object's transform changes.
     std::vector<glm::mat4> motions;
     std::vector<RenderLight> lights;
+    std::vector<RenderPortal> portals;
     Camera camera;                 // copied every frame
     SceneEnvironment environment;  // copied every frame (its map: AssetStore::environmentMap)
 
