@@ -82,7 +82,7 @@ void Renderer::buildRenderingUi() {
                           "+ blue noise: the points shifted per pixel by a blue-noise texture, so neighboring pixels'\n"
                           "errors differ too: fine-grained noise instead of blotches, easier for DLSS to filter.");
     }
-    ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 16);
+    ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 64);
     ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
     ImGui::Combo("Emissive light", &settings.emissiveSampling,
                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");

@@ -986,7 +986,7 @@ vec3 clampBounceLight(vec3 light, uint reflections) {
 }
 
 float ggxAlpha(float roughness) {
-    return max(roughness * roughness, 1e-3);
+    return max(roughness * roughness, 1e-6);
 }
 
 // Reflectance at normal incidence of a non-metal, from its index of refraction: 0.04 for IOR 1.5.
@@ -2554,6 +2554,7 @@ void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirecti
 
 const uint CACHE_PROBES = 8;
 const uint CACHE_MAX_VERTICES = 8;      // update paths fill the cells of their first 8 surfaces
+const float MIRROR_ROUGHNESS = 0.01;    // smoother reflections count as mirrors: no Russian roulette after them
 const float CACHE_ROUGHNESS = 0.25;     // smoother surfaces (and glass) reflect too sharply to be cached
 const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this (rare glints of the sun)
 // A cell averages its whole area, so in a corner it holds more light than the corner itself gets (the walls
@@ -3117,7 +3118,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // boost the survivors by the same factor, so on average the result stays the same.
         // A throughput above 1 (sample weights can exceed 1) always survives: dividing by a chance above 1 would
         // take light away.
-        if (bounce >= 2) {
+        // Not after a mirror reflection: such a path is cheap and goes the same way every frame, so stopping it at
+        // random would be the only noise in what the mirror shows. Between colored mirrors (a red and a green wall
+        // facing each other) the throughput drops fast, and the few survivors, boosted 10x and more, made the
+        // nested reflections speckled. Max bounces still ends such paths.
+        bool mirrorBounce = specularLobe && lobeRoughness < MIRROR_ROUGHNESS;
+        if (bounce >= 2 && !mirrorBounce) {
             float survive = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
             if (bounceRandom.w >= survive) {
                 break;

@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 # Optimized even in Debug builds: model loading does per-texel work on the CPU (mip levels, Toksvig textures, light
 # lists) that takes about 20x longer unoptimized
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -D_GLIBCXX_DEBUG -D_GLIBCXX_ASSERTIONS -g  -O2")
 
 include_directories(${PROJECT_SOURCE_DIR}/include/)
 include_directories(${PROJECT_SOURCE_DIR}/source/)  # project headers by folder: "renderer/Renderer.h"
