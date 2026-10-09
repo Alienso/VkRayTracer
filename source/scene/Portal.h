@@ -6,6 +6,9 @@
 // An end's opening lies in its local XY plane, centered on its position, X along its width, Y along its height,
 // facing +Z (the side it "looks at"). Both ends of a pair have the same shape and size.
 //
+// The rim is ordinary geometry around the opening (outside it, so it never covers the view): the Scene stretches
+// the built-in rim model's cube into bars, rimDepth thick, centered on the opening's plane.
+//
 
 #ifndef VULKANDEMO_PORTAL_H
 #define VULKANDEMO_PORTAL_H
@@ -28,6 +31,9 @@ struct PortalPair {
     PortalShape shape = PortalShape::Rectangle;
     glm::vec2 size = glm::vec2(1.0f, 2.0f);  // width, height of both ends
     PortalEnd ends[2];                        // A and B
+    bool rim = true;
+    float rimWidth = 0.06f;   // how far the frame reaches out from the opening's edge
+    float rimDepth = 0.04f;   // its thickness across the opening's plane
 };
 
 #endif //VULKANDEMO_PORTAL_H

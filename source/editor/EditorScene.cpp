@@ -204,6 +204,11 @@ void Editor::buildPortalUi() {
         ImGui::DragFloat2("Size", &pair.size.x, 0.01f, 0.01f, 100.0f);
         ImGui::SameLine();
         ImGui::TextDisabled("width, height");
+        ImGui::Checkbox("Rim", &pair.rim);
+        if (pair.rim) {
+            ImGui::DragFloat("Rim width", &pair.rimWidth, 0.002f, 0.001f, 1.0f, "%.3f");
+            ImGui::DragFloat("Rim depth", &pair.rimDepth, 0.002f, 0.001f, 1.0f, "%.3f");
+        }
         for (int e = 0; e < 2; e++) {
             ImGui::PushID(e);
             ImGui::SeparatorText(e == 0 ? "End A" : "End B");
@@ -216,6 +221,9 @@ void Editor::buildPortalUi() {
             selectedPortal = std::min(selectedPortal, static_cast<int>(pairs.size()) - 1);
         }
         ImGui::PopID();
+    }
+    if (!pairs.empty()) {
+        buildMaterialUi(assets.model(scene.portalRimModel()));  // rim A and rim B, shared by all pairs
     }
     ImGui::TreePop();
 }

@@ -9,6 +9,9 @@
 // The point light variant replaces the ceiling panel by a point light (KHR_lights_punctual's kind) just below
 // it, as bright straight down as the panel: the same room with sharp shadows and a lit ceiling.
 //
+// The portal rim: two glowing cubes (blue for the A ends, orange for the B ends) that the Scene stretches into the
+// bars of the portals' frames.
+//
 
 #include "assets/BuiltInModels.h"
 #include <algorithm>
@@ -25,9 +28,14 @@ const std::vector<std::string>& builtInModelNames() {
     return names;
 }
 
+const std::string& portalRimModelName() {
+    static const std::string name = "Portal rim";
+    return name;
+}
+
 bool isBuiltInModel(const std::string& name) {
     const auto& names = builtInModelNames();
-    return std::find(names.begin(), names.end(), name) != names.end();
+    return std::find(names.begin(), names.end(), name) != names.end() || name == portalRimModelName();
 }
 
 static Material matte(const std::string& name, glm::vec3 color) {
@@ -87,6 +95,42 @@ static Mesh blockMesh(const std::string& name, uint32_t material, glm::vec3 cent
     addQuad(mesh, corner(0, 1, 1), corner(1, 1, 1), corner(1, 1, 0), corner(0, 1, 0));  // top
     computeBounds(mesh);
     return mesh;
+}
+
+// A cube from -0.5 to 0.5, all six faces
+static Mesh cubeMesh(const std::string& name, uint32_t material) {
+    auto corner = [](int x, int y, int z) { return glm::vec3(x - 0.5f, y - 0.5f, z - 0.5f); };
+    Mesh mesh;
+    mesh.name = name;
+    mesh.materialIndex = material;
+    mesh.hasNormals = true;
+    addQuad(mesh, corner(0, 0, 1), corner(1, 0, 1), corner(1, 1, 1), corner(0, 1, 1));  // front (+z)
+    addQuad(mesh, corner(1, 0, 0), corner(0, 0, 0), corner(0, 1, 0), corner(1, 1, 0));  // back
+    addQuad(mesh, corner(0, 0, 0), corner(0, 0, 1), corner(0, 1, 1), corner(0, 1, 0));  // left (-x)
+    addQuad(mesh, corner(1, 0, 1), corner(1, 0, 0), corner(1, 1, 0), corner(1, 1, 1));  // right
+    addQuad(mesh, corner(0, 1, 1), corner(1, 1, 1), corner(1, 1, 0), corner(0, 1, 0));  // top
+    addQuad(mesh, corner(0, 0, 0), corner(1, 0, 0), corner(1, 0, 1), corner(0, 0, 1));  // bottom
+    computeBounds(mesh);
+    return mesh;
+}
+
+static Model createPortalRim() {
+    Model model;
+    model.name = portalRimModelName();
+    const char* names[2] = {"rim A", "rim B"};
+    const glm::vec3 colors[2] = {{0.1f, 0.45f, 1.0f}, {1.0f, 0.45f, 0.05f}};
+    for (uint32_t i = 0; i < 2; i++) {
+        Material material = matte(names[i], colors[i]);
+        material.roughness = 0.4f;
+        material.emissiveColor = colors[i];
+        material.emissiveStrength = 2.0f;
+        model.materials.push_back(material);
+        model.meshes.push_back(cubeMesh(names[i], i));
+        model.instances.push_back({i, glm::mat4(1.0f)});
+    }
+    model.boundsMin = glm::vec3(-0.5f);
+    model.boundsMax = glm::vec3(0.5f);
+    return model;
 }
 
 static Model createCornellBox(bool withBlocks, bool pointLight) {
@@ -159,6 +203,9 @@ Model createBuiltInModel(const std::string& name) {
     }
     if (name == cornellBoxPointLightName) {
         return createCornellBox(true, true);
+    }
+    if (name == portalRimModelName()) {
+        return createPortalRim();
     }
     throw std::runtime_error("unknown built-in model: " + name);
 }

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include "assets/BuiltInModels.h"
 #include "core/Configuration.h"
@@ -96,6 +97,9 @@ int Scene::addPortalPair() {
     glm::vec3 center = sceneCamera.position + forward * 3.0f;
     float yaw = glm::degrees(std::atan2(-forward.x, -forward.z)) + 0.0f;  // +Z towards the camera (+ 0: no -0)
 
+    rimModel = assets.findOrLoad(portalRimModelName());
+    assets.acquire(rimModel);
+
     PortalPair pair;
     pair.name = "Portal " + std::to_string(++portalPairsMade);
     pair.ends[0].position = center - right * 1.5f;
@@ -107,6 +111,59 @@ int Scene::addPortalPair() {
 
 void Scene::removePortalPair(int index) {
     portalList.erase(portalList.begin() + index);
+    assets.release(rimModel);  // the last pair: the rim model is unloaded
+}
+
+// A bar of a rim: the unit cube stretched to length x width x depth, its length along `along` (in the opening's
+// plane, local to the end), centered at `center`
+static glm::mat4 rimBar(const glm::mat4& end, glm::vec2 center, glm::vec2 along, float length, float width, float depth) {
+    glm::vec2 across = glm::vec2(-along.y, along.x);
+    glm::mat4 local(1.0f);
+    local[0] = glm::vec4(along * length, 0.0f, 0.0f);
+    local[1] = glm::vec4(across * width, 0.0f, 0.0f);
+    local[2] = glm::vec4(0.0f, 0.0f, depth, 0.0f);
+    local[3] = glm::vec4(center, 0.0f, 1.0f);
+    return end * local;
+}
+
+// A rectangle's rim: four bars around it (top and bottom covering the corners). An ellipse's: short straight
+// bars along its edge, each touching it in its middle (so lying outside it: the tangent of a convex shape stays
+// outside), a little longer than their share of the edge so neighbors overlap on the outside.
+std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims() const {
+    std::vector<std::pair<uint32_t, glm::mat4>> bars;
+    if (portalList.empty()) {
+        return bars;
+    }
+    const SceneModel& model = assets.model(rimModel);
+    for (const PortalPair& pair : portalList) {
+        if (!pair.enabled || !pair.rim || pair.rimWidth <= 0.0f) {
+            continue;
+        }
+        float w = pair.size.x * 0.5f, h = pair.size.y * 0.5f, r = pair.rimWidth, d = std::max(pair.rimDepth, 1e-4f);
+        for (int e = 0; e < 2; e++) {
+            uint32_t mesh = model.parts[e].meshIndex;
+            glm::mat4 end = pair.ends[e].transform();
+            if (pair.shape == PortalShape::Rectangle) {
+                bars.push_back({mesh, rimBar(end, {0.0f, h + r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
+                bars.push_back({mesh, rimBar(end, {0.0f, -h - r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
+                bars.push_back({mesh, rimBar(end, {-w - r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
+                bars.push_back({mesh, rimBar(end, {w + r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
+            } else {
+                const int segments = 48;
+                float step = glm::two_pi<float>() / segments;
+                for (int k = 0; k < segments; k++) {
+                    float angle = (k + 0.5f) * step;
+                    glm::vec2 point = {w * std::cos(angle), h * std::sin(angle)};
+                    glm::vec2 outward = glm::normalize(glm::vec2(std::cos(angle) / w, std::sin(angle) / h));
+                    glm::vec2 along = {-outward.y, outward.x};
+                    float edge = glm::length(glm::vec2(-w * std::sin(angle), h * std::cos(angle))) * step;
+                    float length = edge * (1.0f + r / std::min(w, h)) * 1.1f;
+                    bars.push_back({mesh, rimBar(end, point + outward * (r * 0.5f), along, length, r, d)});
+                }
+            }
+        }
+    }
+    return bars;
 }
 
 void Scene::buildRenderList(RenderList& list) {
@@ -115,10 +172,11 @@ void Scene::buildRenderList(RenderList& list) {
     for (const SceneObject& object : objectList) {
         current.push_back({object.model, object.visible, object.originalSize, object.transform(), object.hiddenParts});
     }
+    std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims();
     list.camera = sceneCamera;
     list.environment = sceneEnvironment;
 
-    bool rebuild = list.hasMotion || !(current == list.builtObjects);
+    bool rebuild = list.hasMotion || !(current == list.builtObjects) || rims != list.builtRims;
     list.hasMotion = false;
     if (rebuild) {
         list.instances.clear();
@@ -179,6 +237,15 @@ void Scene::buildRenderList(RenderList& list) {
     }
     if (rebuild) {
         list.builtObjects = std::move(current);
+        // The portal rims: still (no motion), one shared identity motion
+        if (!rims.empty()) {
+            uint32_t motionIndex = static_cast<uint32_t>(list.motions.size());
+            list.motions.push_back(glm::mat4(1.0f));
+            for (const auto& [mesh, world] : rims) {
+                list.instances.push_back({mesh, motionIndex, world});
+            }
+        }
+        list.builtRims = std::move(rims);
     }
 }
 

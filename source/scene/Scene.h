@@ -55,8 +55,10 @@ public:
     void removeObject(int index);
 
     // A new portal pair in front of the camera: its two ends side by side, facing the camera. Returns its index.
+    // Each pair holds a reference to the rim model (AssetStore::acquire), so the last one removed unloads it.
     int addPortalPair();
     void removePortalPair(int index);
+    [[nodiscard]] ModelHandle portalRimModel() const { return rimModel; }  // valid while there are pairs
     std::vector<PortalPair>& portals() { return portalList; }
     [[nodiscard]] const std::vector<PortalPair>& portals() const { return portalList; }
 
@@ -82,6 +84,10 @@ private:
     std::vector<SceneObject> objectList;
     std::vector<PortalPair> portalList;
     int portalPairsMade = 0;  // for their names
+    ModelHandle rimModel;     // the built-in portal rim, while there are pairs
+
+    // The bars of the enabled pairs' rims: (mesh, world matrix) for each
+    std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims() const;
     Camera sceneCamera;
     SceneEnvironment sceneEnvironment;
 };

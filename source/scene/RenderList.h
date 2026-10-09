@@ -14,6 +14,7 @@
 
 #include <glm/glm.hpp>
 #include <cstdint>
+#include <utility>
 #include <vector>
 #include "scene/Camera.h"
 #include "core/Handles.h"
@@ -79,6 +80,8 @@ private:
         }
     };
     std::vector<BuiltObject> builtObjects;
+    // The portal rims' bars (mesh, world matrix) the instances were made with: compared the same way
+    std::vector<std::pair<uint32_t, glm::mat4>> builtRims;
 };
 
 #endif //VULKANDEMO_RENDERLIST_H
