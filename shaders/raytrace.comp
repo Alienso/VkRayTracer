@@ -646,6 +646,7 @@ struct Intersection {
     vec2 barycentrics;
     float t;             // along the ray's last part (after the last portal it went through)
     float travelled;     // the length of its parts before that (0: no portal). -1: lost in portals (see below)
+    uint crossings;      // how many portals it went through
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -661,7 +662,9 @@ struct Intersection {
 // itself through the other) would send a ray back and forth forever: after MAX_PORTAL_CROSSINGS crossings it is
 // lost, and no light comes back along it (black).
 // Rays that must go in a straight line to a point (shadow rays, ReSTIR's visibility and reconnections) count an
-// opening as blocking: light through a portal is only found by bounce rays that happen to go through it.
+// opening as blocking. The sun and the punctual lights also shine through portals: light sampling aims at their
+// images, where they appear through each end (portalLightImage). Other light through a portal (glowing surfaces,
+// the sky, the sun after two portals or more) is only found by bounce rays that happen to go through.
 struct Portal {
     vec3 center;
     float halfWidth;
@@ -680,24 +683,26 @@ const float PORTAL_GAP = 1e-3;
 
 // The nearest opening a ray crosses before maxT, and its distance t; -1: none. skip: an end to leave out (the one
 // the ray just came out of: it starts on that plane).
+// Whether a ray crosses end i's opening before maxT, and where (t)
+bool portalOpeningHit(uint i, vec3 origin, vec3 direction, float maxT, out float t) {
+    vec3 normal = portals[i].normal;
+    float facing = dot(direction, normal);
+    t = dot(portals[i].center - origin, normal) / facing;
+    if (abs(facing) < 1e-8 || !(t > 0.0 && t < maxT)) {
+        return false;
+    }
+    vec3 offset = origin + direction * t - portals[i].center;
+    vec3 right = portals[i].right;
+    vec2 p = vec2(dot(offset, right) / portals[i].halfWidth, dot(offset, cross(normal, right)) / portals[i].halfHeight);
+    return portals[i].shape == PORTAL_ELLIPSE ? dot(p, p) <= 1.0 : max(abs(p.x), abs(p.y)) <= 1.0;
+}
+
 int nearestPortal(vec3 origin, vec3 direction, float maxT, int skip, out float t) {
     t = maxT;
     int nearest = -1;
     for (uint i = 0; i < scene.portalCount; i++) {
-        vec3 normal = portals[i].normal;
-        float facing = dot(direction, normal);
-        if (int(i) == skip || abs(facing) < 1e-8) {
-            continue;
-        }
-        float distance = dot(portals[i].center - origin, normal) / facing;
-        if (!(distance > 0.0 && distance < t)) {
-            continue;
-        }
-        vec3 offset = origin + direction * distance - portals[i].center;
-        vec3 right = portals[i].right;
-        vec2 p = vec2(dot(offset, right) / portals[i].halfWidth,
-                      dot(offset, cross(normal, right)) / portals[i].halfHeight);
-        if (portals[i].shape == PORTAL_ELLIPSE ? dot(p, p) <= 1.0 : max(abs(p.x), abs(p.y)) <= 1.0) {
+        float distance;
+        if (int(i) != skip && portalOpeningHit(i, origin, direction, t, distance)) {
             nearest = int(i);
             t = distance;
         }
@@ -716,6 +721,7 @@ bool portalBetween(vec3 origin, vec3 direction, float distance) {
 // or, with travelled = -1, it was lost in portals.
 bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, out Intersection hit) {
     hit.travelled = 0.0;
+    hit.crossings = 0;
     int skip = -1;
     for (uint part = 0; part <= MAX_PORTAL_CROSSINGS; part++) {
         float portalT = RAY_FAR;
@@ -737,6 +743,7 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
             return false;
         }
         hit.travelled += portalT;
+        hit.crossings++;
         mat4x3 toPartner = portals[portal].toPartner;
         origin = toPartner * vec4(origin + direction * portalT, 1.0);
         direction = normalize(mat3(toPartner) * direction);
@@ -1292,89 +1299,110 @@ bool sampleGlassExit(Hit hit, vec3 v, vec3 random, out vec3 l) {
 // Candidates on glass come in no particular order. Absorption inside a solid depends on the length inside,
 // which is (sum of the distances where the ray leaves) - (sum where it enters) for any number of crossings,
 // so it can be summed in any order.
-vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, inout uint seed, out bool crossedGlass,
-                         out bool crossedSolidGlass) {
+// A portal's opening on the way blocks the light, except with throughEnd >= 0: a light image (portalLightImage),
+// whose ray must go through that end's opening first and then on from its partner, maxDistance being the whole way.
+vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int throughEnd, inout uint seed,
+                         out bool crossedGlass, out bool crossedSolidGlass) {
     crossedGlass = false;
     crossedSolidGlass = false;
-    if (portalBetween(origin, direction, maxDistance)) {
-        return vec3(0.0);
-    }
-    rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
-                          origin, 0.0, direction, max(maxDistance, 0.0));
     vec3 tint = vec3(1.0);
-    vec3 opticalDepth = vec3(0.0);
-    while (rayQueryProceedEXT(rayQuery)) {
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
-            continue;
+    int skip = -1;
+    float tMin = 0.0;
+    // (Cache update paths have no light images: a second part made them take 168 registers instead of 128)
+    [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 ? 1u : 2u); part++) {
+        // Up to the opening it must go through (part 0 of a light image), or to the end; any other opening blocks
+        float portalT = maxDistance;
+        int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, maxDistance, skip, portalT) : -1;
+        if (portal != (part == 0 ? throughEnd : -1)) {
+            return vec3(0.0);
         }
-        // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass):
-        // whatever is read early stays in registers through the tests, on top of the whole path's state.
-        MeshInfo mesh = meshInfos[rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false)];
-        uint firstIndex = mesh.indexOffset + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false)) * 3;
-        uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
-        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, false);
-        vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
-        vec2 uv = vertices[corner.x].uv * weights.x + vertices[corner.y].uv * weights.y + vertices[corner.z].uv * weights.z;
+        rayQueryEXT rayQuery;
+        rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, tMin, direction,
+                              portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : max(maxDistance, tMin));
+        vec3 opticalDepth = vec3(0.0);
+        while (rayQueryProceedEXT(rayQuery)) {
+            if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+                continue;
+            }
+            // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass):
+            // whatever is read early stays in registers through the tests, on top of the whole path's state.
+            MeshInfo mesh = meshInfos[rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false)];
+            uint firstIndex = mesh.indexOffset + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false)) * 3;
+            uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, false);
+            vec3 weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+            vec2 uv = vertices[corner.x].uv * weights.x + vertices[corner.y].uv * weights.y + vertices[corner.z].uv * weights.z;
 
-        // through a hole of a cut-out
-        float opacity = opacityAt(mesh.materialIndex, uv);
-        if (opacity < 1.0 && (opacity <= 0.0 || randomFloat(seed) >= opacity)) {
-            continue;
-        }
+            // through a hole of a cut-out
+            float opacity = opacityAt(mesh.materialIndex, uv);
+            if (opacity < 1.0 && (opacity <= 0.0 || randomFloat(seed) >= opacity)) {
+                continue;
+            }
 
-        Material material = materials[mesh.materialIndex];
-        float transmission = material.transmission;
-        if (transmission > 0.0 && material.transmissionTexture >= 0) {
-            transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
-        }
-        float metallic = material.metallic;
-        if (transmission > 0.0 && material.metallicRoughnessTexture >= 0) {
-            metallic *= sampleTextureFull(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
-        }
-        if (transmission <= 0.0 || metallic >= 1.0) {
-            rayQueryConfirmIntersectionEXT(rayQuery);  // opaque: in shadow (and with TerminateOnFirstHit, done)
-            break;
-        }
+            Material material = materials[mesh.materialIndex];
+            float transmission = material.transmission;
+            if (transmission > 0.0 && material.transmissionTexture >= 0) {
+                transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
+            }
+            float metallic = material.metallic;
+            if (transmission > 0.0 && material.metallicRoughnessTexture >= 0) {
+                metallic *= sampleTextureFull(material.metallicRoughnessTexture, material.metallicRoughnessUvTransform, uv).b;
+            }
+            if (transmission <= 0.0 || metallic >= 1.0) {
+                rayQueryConfirmIntersectionEXT(rayQuery);  // opaque: in shadow (and with TerminateOnFirstHit, done)
+                break;
+            }
 
-        // Glass: the share that passes is what neither the reflection nor the opaque part takes,
-        // tinted by the base color when entering (or crossing a thin pane).
-        crossedGlass = true;
-        mat3 worldToObject = mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, false));
-        vec3 p0 = vertices[corner.x].position;
-        vec3 outward = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0) * worldToObject;
-        if (mesh.hasNormals != 0) {
-            vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
-                                + vertices[corner.z].normal * weights.z;
-            if (dot(outward, smoothNormal * worldToObject) < 0.0) {
-                outward = -outward;  // as in traceClosest: the vertex normals define the outside
+            // Glass: the share that passes is what neither the reflection nor the opaque part takes,
+            // tinted by the base color when entering (or crossing a thin pane).
+            crossedGlass = true;
+            mat3 worldToObject = mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, false));
+            vec3 p0 = vertices[corner.x].position;
+            vec3 outward = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0) * worldToObject;
+            if (mesh.hasNormals != 0) {
+                vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
+                                    + vertices[corner.z].normal * weights.z;
+                if (dot(outward, smoothNormal * worldToObject) < 0.0) {
+                    outward = -outward;  // as in traceClosest: the vertex normals define the outside
+                }
+            }
+            float cosTheta = dot(normalize(outward), direction);
+            bool entering = cosTheta < 0.0;
+            vec3 color = material.baseColor.rgb;
+            if (material.baseColorTexture >= 0) {
+                color *= sampleTextureFull(material.baseColorTexture, material.baseColorUvTransform, uv).rgb;
+            }
+            float fresnel = fresnelSchlick(dielectricF0(material.ior), abs(cosTheta));
+            tint *= (1.0 - metallic) * transmission * (1.0 - fresnel);
+            if (entering || material.solid == 0) {
+                tint *= color;
+            }
+            if (material.solid != 0) {
+                crossedSolidGlass = true;
+                float distance = rayQueryGetIntersectionTEXT(rayQuery, false) * length(worldToObject * direction) * mesh.unitScale;
+                opticalDepth += material.absorption * (entering ? -distance : distance);
+            }
+            if (all(lessThan(tint, vec3(1e-4)))) {
+                rayQueryConfirmIntersectionEXT(rayQuery);  // practically black: no need to look further
+                break;
             }
         }
-        float cosTheta = dot(normalize(outward), direction);
-        bool entering = cosTheta < 0.0;
-        vec3 color = material.baseColor.rgb;
-        if (material.baseColorTexture >= 0) {
-            color *= sampleTextureFull(material.baseColorTexture, material.baseColorUvTransform, uv).rgb;
+        if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            return vec3(0.0);
         }
-        float fresnel = fresnelSchlick(dielectricF0(material.ior), abs(cosTheta));
-        tint *= (1.0 - metallic) * transmission * (1.0 - fresnel);
-        if (entering || material.solid == 0) {
-            tint *= color;
-        }
-        if (material.solid != 0) {
-            crossedSolidGlass = true;
-            float distance = rayQueryGetIntersectionTEXT(rayQuery, false) * length(worldToObject * direction) * mesh.unitScale;
-            opticalDepth += material.absorption * (entering ? -distance : distance);
-        }
-        if (all(lessThan(tint, vec3(1e-4)))) {
-            rayQueryConfirmIntersectionEXT(rayQuery);  // practically black: no need to look further
+        tint *= exp(-max(opticalDepth, vec3(0.0)));
+        if (portal < 0) {
             break;
         }
+        // On from the partner, for the rest of the way
+        mat4x3 toPartner = portals[portal].toPartner;
+        origin = toPartner * vec4(origin + direction * portalT, 1.0);
+        direction = normalize(mat3(toPartner) * direction);
+        maxDistance -= portalT;
+        skip = portal ^ 1;
+        tMin = PORTAL_GAP;
     }
-    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-        return vec3(0.0);
-    }
-    return tint * exp(-max(opticalDepth, vec3(0.0)));
+    return tint;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1824,6 +1852,48 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
     return s;
 }
 
+// A light seen through portal end `end`: where it appears from this side, moved back through the portal. A shadow
+// ray towards it goes through the end's opening and on from the partner to the light itself (shadowTransmittance
+// with throughEnd), the same distance in all, so falloff and spot cones come out right. which: 0 = the sun, k =
+// the punctual light of slot k - 1 (as samplePunctualLight). Most points don't see a light's image through a given
+// opening: no light then (s.light = 0), for the cost of one plane test.
+LightSample portalLightImage(uint end, uint which, vec3 position, inout uint seed) {
+    mat4x3 toPartner = portals[end].toPartner;
+    mat3 back = transpose(mat3(toPartner));  // the partner's side -> this side (a rotation: transposed = inverse)
+    LightSample s = noLightSample();
+    if (which == 0) {
+        // Without "Shadows" the sun isn't blocked by the opening either: it already lights everything directly
+        if (scene.sunOn == 0 || scene.shadowsEnabled == 0) {
+            return s;
+        }
+        vec2 u = vec2(randomFloat(seed), randomFloat(seed));
+        s.direction = back * randomDirectionInCone(scene.sunDirection.xyz, scene.sunDirection.w, u);
+        s.distance = SKY_DISTANCE;
+        s.light = PI * scene.sunColor.rgb;
+        s.pdf = scene.sunPdf;
+        s.mis = scene.sunMis != 0 ? MIS_UNLESS_GLASS : MIS_NONE;
+        s.shadowed = true;
+    } else {
+        uint count = scene.punctualLightCount;
+        uint index = which - 1;
+        float scale = 1.0;
+        if (count > MAX_PUNCTUAL_LIGHTS_PER_HIT) {
+            index = min(uint(randomFloat(seed) * float(count)), count - 1);
+            scale = float(count);
+        }
+        PunctualLight light = punctualLights[index];
+        light.position = back * (light.position - toPartner[3]);
+        light.direction = back * light.direction;
+        s = punctualLightSample(light, position);
+        s.light *= scale;
+    }
+    float t;
+    if (!portalOpeningHit(end, position, s.direction, s.distance, t)) {
+        s.light = vec3(0.0);
+    }
+    return s;
+}
+
 // ---------------------------------------------------------------------------------------------
 // ReSTIR DI (see RESTIR_DI_PLAN.md)
 //
@@ -2160,6 +2230,7 @@ bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Int
     float portalT = RAY_FAR;
     int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, RAY_FAR, -1, portalT) : -1;
     hit.travelled = 0.0;
+    hit.crossings = 0;
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.0, direction,
                           portal >= 0 ? max(portalT - PORTAL_GAP, 0.0) : RAY_FAR);
@@ -2231,7 +2302,7 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             vec3 l, weight;
             float pdf, lobeRoughness;
             bool transmitted, specularLobe;
-            Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0, 0.0);
+            Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0, 0.0, 0u);
             vec3 random = vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed));
             if (!sampleBrdf(hit, toLocal(frame, v), random, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
                 if (i == lightCandidates) {
@@ -2568,6 +2639,7 @@ bool loadPrimaryHit(ivec2 pixel, inout uint seed, out Intersection intersection)
     PrimaryHit stored = primaryHits[primaryHitIndex(pixel)];
     seed = stored.seed;
     intersection.travelled = 0.0;
+    intersection.crossings = 0;
     if (stored.meshIndex >= PRIMARY_THROUGH_PORTAL) {
         return false;
     }
@@ -2651,10 +2723,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // Otherwise a glossy table reflecting the window would only get the shadow rays, which rarely hit its narrow
     // reflection: fireflies. So the sky needs to know about solid glass, and the last reflection's pdf.
     bool throughSolidGlass = false;  // went through solid glass since the last reflection
-    // Went through a portal since the last reflection. Light sampling can't reach through portals (see "Portals"):
-    // whatever such a ray finds (a glowing surface, the sky, the sun) counts fully, and isn't that surface's direct
-    // light for the radiance cache either (paths that end in the cache rely on shadow rays for that).
-    bool portalSinceReflection = false;
+    // Portals gone through since the last reflection. Light sampling reaches the sun through one of them (light
+    // images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing surface, the
+    // sky, the sun after two) counts fully, and isn't that surface's direct light for the radiance cache either
+    // (paths that end in the cache rely on shadow rays for that).
+    uint portalCrossings = 0;
     float reflectionPdf = 0.0;       // bouncePdf of the last reflection (glass passes don't change it)
     // Where the last reflection was: the light tree's chance of picking a glowing triangle depends on the point
     vec3 reflectionPosition = vec3(0.0);
@@ -2695,11 +2768,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             intersection.barycentrics = stored.barycentrics;
             intersection.t = stored.t;
             intersection.travelled = 0.0;
+            intersection.crossings = 0;
         } else {
             found = intersectClosest(origin, direction, seed, intersection);
         }
         bool crossedPortal = intersection.travelled != 0.0;
-        portalSinceReflection = portalSinceReflection || crossedPortal;
+        portalCrossings += intersection.crossings;
         Hit hit;
         hit.found = found;
         if (found) {
@@ -2719,7 +2793,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 break;  // lost in portals: no light
             }
             vec3 skyLight = throughput * environmentLight(direction);
-            if (scene.environmentSampling == 0 || !reflectedOnce || portalSinceReflection) {
+            if (scene.environmentSampling == 0 || !reflectedOnce || portalCrossings > 0) {
                 ADD_LIGHT(skyLight);  // nothing else finds it (the camera sees the sky, maybe through glass)
             } else if (!throughSolidGlass && !restirReflection) {
                 // The bounce-sampling share of the last surface's direct skylight, also through thin panes. Unlike
@@ -2732,8 +2806,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // The sun's disc: always visible to the camera; for bounce rays, the MIS share of the bounce method
             if (scene.sunOn != 0 && dot(direction, scene.sunDirection.xyz) >= scene.sunDirection.w) {
                 vec3 sunRadiance = scene.sunColor.rgb * scene.sunRadianceScale;
-                if (!reflectedOnce || portalSinceReflection) {
-                    ADD_LIGHT(throughput * sunRadiance);  // the camera sees it (maybe through glass), or a portal
+                // Its image through a portal is light-sampled only through one, and only with "Shadows" (as there)
+                bool sunImaged = portalCrossings == 1 && scene.shadowsEnabled != 0;
+                if (!reflectedOnce || (portalCrossings > 0 && !sunImaged)) {
+                    ADD_LIGHT(throughput * sunRadiance);  // the camera sees it (maybe through glass), or portals
+                } else if (sunImaged && CACHE_UPDATE_PASS != 0) {
+                    // Update paths sample no light images: the bounce counts it fully, as the last surface's direct
+                    // light (which image paths ending in its cell get from the image)
+                    ADD_LIGHT_EXCEPT(throughput * sunRadiance, previousVertex);
                 } else if (!throughGlass && scene.sunMis != 0) {
                     // the bounce-sampling share of the last surface's direct sunlight
                     ADD_LIGHT_EXCEPT(throughput * sunRadiance * misWeight(bouncePdf, scene.sunPdf), previousVertex);
@@ -2756,7 +2836,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // entirely to light sampling.
         if (any(greaterThan(hit.emissive, vec3(0.0)))) {
             float weight = 1.0;
-            bool lightSampled = sampleLights && hit.lightIndex >= 0 && !portalSinceReflection;
+            bool lightSampled = sampleLights && hit.lightIndex >= 0 && portalCrossings == 0;
             if (!lightSampled) {
                 // only bounce rays find it (or the camera does)
             } else if (reflectedOnce && restirReflection) {
@@ -2859,14 +2939,17 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         }
         if (!leavingGlass) {
             // Direct light: one shadow ray per kind of light (see LightSample). Slot 0: the sun, 1: the sky, 2: the
-            // glowing triangles, 3 and up: the punctual lights. One loop, so the shadow ray and the BRDF exist only
+            // glowing triangles, 3 and up: the punctual lights, then the sun's and the punctual lights' images through
+            // each portal end (portalLightImage). One loop, so the shadow ray and the BRDF exist only
             // once in the compiled shader. In world space: a shading frame would take 9 more registers across the
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
             clampDepth = giState == 2 ? 0u : reflections + 1;  // light this surface reflects
             uint lightSlots = restirVertex && scene.restirPunctualCandidates > 0 ? 3 : 3 + punctualLightSamples();
-            [[dont_unroll]] for (uint slot = 0; slot < lightSlots; slot++) {
+            uint imageSlots = CACHE_UPDATE_PASS != 0 ? 0 : scene.portalCount * (1 + punctualLightSamples());
+            [[dont_unroll]] for (uint slot = 0; slot < lightSlots + imageSlots; slot++) {
                 LightSample s = noLightSample();
+                int imageEnd = -1;  // the portal end this slot's light is seen through
                 if (slot == 0) {
                     // A random point on the sun's disc. Points near a shadow edge see only part of the disc, so
                     // averaged over many samples the shadow edge becomes soft (penumbra). The disc delivers
@@ -2903,8 +2986,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                         s = sampleEmissiveLight(hit, hit.normal, hit.position,
                                                 pathSample(bounce, SAMPLE_EMISSIVE, seed).xyz);
                     }
-                } else {
+                } else if (slot < lightSlots) {
                     s = samplePunctualLight(slot - 3, hit.position, seed);
+                } else {
+                    uint image = slot - lightSlots;
+                    imageEnd = int(image % scene.portalCount);
+                    s = portalLightImage(uint(imageEnd), image / scene.portalCount, hit.position, seed);
                 }
                 if (all(equal(s.light, vec3(0.0)))) {
                     continue;
@@ -2928,7 +3015,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 vec3 transmittance = vec3(1.0);
                 if (s.shadowed) {
                     vec3 shadowOrigin = shadowRayStart(hit, behind, s);
-                    transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
+                    transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, imageEnd, seed, crossedGlass,
+                                                        crossedSolidGlass);
                     // The reservoir's sample is blocked: kept with W = 0, so every sample handed on to the next
                     // frame is known to be seen from its own surface (restirTemporal counts on that)
                     if (restirVertex && slot == 2 && all(equal(transmittance, vec3(0.0)))) {
@@ -3015,7 +3103,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         } else {
             throughGlass = false;
             throughSolidGlass = false;
-            portalSinceReflection = false;
+            portalCrossings = 0;
             reflectedOnce = true;
             reflections++;
             restirReflection = restirVertex;
@@ -3158,7 +3246,8 @@ bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
     bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
     vec3 shadowOrigin = shadowRayStart(hit, behind, s);
     bool crossedGlass, crossedSolidGlass;
-    vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, seed, crossedGlass, crossedSolidGlass);
+    vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, seed, crossedGlass,
+                                             crossedSolidGlass);
     return any(greaterThan(transmittance, vec3(0.0)));
 }
 
@@ -3304,7 +3393,7 @@ void restirPass(ivec2 pixel, ivec2 size) {
                 bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
                 vec3 shadowOrigin = shadowRayStart(hit, behind, s);
                 bool crossedGlass, crossedSolidGlass;
-                vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, candidateSeed,
+                vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, candidateSeed,
                                                          crossedGlass, crossedSolidGlass);
                 if (all(equal(transmittance, vec3(0.0)))) {
                     reservoir.W = 0.0;
