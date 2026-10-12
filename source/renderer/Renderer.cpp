@@ -34,6 +34,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createUniformBuffer();
     createSpecularAlbedoTable();
     createBlueNoiseTexture();
+    createVolumeTextures();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
     createLightBuffers();
     createPortalBuffer();

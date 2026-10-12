@@ -144,7 +144,7 @@ void Renderer::recordRadianceCache(VkCommandBuffer commandBuffer) {
     // 1: update paths, one per tile of cacheUpdateTile x cacheUpdateTile pixels (8x8 tiles per workgroup)
     uint32_t tile = static_cast<uint32_t>(std::max(settings.cacheUpdateTile, 1));
     uint32_t tilesX = (renderExtent.width + tile - 1) / tile, tilesY = (renderExtent.height + tile - 1) / tile;
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtCacheUpdatePipeline);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(rtCacheUpdatePipeline));
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
     vkCmdDispatch(commandBuffer, (tilesX + 7) / 8, (tilesY + 7) / 8, 1);
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

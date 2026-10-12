@@ -64,6 +64,20 @@ struct Material {
     // fabric). This share of the diffuse layer leaves on the other side instead, tinted by its own color.
     float diffuseTransmission = 0.0f;
     glm::vec3 diffuseTransmissionColor = glm::vec3(1.0f);
+    // Fog inside: the closed mesh is filled with fog of this thickness (per unit of distance in the world: light goes
+    // ~1 / fogDensity before it scatters; 0 = none). See "Fog" in shaders/raytrace.comp. Not from glTF (yet).
+    float fogDensity = 0.0f;
+    glm::vec3 fogColor = glm::vec3(1.0f);  // its color in white light (the share of the light it scatters that goes on)
+    float fogForward = 0.3f;               // -1..1: how much scattered light keeps going forward (0: every way alike)
+    bool invisibleSurface = false;         // rays pass the surface unchanged: only the fog inside shows
+    // Fog that varies through the volume (see "Varying density" in shaders/raytrace.comp). Its thickness is then the
+    // most there is anywhere; noise and the edge fade only take away.
+    bool fogNoise = false;     // patchy: a 3D noise in the mesh's own space (moves, turns and scales with the object)
+    float fogNoiseSize = 1.0f; // the size of its blobs, in the mesh's units
+    float fogCoverage = 0.5f;  // 0..1: about the share of the volume that has fog
+    int fogNoiseSeed = 0;      // another part of the noise, so objects sharing the numbers still differ
+    float fogEdge = 0.0f;      // fades out over this distance towards the mesh's surface (mesh units); 0 = sharp
+    glm::vec3 fogDrift = glm::vec3(0.0f);  // patchy fog: the blobs move this far per second (mesh units, the mesh's axes)
     glm::vec3 emissiveColor = glm::vec3(0.0f);
     float emissiveStrength = 1.0f;  // KHR_materials_emissive_strength: lets emission go above 1
     AlphaMode alphaMode = AlphaMode::Opaque;

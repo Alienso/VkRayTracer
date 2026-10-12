@@ -13,24 +13,30 @@
 // the entrance and the exit, lit by many small lamps. Every lamp and every wall is seen again and again in the
 // mirrors, so it's hard to tell what is real: a test for reflections (DLSS guides, noise in reflected surfaces).
 //
+// The light orb: a small glowing ball floating at the height of a fog box's middle, to light fog from inside.
+//
 // The portal rim: two glowing cubes (blue for the A ends, orange for the B ends) that the Scene stretches into the
 // bars of the portals' frames.
 //
 
 #include "assets/BuiltInModels.h"
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/constants.hpp>
 
 static const char* cornellBoxName = "Cornell box";
 static const char* cornellBoxWithBlocksName = "Cornell box (classic, with blocks)";
 static const char* cornellBoxPointLightName = "Cornell box (blocks, point light)";
 static const char* cubeName = "Cube";
 static const char* mirrorMazeName = "Mirror maze";
+static const char* fogBoxName = "Fog box";
+static const char* lightOrbName = "Light orb";
 
 const std::vector<std::string>& builtInModelNames() {
-    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName};
+    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName, fogBoxName, lightOrbName};
     return names;
 }
 
@@ -137,6 +143,80 @@ static Model createCube() {
     model.boundsMin = glm::vec3(-0.5f);
     model.boundsMax = glm::vec3(0.5f);
 
+    return model;
+}
+
+// A box of fog, 4 x 3 x 4 standing on the ground: an invisible surface around fog (see Material::fogDensity). Scale
+// and turn it like any object; its material is shared by all fog boxes.
+static Model createFogBox() {
+    Model model;
+    model.name = fogBoxName;
+    Material material = matte("fog", glm::vec3(1.0f));
+    material.fogDensity = 0.3f;
+    material.invisibleSurface = true;
+    model.materials.push_back(material);
+    Mesh mesh = cubeMesh("mesh", 0);
+    for (SceneVertex& vertex : mesh.vertices) {
+        vertex.position = vertex.position * glm::vec3(4.0f, 3.0f, 4.0f) + glm::vec3(0.0f, 1.5f, 0.0f);
+    }
+    computeBounds(mesh);
+    model.boundsMin = mesh.boundsMin;
+    model.boundsMax = mesh.boundsMax;
+    model.meshes.push_back(mesh);
+    model.instances.push_back({0, glm::mat4(1.0f)});
+    return model;
+}
+
+// A sphere of `radius` around `center`: rings of latitude, smooth normals (the same position on the seam and at the
+// poles is several vertices, with their own UVs)
+static Mesh sphereMesh(const std::string& name, uint32_t material, glm::vec3 center, float radius) {
+    const uint32_t rings = 24, segments = 48;
+    Mesh mesh;
+    mesh.name = name;
+    mesh.materialIndex = material;
+    mesh.hasNormals = true;
+    // The seam's and the poles' copies get exactly the same positions (sin(pi) isn't 0 in floats): the mesh is closed
+    // exactly, which the fog's distance field needs
+    for (uint32_t ring = 0; ring <= rings; ring++) {
+        float theta = glm::pi<float>() * static_cast<float>(ring) / rings;  // from straight up
+        float sinTheta = ring == 0 || ring == rings ? 0.0f : std::sin(theta);
+        float cosTheta = ring == 0 ? 1.0f : ring == rings ? -1.0f : std::cos(theta);
+        for (uint32_t segment = 0; segment <= segments; segment++) {
+            float phi = 2.0f * glm::pi<float>() * static_cast<float>(segment % segments) / segments;
+            glm::vec3 normal(sinTheta * std::cos(phi), cosTheta, -sinTheta * std::sin(phi));
+            mesh.vertices.push_back({center + normal * radius, normal,
+                                     {static_cast<float>(segment) / segments, static_cast<float>(ring) / rings},
+                                     glm::vec4(0.0f)});
+        }
+    }
+    for (uint32_t ring = 0; ring < rings; ring++) {
+        for (uint32_t segment = 0; segment < segments; segment++) {
+            uint32_t a = ring * (segments + 1) + segment, b = a + segments + 1;  // this ring, the one below
+            if (ring > 0) {
+                mesh.indices.insert(mesh.indices.end(), {a, b, a + 1});
+            }
+            if (ring + 1 < rings) {
+                mesh.indices.insert(mesh.indices.end(), {a + 1, b, b + 1});
+            }
+        }
+    }
+    computeBounds(mesh);
+    return mesh;
+}
+
+// A glowing ball, 0.3 across, floating 1.5 above the ground: the middle of a fog box (which is 3 high)
+static Model createLightOrb() {
+    Model model;
+    model.name = lightOrbName;
+    Material material = matte("orb", glm::vec3(1.0f));
+    material.emissiveColor = {1.0f, 0.8f, 0.55f};  // warm
+    material.emissiveStrength = 40.0f;
+    model.materials.push_back(material);
+    Mesh mesh = sphereMesh("mesh", 0, glm::vec3(0.0f, 1.5f, 0.0f), 0.15f);
+    model.boundsMin = mesh.boundsMin;
+    model.boundsMax = mesh.boundsMax;
+    model.meshes.push_back(mesh);
+    model.instances.push_back({0, glm::mat4(1.0f)});
     return model;
 }
 
@@ -331,6 +411,12 @@ Model createBuiltInModel(const std::string& name) {
     }
     if (name == mirrorMazeName) {
         return createMirrorMaze();
+    }
+    if (name == fogBoxName) {
+        return createFogBox();
+    }
+    if (name == lightOrbName) {
+        return createLightOrb();
     }
     if (name == portalRimModelName()) {
         return createPortalRim();

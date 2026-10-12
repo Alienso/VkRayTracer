@@ -104,6 +104,7 @@ struct SceneUniforms {
     uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
     uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
     uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
+    float fogTime;                   // seconds of fog drift (Material::fogDrift); 0 while no fog drifts
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
@@ -111,6 +112,7 @@ struct GpuInstance {
     glm::mat4 motion;           // this frame's world position -> last frame's (motion vectors)
     glm::mat4x3 objectToWorld;  // the shader reads these instead of the ray query's, so hits stored by the ReSTIR
     glm::mat3 worldToObject;    // camera-ray pass can be rebuilt the same way. Without the translation (normals)
+    uint32_t meshIndex;         // as the TLAS instance's custom index (fog volumes are known by their instance)
 };
 
 // One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
@@ -220,6 +222,9 @@ struct DisplayPushConstants {
     uint32_t toneMapping;   // 0 = clamp, 1 = ACES
     uint32_t view;          // DisplayView
     float farDistance;      // sky depth, to show it apart in the depth views
+    float grainStrength;    // fog grain: 0 = off
+    float grainSize;        // output pixels
+    uint32_t frame;
 };
 
 // Must match the push constants in shaders/noise.comp
@@ -314,7 +319,25 @@ struct GpuMaterial {
     glm::mat3x2 diffuseTransmissionUvTransform;
     glm::mat3x2 diffuseTransmissionColorUvTransform;
     int32_t normalVarianceTexture;  // R: the normal map's averaged-away bumps as GGX alpha (Toksvig), see Material
+    float fogDensity;               // fog inside, see Material
+    glm::vec3 fogColor;
+    float fogForward;
+    uint32_t invisible;             // 1 = rays pass the surface unchanged
+    uint32_t fogNoise;              // varying fog, see Material
+    float fogNoiseScale;            // 1 / the noise texture's repeat, in mesh units
+    float fogCoverage;
+    float fogEdge;
+    glm::vec3 fogNoiseOffset;       // from the seed, in texture repeats
+    glm::vec3 fogDrift;             // in texture repeats per second
 };
+
+// The fog noise texture holds this many blobs along each side (Volumes.cpp)
+static constexpr float fogNoiseBlobs = 4.0f;
+
+// Fog whose density varies through the volume: noise or an edge fade (see "Varying density" there)
+inline bool fogVaries(const Material& material) {
+    return material.fogDensity > 0.0f && (material.fogNoise || material.fogEdge > 0.0f);
+}
 
 // The first group is drawn by the trace shader (one property of the first hit). The "guide" group shows the
 // DLSS input images as written during normal path tracing; the display pass draws them.
@@ -505,6 +528,11 @@ struct RenderSettings {
     float brightenSpeed = 1.5f;     // auto: adaptation rates per second (exponential); like the eye,
     float darkenSpeed = 3.0f;       //       getting used to the dark is slower than to bright light
     bool toneMapping = true;
+    // Fog grain (display.comp): film-like grain where the camera sees fog, added after DLSS (which removes the path
+    // tracer's own noise). A look only: the traced light is unchanged.
+    bool fogGrain = true;
+    float fogGrainStrength = 0.25f;  // how far it moves a pixel's brightness, at most (where it's all fog)
+    float fogGrainSize = 1.0f;       // output pixels
     int debugView = static_cast<int>(DebugView::None);
     int renderMode = static_cast<int>(RenderMode::Accumulation);  // RenderMode, picked in the UI
     // The image's size (what Capture saves): 0 = the window's, else this many rows (outputHeights), as wide as the
@@ -542,6 +570,7 @@ struct RendererStats {
 class Renderer {
 public:
     static constexpr uint32_t maxTextures = 1024;  // size of the texture descriptor array
+    static constexpr uint32_t maxVolumeTextures = 256;  // size of the 3D texture descriptor array (Volumes.cpp)
 
     explicit Renderer(AssetStore& assets) : assets(assets) {}
 
@@ -691,6 +720,7 @@ private:
     RenderImage normalRoughnessImage;     // RGBA16F: world-space shading normal, roughness in alpha
     RenderImage specularHitDistanceImage; // R32F: first hit -> next hit along a reflection/refraction, 0 = unknown
     RenderImage guideHistoryImage;        // RGBA16F: last frame's diffuse albedo, for the reprojection error view
+    RenderImage fogAmountImage;           // R32F: how much fog the camera sees (for the fog grain, display.comp)
     VkBuffer primaryHitBuffer = VK_NULL_HANDLE;  // GpuPrimaryHit per render pixel (ReSTIR: camera rays traced first)
     VkDeviceMemory primaryHitMemory = VK_NULL_HANDLE;
     VkBuffer bounceHitBuffer = VK_NULL_HANDLE;   // GpuBounceHit per render pixel (ReSTIR: first bounce traced early)
@@ -729,6 +759,12 @@ private:
     VkPipeline rtRestirGiShadePipeline;  // RESTIR_PASS = 3: ReSTIR GI's shading, after the image pass
     VkPipeline rtRestirGiTemporalPipeline;  // RESTIR_PASS = 4: ReSTIR GI's temporal reuse, before its shading
     VkPipeline rtRestirGiSpatialPipeline;   // RESTIR_PASS = 5: ReSTIR GI's spatial reuse, between those two
+    // The same seven with FOG = 1, used while some material has fog inside or an invisible surface, and with FOG = 2
+    // while some fog varies through its volume (fogLevel). The fog's code costs registers, and with them time, even
+    // where there is no fog.
+    VkPipeline rtFogPipelines[2][7] = {};
+    uint32_t fogLevel = 0;  // this frame's FOG (buildSceneUniforms)
+    VkPipeline tracePipeline(VkPipeline plain) const;  // plain, or its fog version in a fog scene
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;
@@ -788,6 +824,7 @@ private:
     VkPipelineLayout exposurePipelineLayout;
     VkPipeline exposurePipeline;
     float frameDeltaTime = 0.0f;   // seconds, given to beginFrame
+    float fogTime = 0.0f;          // seconds the fog has drifted (only counts while some fog drifts)
 
     // Noise measurement (Noise.cpp): a converged reference of the current view, then the error of the displayed
     // image against it, frame by frame. Resources are created on first use.
@@ -964,6 +1001,14 @@ private:
     // BlueNoise.cpp
     void createBlueNoiseTexture();
     void destroyBlueNoiseTexture();
+    // Volumes.cpp: the fog's 3D textures
+    void createVolumeTextures();
+    void destroyVolumeTextures();
+    bool syncDistanceFields();
+    GpuTexture uploadVolumeTexture(uint32_t width, uint32_t height, uint32_t depth, VkFormat format, const void* data,
+                                   size_t size, VkSampler sampler);
+    VkSampler volumeRepeatSampler = VK_NULL_HANDLE;  // the noise: tiles
+    VkSampler volumeClampSampler = VK_NULL_HANDLE;   // distance fields
     // Dlss.cpp
     void initStreamline();
     void addStreamlineDeviceRequirements(std::vector<const char*>& extensions, VkPhysicalDeviceVulkan12Features& features12,

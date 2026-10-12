@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <iostream>
+#include <map>
+#include <tuple>
 #include <imgui/imgui.h>
 #include "editor/Editor.h"
 #include "assets/BuiltInModels.h"
@@ -228,6 +230,37 @@ void Editor::buildPortalUi() {
     ImGui::TreePop();
 }
 
+// Whether a mesh is closed: every edge shared by exactly two triangles (corners at the same place count as one, a
+// mesh has a corner several times where its normals or UVs differ). Fog fills a mesh by the surfaces a ray crosses,
+// so an open one has fog leaking out of it, or inside out. Kept by mesh id: a mesh doesn't change while loaded.
+static bool meshIsClosed(const AssetStore& assets, uint32_t meshIndex) {
+    static std::map<uint64_t, bool> known;
+    uint64_t id = assets.meshIds()[meshIndex];
+    auto it = known.find(id);
+    if (it != known.end()) {
+        return it->second;
+    }
+    const Mesh& mesh = assets.meshes()[meshIndex];
+    auto key = [](const glm::vec3& p) { return std::make_tuple(p.x, p.y, p.z); };
+    std::map<std::tuple<float, float, float>, uint32_t> corners;
+    std::vector<uint32_t> corner(mesh.vertices.size());
+    for (size_t v = 0; v < mesh.vertices.size(); v++) {
+        corner[v] = corners.emplace(key(mesh.vertices[v].position), static_cast<uint32_t>(corners.size())).first->second;
+    }
+    std::map<std::pair<uint32_t, uint32_t>, int> edges;
+    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+        for (int e = 0; e < 3; e++) {
+            uint32_t a = corner[mesh.indices[t + e]], b = corner[mesh.indices[t + (e + 1) % 3]];
+            if (a != b) {
+                edges[{std::min(a, b), std::max(a, b)}]++;
+            }
+        }
+    }
+    bool closed = !edges.empty() && std::all_of(edges.begin(), edges.end(), [](const auto& edge) { return edge.second == 2; });
+    known[id] = closed;
+    return closed;
+}
+
 // Materials belong to the model, so editing one changes every object that shows that model.
 void Editor::buildMaterialUi(const SceneModel& model) {
     if (!ImGui::TreeNode("materials", "Materials (%u, shared by all %s objects)", model.materialCount, model.name.c_str())) {
@@ -296,6 +329,72 @@ void Editor::buildMaterialUi(const SceneModel& model) {
                     changed |= ImGui::DragFloat("Attenuation distance", &m.attenuationDistance, 0.01f, 0.0f, 100.0f, "%.3f");
                     ImGui::TextDisabled("color after this distance inside (model units), 0 = clear");
                 }
+            }
+            bool fog = m.fogDensity > 0.0f;
+            if (ImGui::Checkbox("Fog inside", &fog)) {
+                m.fogDensity = fog ? 0.3f : 0.0f;
+                changed = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Fills the mesh with fog (it must be closed). With an invisible surface: haze, smoke,\n"
+                                  "a cloud. With solid glass: murky water, milky glass.");
+            }
+            if (fog) {
+                changed |= ImGui::SliderFloat("Thickness##fog", &m.fogDensity, 0.001f, 10.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How much fog there is per unit of distance: light goes about 1 / thickness units\n"
+                                      "before it scatters.");
+                }
+                changed |= ImGui::ColorEdit3("Fog color", &m.fogColor.x, ImGuiColorEditFlags_Float);
+                changed |= ImGui::SliderFloat("Forward scattering", &m.fogForward, -0.9f, 0.9f, "%.2f");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("0: light scatters every way alike. Higher: mostly onwards, so beams glow brightest\n"
+                                      "looking towards the light (real haze: 0.3 - 0.8). Negative: back towards the light.");
+                }
+                changed |= ImGui::Checkbox("Patchy (noise)", &m.fogNoise);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Fog in blobs and wisps instead of the same everywhere. The thickness is then the\n"
+                                      "most there is. The noise belongs to the object: it moves, turns and scales with it.");
+                }
+                if (m.fogNoise) {
+                    changed |= ImGui::SliderFloat("Blob size", &m.fogNoiseSize, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("About how big the blobs are, in the mesh's own units (before the object's scale)");
+                    }
+                    changed |= ImGui::SliderFloat("Coverage", &m.fogCoverage, 0.0f, 1.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("About the share of the volume that has fog: low = a few wisps, 1 = everywhere, thinner\n"
+                                          "in places");
+                    }
+                    changed |= ImGui::SliderInt("Variation", &m.fogNoiseSeed, 0, 99);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Another part of the noise: the same kind of fog, other blobs");
+                    }
+                    changed |= ImGui::DragFloat3("Drift", &m.fogDrift.x, 0.01f, -10.0f, 10.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Wind: the blobs move this far per second (mesh units, along the mesh's own X, Y, Z).\n"
+                                          "They pass through the mesh, which stays where it is. 0 = still.\n"
+                                          "While fog drifts, Accumulation restarts every frame (the image changes).");
+                    }
+                }
+                changed |= ImGui::SliderFloat("Edge softness", &m.fogEdge, 0.0f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Fades the fog out over this distance towards the mesh's surface (mesh units), instead\n"
+                                      "of ending sharply there. 0: sharp.");
+                }
+                if (m.fogNoise || m.fogEdge > 0.0f) {
+                    ImGui::TextDisabled("Varying fog: slower than even fog, the more so the thinner it is in places");
+                }
+                for (uint32_t mesh = model.firstMesh; mesh < model.firstMesh + model.meshCount; mesh++) {
+                    if (assets.meshes()[mesh].materialIndex == index && !meshIsClosed(assets, mesh)) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "Mesh \"%s\" isn't closed: fog may leak or turn inside out",
+                                           assets.meshes()[mesh].name.c_str());
+                    }
+                }
+            }
+            changed |= ImGui::Checkbox("Invisible surface", &m.invisibleSurface);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Rays pass the surface unchanged: only the fog inside shows");
             }
             if (changed) {
                 assets.materialsChanged();  // the renderer copies them in this frame's command buffer

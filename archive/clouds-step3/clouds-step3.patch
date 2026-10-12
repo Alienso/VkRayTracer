@@ -1,0 +1,441 @@
+diff --git a/shaders/raytrace.comp b/shaders/raytrace.comp
+index a8d9e33..4c2e374 100644
+--- a/shaders/raytrace.comp
++++ b/shaders/raytrace.comp
+@@ -117,6 +117,7 @@ layout(binding = 3) uniform SceneUniforms {
+     uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
+     uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see triangleSolidAngle), 0 = by area
+     uint portalCount;               // entries in the portal list (binding 31): two per pair
++    uint maxFogScatters;            // scatter points in fog a path may have (they don't count as bounces, see tracePath)
+ } scene;
+ 
+ // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
+@@ -188,6 +189,10 @@ struct Material {
+     float fogCoverage;             // 0..1: about the share of the volume with fog
+     float fogEdge;                 // fades out over this distance towards the surface (mesh units); 0 = sharp
+     vec3 fogNoiseOffset;           // where in the noise texture (from the material's seed)
++    float fogDetail;               // 0..0.95: the noise's edges eaten away by a finer noise (wisps); 0 = none
++    // Cloud droplets (see fogPhase): x: the forward lobe's g, y: the Draine lobe's g, z: its alpha, w: its weight.
++    // w = 0: haze, one Henyey-Greenstein lobe of g = fogForward.
++    vec4 fogMie;
+ };
+ layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
+ 
+@@ -829,7 +834,17 @@ float fogDensityAt(uint instance, vec3 p) {
+                                                     + materials[material].fogNoiseOffset, 0.0).r;
+         // The noise is spread evenly over 0..1 (Volumes.cpp): the top `coverage` of it is fog, rising from 0
+         float coverage = materials[material].fogCoverage;
+-        density *= clamp((noise - (1.0 - coverage)) / max(coverage, 1e-3), 0.0, 1.0);
++        float shape = clamp((noise - (1.0 - coverage)) / max(coverage, 1e-3), 0.0, 1.0);
++        // Edge detail (as in Horizon Zero Dawn's clouds): the same noise 4x finer, elsewhere in the texture, eats the
++        // thin parts away; where the shape is full (1) nothing changes, so the thickness stays the majorant
++        float detail = materials[material].fogDetail;
++        if (detail > 0.0 && shape > 0.0 && shape < 1.0) {
++            float fine = textureLod(volumeTextures[0], local * (4.0 * materials[material].fogNoiseScale)
++                                                       + materials[material].fogNoiseOffset + 0.5, 0.0).r;
++            float erosion = fine * detail;
++            shape = clamp((shape - erosion) / (1.0 - erosion), 0.0, 1.0);
++        }
++        density *= shape;
+     }
+     // The mesh's signed distance (negative inside): none outside, faded towards the surface inside
+     uint mesh = instances[instance].meshIndex;
+@@ -981,19 +996,55 @@ uvec2 mediumAt(vec3 p) {
+ 
+ // The share of scattered light that goes into a direction at cosine cosTheta to the light's own, per solid angle
+ // (Henyey-Greenstein: g = 0: every way alike, towards 1: mostly on forward)
+-float fogPhase(float cosTheta, float g) {
++float henyeyGreenstein(float cosTheta, float g) {
+     float d = 1.0 + g * g - 2.0 * g * cosTheta;
+     return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+ }
+ 
+-// A direction picked by fogPhase around `forward` (the ray's); pdf = fogPhase of it
+-vec3 sampleFogDirection(vec3 forward, float g, vec2 u, out float pdf) {
+-    float cosTheta = 1.0 - 2.0 * u.x;
+-    if (abs(g) > 1e-3) {
+-        float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+-        cosTheta = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
++// A cosine picked by henyeyGreenstein(., g)
++float sampleHenyeyGreenstein(float g, float u) {
++    if (abs(g) <= 1e-3) {
++        return 1.0 - 2.0 * u;
++    }
++    float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
++    return clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
++}
++
++// The phase function of fog material `material` (the share of scattered light per solid angle, as above). Haze: one
++// Henyey-Greenstein lobe. Clouds: the approximate Mie function of Jendersie & d'Eon 2023, fitted to water droplets of
++// one size: a very narrow forward lobe (light bent around the droplets: the silver lining) plus a Draine lobe, which is
++// Henyey-Greenstein times (1 + alpha cos^2), normalized (more light straight back too: the glory side).
++float fogPhase(uint material, float cosTheta) {
++    vec4 mie = materials[material].fogMie;
++    if (mie.w <= 0.0) {
++        return henyeyGreenstein(cosTheta, materials[material].fogForward);
++    }
++    float draine = henyeyGreenstein(cosTheta, mie.y) * (1.0 + mie.z * cosTheta * cosTheta)
++                   / (1.0 + mie.z * (1.0 + 2.0 * mie.y * mie.y) / 3.0);
++    return mix(henyeyGreenstein(cosTheta, mie.x), draine, mie.w);
++}
++
++// A direction picked by fogPhase around `forward` (the ray's); pdf = fogPhase of it. Clouds: a lobe picked by its
++// weight (u.x), the Draine lobe by rejection: a Henyey-Greenstein cosine, kept with chance (1 + alpha cos^2) /
++// (1 + alpha), else another (about 6 in 10 are kept; 64 failures in a row would take ~1e-24 and keep the last).
++vec3 sampleFogDirection(vec3 forward, uint material, vec2 u, inout uint seed, out float pdf) {
++    vec4 mie = materials[material].fogMie;
++    float cosTheta;
++    if (mie.w <= 0.0) {
++        cosTheta = sampleHenyeyGreenstein(materials[material].fogForward, u.x);
++    } else if (u.x >= mie.w) {
++        cosTheta = sampleHenyeyGreenstein(mie.x, (u.x - mie.w) / (1.0 - mie.w));
++    } else {
++        float v = u.x / mie.w;
++        for (uint attempt = 0; attempt < 64; attempt++) {
++            cosTheta = sampleHenyeyGreenstein(mie.y, v);
++            if (randomFloat(seed) * (1.0 + mie.z) <= 1.0 + mie.z * cosTheta * cosTheta) {
++                break;
++            }
++            v = randomFloat(seed);
++        }
+     }
+-    pdf = fogPhase(cosTheta, g);
++    pdf = fogPhase(material, cosTheta);
+     float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+     float phi = 2.0 * PI * u.y;
+     vec3 tangent, bitangent;
+@@ -2469,7 +2520,7 @@ vec3 fogLampLight(vec3 origin, vec3 direction, Intersection stretch, uint bounce
+     for (uvec2 rest = stretch.lampMedia; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+         uint material = mediumMaterial(firstMedium(rest));
+         scattering += fogDensityAt(firstMedium(rest), point) * materials[material].fogColor
+-                      * fogPhase(cosTheta, materials[material].fogForward);
++                      * fogPhase(material, cosTheta);
+     }
+     if (all(equal(scattering, vec3(0.0)))) {
+         return vec3(0.0);  // a clear spot of varying fog
+@@ -3531,7 +3582,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
+     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
+     // by bouncing would be one bounce short, and the methods wouldn't agree.
+-    for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
++    // Scatter points in fog don't count as bounces: in a cloud, light scatters dozens of times before it gets out,
++    // and with a few bounces cloud insides came out dark. They have their own, much larger budget (maxFogScatters, a
++    // safety: Russian roulette ends such paths long before, unless the fog is pure white). The final ray goes on
++    // through fog as well, scattering there, until it finds what it sees. `bounce` counts the path's vertices of both
++    // kinds (it numbers the random samples).
++    uint surfaceBounces = 0;  // surfaces lit so far
++    uint fogScatters = 0;     // scatter points lit so far
++    for (uint bounce = 0; bounce <= scene.maxBounces + scene.maxFogScatters; bounce++) {
+         // light found at this hit (the sky, the sun, a glowing surface). Not in a GI sample's Lo (see "ReSTIR GI").
+         uint clampDepth = giState == 2 ? 0u : reflections;
+         // (not traceClosest: one copy of the code that builds a Hit, called once here, keeps the shader smaller)
+@@ -3582,10 +3640,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+                 intersection.lampWeight = traced.lampWeight;
+             }
+         }
+-        // The lamps' light fog scatters into this stretch (not the final ray's: as at its end, see below). Not in
++        // The lamps' light fog scatters into this stretch (the final ray's too: it may scatter, see the budget above). Not in
+         // update paths: one more shadow ray took them from 128 registers to 168; their scatter points light-sample
+         // the lamps instead (noisier, but the cache averages it).
+-        if (CACHE_UPDATE_PASS == 0 && intersection.lampWeight > 0.0 && bounce < scene.maxBounces) {
++        if (CACHE_UPDATE_PASS == 0 && intersection.lampWeight > 0.0) {
+             ADD_LIGHT(throughput * fogLampLight(origin, direction, intersection, bounce, seed));
+         }
+         bool crossedPortal = intersection.travelled != 0.0;
+@@ -3602,7 +3660,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+             if (reflections == 0 && giState != 2) {
+                 cameraRayFog = 1.0;  // the camera sees this fog (see fogAmountImage)
+             }
+-            hit = fogHit(origin + direction * intersection.t, direction, intersection.travelled + intersection.t, medium);
++            vec3 scatterPoint = origin + direction * intersection.t;
++            // The new direction comes out of a frame built around this one, so its rounding error would grow with
++            // every scatter: after a few hundred (in a cloud), cosines above 1 made the phase function NaN
++            direction = normalize(direction);
++            hit = fogHit(scatterPoint, direction, intersection.travelled + intersection.t, medium);
+             throughput *= materials[medium].fogColor * exp(-materials[medium].absorption * intersection.t);
+             if (bounce == 0 && wantGuides) {
+                 guidesRetrace = true;  // the guides: of what is behind the fog
+@@ -3689,9 +3751,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+             // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
+             ADD_LIGHT_EXCEPT(throughput * hit.emissive * weight, reflectedOnce && lightSampled ? previousVertex : -1);
+         }
+-        if (bounce == scene.maxBounces) {
++        if (isFog(hit) ? fogScatters == scene.maxFogScatters : surfaceBounces == scene.maxBounces) {
+             break;  // the final ray: only what it sees counts
+         }
++        if (isFog(hit)) {
++            fogScatters++;
++        } else {
++            surfaceBounces++;
++        }
+ 
+         // ReSTIR GI: the second surface of a GI pixel. Its glow (above) stays the first surface's; everything after
+         // it is the sample's Lo.
+@@ -3842,7 +3909,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+                 float pdfBounce;  // how likely the bounce sampling would have picked this direction
+                 vec3 contribution;
+                 if (isFog(hit)) {
+-                    pdfBounce = fogPhase(dot(direction, s.direction), materials[hit.meshIndex].fogForward);
++                    pdfBounce = fogPhase(hit.meshIndex, dot(direction, s.direction));
+                     contribution = s.light * pdfBounce;
+                 } else {
+                     contribution = s.light * evaluateBrdfWorld(hit, hit.normal, -direction, s.direction, pdfBounce)
+@@ -3891,7 +3958,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
+         vec4 bounceRandom = pathSample(bounce, SAMPLE_BOUNCE, seed);  // xyz: the direction, w: Russian roulette
+         if (isFog(hit)) {
+             // On from the fog in a direction picked by its phase function: weight 1 (phase / pdf)
+-            l = toLocal(frame, sampleFogDirection(direction, materials[hit.meshIndex].fogForward, bounceRandom.xy, bouncePdf));
++            l = toLocal(frame, sampleFogDirection(direction, hit.meshIndex, bounceRandom.xy, seed, bouncePdf));
+             lobeRoughness = 1.0;
+             specularLobe = false;
+         } else if (leavingGlass) {
+diff --git a/source/renderer/Renderer.h b/source/renderer/Renderer.h
+index 4426080..af59839 100644
+--- a/source/renderer/Renderer.h
++++ b/source/renderer/Renderer.h
+@@ -104,6 +104,7 @@ struct SceneUniforms {
+     uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
+     uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
+     uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
++    uint32_t maxFogScatters;         // scatter points in fog per path (not counted as bounces)
+ };
+ 
+ // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
+@@ -327,6 +328,8 @@ struct GpuMaterial {
+     float fogCoverage;
+     float fogEdge;
+     glm::vec3 fogNoiseOffset;       // from the seed, in texture repeats
++    float fogDetail;                // edge erosion by the finer noise, 0 = none
++    glm::vec4 fogMie;               // cloud droplets' phase function (fitted parameters), w = 0: haze, see Material
+ };
+ 
+ // The fog noise texture holds this many blobs along each side (Volumes.cpp)
+@@ -449,6 +452,9 @@ struct RenderSettings {
+     // Points on glowing triangles: spread evenly over the triangle's solid angle as the surface sees it (Arvo 1995),
+     // or evenly over its area (then a large panel close by gets most samples in its far parts)
+     bool emissiveSolidAngle = true;
++    // Scatter points in fog per path, on top of the bounces. A safety: Russian roulette ends paths in fog that isn't
++    // pure white long before. Too low darkens thick clouds.
++    int maxFogScatters = 1024;
+     int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
+     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
+     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
+diff --git a/source/renderer/RayTracer.cpp b/source/renderer/RayTracer.cpp
+index 1de47ff..e54c776 100644
+--- a/source/renderer/RayTracer.cpp
++++ b/source/renderer/RayTracer.cpp
+@@ -874,6 +874,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
+     }
+     uniforms.samplesPerPixel = static_cast<uint32_t>(std::max(settings.samplesPerPixel, 1));
+     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
++    uniforms.maxFogScatters = static_cast<uint32_t>(std::max(settings.maxFogScatters, 1));
+     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
+     uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
+     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
+@@ -946,7 +947,8 @@ SceneUniforms Renderer::buildSceneUniforms() {
+     bool lightingChanged =
+             std::memcmp(&uniforms.sunDirection, &previousUniforms.sunDirection,
+                         offsetof(SceneUniforms, samplesPerPixel) - offsetof(SceneUniforms, sunDirection)) != 0 ||
+-            uniforms.maxBounces != previousUniforms.maxBounces || uniforms.shadowsEnabled != previousUniforms.shadowsEnabled ||
++            uniforms.maxBounces != previousUniforms.maxBounces || uniforms.maxFogScatters != previousUniforms.maxFogScatters ||
++            uniforms.shadowsEnabled != previousUniforms.shadowsEnabled ||
+             uniforms.emissiveSampling != previousUniforms.emissiveSampling ||
+             uniforms.blurCaustics != previousUniforms.blurCaustics ||
+             uniforms.cacheCellScale != previousUniforms.cacheCellScale;
+diff --git a/source/renderer/ImGuiInit.cpp b/source/renderer/ImGuiInit.cpp
+index de7335c..c4c7448 100644
+--- a/source/renderer/ImGuiInit.cpp
++++ b/source/renderer/ImGuiInit.cpp
+@@ -84,6 +84,12 @@ void Renderer::buildRenderingUi() {
+     }
+     ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 64);
+     ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
++    ImGui::SliderInt("Max fog scatters", &settings.maxFogScatters, 1, 4096, "%d", ImGuiSliderFlags_Logarithmic);
++    if (ImGui::IsItemHovered()) {
++        ImGui::SetTooltip("Scattering in fog and clouds doesn't count as a bounce: light scatters dozens of times\n"
++                          "inside a cloud before it gets out. This is its own limit, a safety: paths in fog that\n"
++                          "isn't pure white end long before (Russian roulette). Too low darkens thick clouds.");
++    }
+     ImGui::Combo("Emissive light", &settings.emissiveSampling,
+                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
+     ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
+diff --git a/source/assets/ModelLoader.h b/source/assets/ModelLoader.h
+index 90d8647..0c6e426 100644
+--- a/source/assets/ModelLoader.h
++++ b/source/assets/ModelLoader.h
+@@ -77,6 +77,15 @@ struct Material {
+     float fogCoverage = 0.5f;  // 0..1: about the share of the volume that has fog
+     int fogNoiseSeed = 0;      // another part of the noise, so objects sharing the numbers still differ
+     float fogEdge = 0.0f;      // fades out over this distance towards the mesh's surface (mesh units); 0 = sharp
++    float fogDetail = 0.0f;    // 0..0.95: the noise's thin parts eaten away by a finer noise (wisps at cloud edges)
++    // Cloud: water droplets of this size (micrometers, 5..50) scatter the light (strongly forward, some straight back;
++    // see fogPhase in the shader) instead of fogForward's single lobe. 0 = haze (fogForward).
++    float fogDroplets = 0.0f;
++    // Cloud droplets: half the light they scatter goes on within ~0.3 degrees of straight ahead (the diffraction peak).
++    // Off (default): that peak counts as light passing straight through ("delta scaling": the thickness drops by the
++    // peak's share, the rest of the scattering stays); the image differs only by that 0.3 degree spread. On: traced
++    // as scattering, exact but very noisy (that light then reaches the camera mostly by rays hitting the sun by chance).
++    bool fogExactForwardPeak = false;
+     glm::vec3 emissiveColor = glm::vec3(0.0f);
+     float emissiveStrength = 1.0f;  // KHR_materials_emissive_strength: lets emission go above 1
+     AlphaMode alphaMode = AlphaMode::Opaque;
+diff --git a/source/renderer/Materials.cpp b/source/renderer/Materials.cpp
+index d8e44ac..a5a30fa 100644
+--- a/source/renderer/Materials.cpp
++++ b/source/renderer/Materials.cpp
+@@ -292,6 +292,27 @@ std::vector<GpuMaterial> Renderer::packMaterials() const {
+         gpu.fogEdge = std::max(m.fogEdge, 0.0f);
+         // Each seed its own place in the texture: steps of the golden ratio spread them evenly
+         gpu.fogNoiseOffset = glm::fract(static_cast<float>(m.fogNoiseSeed) * glm::vec3(0.6180340f, 0.7548777f, 0.5698403f));
++        gpu.fogDetail = glm::clamp(m.fogDetail, 0.0f, 0.95f);
++        // Cloud droplets: Jendersie & d'Eon 2023, "An Approximate Mie Scattering Function for Fog and Cloud
++        // Rendering", the fit for droplet diameters of 5 to 50 micrometers
++        gpu.fogMie = glm::vec4(0.0f);
++        if (m.fogDroplets > 0.0f) {
++            float d = glm::clamp(m.fogDroplets, 5.0f, 50.0f);
++            gpu.fogMie = glm::vec4(std::exp(-0.0990567f / (d - 1.67154f)),
++                                   std::exp(-2.20679f / (d + 3.91029f) - 0.428934f),
++                                   std::exp(3.62489f - 8.29288f / (d + 5.52825f)),
++                                   std::exp(-0.599085f / (d - 0.641583f) - 0.665888f));
++            if (!m.fogExactForwardPeak) {
++                // Delta scaling (Joseph, Wiscombe & Weinman 1976): the forward peak's share f of the scattering passes
++                // straight on. Of the extinction, f * (the scattered share) goes; of what is left, the scattered share is
++                // (1 - f) c / (1 - f c). One density for all colors: their average decides it (exact for gray fog).
++                float f = 1.0f - gpu.fogMie.w;
++                float c = (gpu.fogColor.r + gpu.fogColor.g + gpu.fogColor.b) / 3.0f;
++                gpu.fogDensity *= 1.0f - f * c;
++                gpu.fogColor = gpu.fogColor * (1.0f - f) / std::max(1.0f - f * c, 1e-6f);
++                gpu.fogMie = glm::vec4(0.0f, gpu.fogMie.y, gpu.fogMie.z, 1.0f);  // the Draine lobe alone
++            }
++        }
+         // Beer's law: after distance d, exp(-absorption * d) of the light is left. glTF gives the color left
+         // after attenuationDistance, so absorption = -ln(color) / distance per channel.
+         if (m.solid && m.attenuationDistance > 0.0f) {
+diff --git a/source/editor/EditorScene.cpp b/source/editor/EditorScene.cpp
+index aca1d36..9d3f067 100644
+--- a/source/editor/EditorScene.cpp
++++ b/source/editor/EditorScene.cpp
+@@ -346,10 +346,35 @@ void Editor::buildMaterialUi(const SceneModel& model) {
+                                       "before it scatters.");
+                 }
+                 changed |= ImGui::ColorEdit3("Fog color", &m.fogColor.x, ImGuiColorEditFlags_Float);
+-                changed |= ImGui::SliderFloat("Forward scattering", &m.fogForward, -0.9f, 0.9f, "%.2f");
++                int scattering = m.fogDroplets > 0.0f ? 1 : 0;
++                if (ImGui::Combo("Scattering", &scattering, "Haze\0Cloud droplets\0")) {
++                    m.fogDroplets = scattering == 1 ? 20.0f : 0.0f;
++                    changed = true;
++                }
+                 if (ImGui::IsItemHovered()) {
+-                    ImGui::SetTooltip("0: light scatters every way alike. Higher: mostly onwards, so beams glow brightest\n"
+-                                      "looking towards the light (real haze: 0.3 - 0.8). Negative: back towards the light.");
++                    ImGui::SetTooltip("Haze: one lobe, set by Forward scattering.\n"
++                                      "Cloud droplets: how water droplets scatter light (a fit to Mie theory): mostly\n"
++                                      "straight on (the bright rim of a cloud in front of the sun), some straight back.");
++                }
++                if (scattering == 0) {
++                    changed |= ImGui::SliderFloat("Forward scattering", &m.fogForward, -0.9f, 0.9f, "%.2f");
++                    if (ImGui::IsItemHovered()) {
++                        ImGui::SetTooltip("0: light scatters every way alike. Higher: mostly onwards, so beams glow brightest\n"
++                                          "looking towards the light (real haze: 0.3 - 0.8). Negative: back towards the light.");
++                    }
++                } else {
++                    changed |= ImGui::SliderFloat("Droplet size", &m.fogDroplets, 5.0f, 50.0f, "%.0f um");
++                    if (ImGui::IsItemHovered()) {
++                        ImGui::SetTooltip("Diameter of the droplets in micrometers. Clouds: about 10 - 30. Bigger droplets\n"
++                                          "send more of the light straight on.");
++                    }
++                    changed |= ImGui::Checkbox("Exact forward peak", &m.fogExactForwardPeak);
++                    if (ImGui::IsItemHovered()) {
++                        ImGui::SetTooltip("Half the light droplets scatter goes on within ~0.3 degrees of straight ahead.\n"
++                                          "Off: that counts as light passing straight through (the cloud is that much thinner\n"
++                                          "for it); the image differs only by that tiny spread. On: traced as scattering:\n"
++                                          "exact, but very noisy (sparkles that take thousands of frames to settle).");
++                    }
+                 }
+                 changed |= ImGui::Checkbox("Patchy (noise)", &m.fogNoise);
+                 if (ImGui::IsItemHovered()) {
+@@ -370,6 +395,11 @@ void Editor::buildMaterialUi(const SceneModel& model) {
+                     if (ImGui::IsItemHovered()) {
+                         ImGui::SetTooltip("Another part of the noise: the same kind of fog, other blobs");
+                     }
++                    changed |= ImGui::SliderFloat("Edge detail", &m.fogDetail, 0.0f, 0.95f, "%.2f");
++                    if (ImGui::IsItemHovered()) {
++                        ImGui::SetTooltip("Eats the thin parts of the blobs away with a finer noise: wisps and ragged edges\n"
++                                          "(cloud edges). The thick middles stay.");
++                    }
+                 }
+                 changed |= ImGui::SliderFloat("Edge softness", &m.fogEdge, 0.0f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                 if (ImGui::IsItemHovered()) {
+diff --git a/source/assets/BuiltInModels.cpp b/source/assets/BuiltInModels.cpp
+index f46f604..ac9d961 100644
+--- a/source/assets/BuiltInModels.cpp
++++ b/source/assets/BuiltInModels.cpp
+@@ -15,6 +15,8 @@
+ //
+ // The light orb: a small glowing ball floating at the height of a fog box's middle, to light fog from inside.
+ //
++// The cloud: a flattened ball of invisible fog, patchy, with soft ragged edges and the scattering of cloud droplets.
++//
+ // The portal rim: two glowing cubes (blue for the A ends, orange for the B ends) that the Scene stretches into the
+ // bars of the portals' frames.
+ //
+@@ -34,9 +36,10 @@ static const char* cubeName = "Cube";
+ static const char* mirrorMazeName = "Mirror maze";
+ static const char* fogBoxName = "Fog box";
+ static const char* lightOrbName = "Light orb";
++static const char* cloudName = "Cloud";
+ 
+ const std::vector<std::string>& builtInModelNames() {
+-    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName, fogBoxName, lightOrbName};
++    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName, fogBoxName, lightOrbName, cloudName};
+     return names;
+ }
+ 
+@@ -220,6 +223,37 @@ static Model createLightOrb() {
+     return model;
+ }
+ 
++// A cumulus-like cloud, 8 x 3.6 x 5.6, its bottom 3 above the ground: a flattened ball of invisible fog (only the fog
++// shows). Its shape comes from the noise and the edge fade; the thickness is that of a small real cloud seen
++// close up. Its material is shared by all clouds: give one another Variation, or turn it, so two clouds differ.
++static Model createCloud() {
++    Model model;
++    model.name = cloudName;
++    Material material = matte("cloud", glm::vec3(1.0f));
++    material.invisibleSurface = true;
++    material.fogDensity = 8.0f;            // half of it passes on straight (the droplets' forward peak, see Material)
++    material.fogColor = glm::vec3(0.99f);  // droplets absorb almost nothing
++    material.fogDroplets = 20.0f;
++    material.fogNoise = true;
++    material.fogNoiseSize = 1.6f;
++    material.fogCoverage = 0.7f;
++    material.fogDetail = 0.5f;
++    material.fogEdge = 1.0f;
++    model.materials.push_back(material);
++    const glm::vec3 radii(4.0f, 1.8f, 2.8f), center(0.0f, 4.8f, 0.0f);
++    Mesh mesh = sphereMesh("mesh", 0, glm::vec3(0.0f), 1.0f);
++    for (SceneVertex& vertex : mesh.vertices) {
++        vertex.position = center + vertex.position * radii;
++        vertex.normal = glm::normalize(vertex.normal / radii);  // an ellipsoid's normal
++    }
++    computeBounds(mesh);
++    model.boundsMin = mesh.boundsMin;
++    model.boundsMax = mesh.boundsMax;
++    model.meshes.push_back(mesh);
++    model.instances.push_back({0, glm::mat4(1.0f)});
++    return model;
++}
++
+ static Model createPortalRim() {
+     Model model;
+     model.name = portalRimModelName();
+@@ -418,6 +452,9 @@ Model createBuiltInModel(const std::string& name) {
+     if (name == lightOrbName) {
+         return createLightOrb();
+     }
++    if (name == cloudName) {
++        return createCloud();
++    }
+     if (name == portalRimModelName()) {
+         return createPortalRim();
+     }

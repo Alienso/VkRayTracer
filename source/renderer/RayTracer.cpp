@@ -4,6 +4,8 @@
 
 #include <unordered_map>
 #include <vulkan/vulkan.h>
+#include <atomic>
+#include <thread>
 #include <stdexcept>
 #include <cmath>
 #include <string>
@@ -401,6 +403,7 @@ void Renderer::createRayTracingImages() {
     createImage(renderExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
     createImage(renderExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                 guideHistoryImage);
+    createImage(renderExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, fogAmountImage);
     // Written before it is read in every frame that uses it, so it needs no clearing
     createBuffer(sizeof(GpuPrimaryHit) * renderExtent.width * renderExtent.height, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory);
@@ -422,7 +425,7 @@ void Renderer::createRayTracingImages() {
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkImage images[] = {radianceImage, linearDepthImage.image, motionVectorImage.image, diffuseAlbedoImage.image,
                             specularAlbedoImage.image, normalRoughnessImage.image, specularHitDistanceImage.image,
-                            guideHistoryImage.image};
+                            guideHistoryImage.image, fogAmountImage.image};
         constexpr uint32_t imageCount = static_cast<uint32_t>(std::size(images));
         VkImageMemoryBarrier barriers[imageCount]{};
         for (uint32_t i = 0; i < imageCount; i++) {
@@ -457,7 +460,8 @@ void Renderer::createRayTracingImages() {
 
 void Renderer::destroyRayTracingImages() {
     for (RenderImage* image : {&linearDepthImage, &motionVectorImage, &diffuseAlbedoImage, &specularAlbedoImage,
-                               &normalRoughnessImage, &specularHitDistanceImage, &guideHistoryImage}) {
+                               &normalRoughnessImage, &specularHitDistanceImage, &guideHistoryImage,
+                               &fogAmountImage}) {
         destroyImage(*image);
     }
     vkDestroyImageView(device, radianceImageView, nullptr);
@@ -482,8 +486,9 @@ void Renderer::createRayTracingDescriptors() {
     // specular albedo, normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages,
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
-    // 29: ReSTIR GI reservoirs, 30: blue noise
-    std::vector<VkDescriptorSetLayoutBinding> bindings(32);
+    // 29: ReSTIR GI reservoirs, 30: blue noise, 31: portals, 32: 3D textures (the fog's, Volumes.cpp),
+    // 33: fog amount (for the fog grain)
+    std::vector<VkDescriptorSetLayoutBinding> bindings(34);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -514,11 +519,14 @@ void Renderer::createRayTracingDescriptors() {
     bindings[29] = {29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[30] = {30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
     bindingFlags[7] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    bindingFlags[32] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
     VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
     bindingFlagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
     bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
@@ -535,10 +543,10 @@ void Renderer::createRayTracingDescriptors() {
 
     VkDescriptorPoolSize poolSizes[] = {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1}
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + maxVolumeTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -607,7 +615,13 @@ void Renderer::updateRayTracingDescriptorSet() {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    std::vector<VkWriteDescriptorSet> writes(32);
+    std::vector<VkDescriptorImageInfo> volumeInfos;
+    for (const GpuTexture& texture : gpuAssets.volumeTextures) {
+        volumeInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    }
+
+    VkDescriptorImageInfo fogAmountInfo{VK_NULL_HANDLE, fogAmountImage.view, VK_IMAGE_LAYOUT_GENERAL};
+    std::vector<VkWriteDescriptorSet> writes(34);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -671,6 +685,11 @@ void Renderer::updateRayTracingDescriptorSet() {
     writes[30].pBufferInfo = &blueNoiseInfo;
     writes[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[31].pBufferInfo = &portalInfo;
+    writes[32].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[32].descriptorCount = static_cast<uint32_t>(volumeInfos.size());  // (the noise is always there)
+    writes[32].pImageInfo = volumeInfos.data();
+    writes[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[33].pImageInfo = &fogAmountInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -692,27 +711,44 @@ void Renderer::createRayTracingPipeline() {
     // Seven pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
     // (CACHE_UPDATE_PASS = 1), ReSTIR's camera rays and DI candidates (RESTIR_PASS = 1), DI's spatial reuse
     // (RESTIR_PASS = 2), GI's shading (RESTIR_PASS = 3), temporal (RESTIR_PASS = 4) and spatial reuse
-    // (RESTIR_PASS = 5). The constants let the compiler drop the other passes' code from each.
+    // (RESTIR_PASS = 5). The constants let the compiler drop the other passes' code from each. And each again with
+    // the fog's code (FOG = 1 and 2, see tracePipeline). Compiled on threads of their own: one after the other they
+    // took about 3 seconds each.
     VkPipeline* pipelines[] = {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline, &rtRestirSpatialPipeline,
                                &rtRestirGiShadePipeline, &rtRestirGiTemporalPipeline, &rtRestirGiSpatialPipeline};
-    for (uint32_t pass = 0; pass < std::size(pipelines); pass++) {
-        uint32_t constants[2] = {pass == 1 ? 1u : 0u, pass >= 2 ? pass - 1 : 0u};
-        VkSpecializationMapEntry entries[2] = {{0, 0, sizeof(uint32_t)}, {1, sizeof(uint32_t), sizeof(uint32_t)}};
-        VkSpecializationInfo specialization{2, entries, sizeof(constants), constants};
-        VkComputePipelineCreateInfo pipelineInfo{};
-        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipelineInfo.stage.module = shaderModule;
-        pipelineInfo.stage.pName = "main";
-        pipelineInfo.stage.pSpecializationInfo = &specialization;
-        pipelineInfo.layout = rtPipelineLayout;
-        if (pipelineStatisticsSupported) {
-            pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-        }
-        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipelines[pass]) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create ray tracing pipeline!");
-        }
+    const uint32_t passes = static_cast<uint32_t>(std::size(pipelines));
+    std::vector<std::thread> compilers;
+    std::atomic<bool> failed{false};
+    for (uint32_t variant = 0; variant < 3 * passes; variant++) {
+        uint32_t pass = variant % passes;
+        uint32_t fog = variant / passes;
+        VkPipeline* pipeline = fog > 0 ? &rtFogPipelines[fog - 1][pass] : pipelines[pass];
+        compilers.emplace_back([this, pass, fog, pipeline, shaderModule, &failed] {
+            uint32_t constants[3] = {pass == 1 ? 1u : 0u, pass >= 2 ? pass - 1 : 0u, fog};
+            VkSpecializationMapEntry entries[3] = {{0, 0, sizeof(uint32_t)}, {1, sizeof(uint32_t), sizeof(uint32_t)},
+                                                   {2, 2 * sizeof(uint32_t), sizeof(uint32_t)}};
+            VkSpecializationInfo specialization{3, entries, sizeof(constants), constants};
+            VkComputePipelineCreateInfo pipelineInfo{};
+            pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = shaderModule;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.stage.pSpecializationInfo = &specialization;
+            pipelineInfo.layout = rtPipelineLayout;
+            if (pipelineStatisticsSupported) {
+                pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            }
+            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline) != VK_SUCCESS) {
+                failed = true;
+            }
+        });
+    }
+    for (std::thread& compiler : compilers) {
+        compiler.join();
+    }
+    if (failed) {
+        throw std::runtime_error("failed to create ray tracing pipeline!");
     }
 
     vkDestroyShaderModule(device, shaderModule, nullptr);
@@ -724,9 +760,24 @@ void Renderer::createRayTracingPipeline() {
                                "ReSTIR spatial reuse:\n" + readPipelineStatistics(rtRestirSpatialPipeline) +
                                "ReSTIR GI shading:\n" + readPipelineStatistics(rtRestirGiShadePipeline) +
                                "ReSTIR GI temporal reuse:\n" + readPipelineStatistics(rtRestirGiTemporalPipeline) +
-                               "ReSTIR GI spatial reuse:\n" + readPipelineStatistics(rtRestirGiSpatialPipeline);
+                               "ReSTIR GI spatial reuse:\n" + readPipelineStatistics(rtRestirGiSpatialPipeline) +
+                               "Image paths with fog:\n" + readPipelineStatistics(rtFogPipelines[0][0]) +
+                               "Cache update paths with fog:\n" + readPipelineStatistics(rtFogPipelines[0][1]) +
+                               "Image paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][0]) +
+                               "Cache update paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][1]);
         std::cout << "Trace shader statistics (from the driver):\n" << rtPipelineStatistics << std::flush;
     }
+}
+
+VkPipeline Renderer::tracePipeline(VkPipeline plain) const {
+    const VkPipeline plainOnes[] = {rtPipeline, rtCacheUpdatePipeline, rtRestirPipeline, rtRestirSpatialPipeline,
+                                    rtRestirGiShadePipeline, rtRestirGiTemporalPipeline, rtRestirGiSpatialPipeline};
+    for (size_t i = 0; fogLevel > 0 && i < std::size(plainOnes); i++) {
+        if (plainOnes[i] == plain) {
+            return rtFogPipelines[fogLevel - 1][i];
+        }
+    }
+    return plain;
 }
 
 // The driver's statistics about a compiled pipeline, one "name: value" line each (on NVIDIA e.g. the registers per
@@ -813,6 +864,22 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.environmentIntensity = environment.mapIntensity;
     uniforms.punctualLightCount = static_cast<uint32_t>(uploadedPunctualLights.size());
     uniforms.portalCount = static_cast<uint32_t>(uploadedPortals.size());
+    fogLevel = 0;
+    bool fogDrifts = false;
+    for (const SceneMaterial& material : assets.materials()) {
+        if (fogVaries(material.material)) {
+            fogLevel = 2;
+            fogDrifts = fogDrifts || (material.material.fogNoise && material.material.fogDrift != glm::vec3(0.0f));
+        } else if (material.material.fogDensity > 0.0f || material.material.invisibleSurface) {
+            fogLevel = std::max(fogLevel, 1u);
+        }
+    }
+    // Drifting fog changes the image every frame (accumulation restarts); still fog leaves the uniforms alone. The
+    // clock stops while nothing drifts, so fog that starts drifting again goes on from where it was.
+    if (fogDrifts) {
+        fogTime += std::min(frameDeltaTime, 0.25f);  // a long stall (loading a model) shouldn't jump
+    }
+    uniforms.fogTime = fogDrifts ? fogTime : 0.0f;
     uniforms.samplesPerPixel = static_cast<uint32_t>(std::max(settings.samplesPerPixel, 1));
     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
@@ -1045,7 +1112,7 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     // 3: ReSTIR: the camera rays first (their hits go to the primary hit buffer), and (DI) a light sample per pixel
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
     if (uniforms.restirDi != 0 || uniforms.restirGi != 0) {
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtRestirPipeline);
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(rtRestirPipeline));
         vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
         VkMemoryBarrier hitsBarrier{};
         hitsBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1055,7 +1122,7 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
                              0, 1, &hitsBarrier, 0, nullptr, 0, nullptr);
         // Spatial reuse: reads the ReSTIR pass's reservoirs (a part of their own), writes this frame's
         if (uniforms.restirSpatialNeighbors + uniforms.restirDisocclusionNeighbors > 0) {
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtRestirSpatialPipeline);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(rtRestirSpatialPipeline));
             vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
             vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &hitsBarrier, 0, nullptr, 0, nullptr);
@@ -1064,7 +1131,7 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     writeTimestamp(commandBuffer, 2);
 
     // 4: trace
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipeline);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(rtPipeline));
     vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
     // ReSTIR GI: the image pass left a fresh sample per pixel; reused, then its light added to the image (timed as
     // part of "trace")
@@ -1080,7 +1147,7 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
             }
             vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &giBarrier, 0, nullptr, 0, nullptr);
-            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(pipeline));
             vkCmdDispatch(commandBuffer, (renderExtent.width + 7) / 8, (renderExtent.height + 7) / 8, 1);
         }
     }
@@ -1194,6 +1261,12 @@ void Renderer::cleanupRayTracing() {
     vkDestroyPipeline(device, rtRestirGiShadePipeline, nullptr);
     vkDestroyPipeline(device, rtRestirGiTemporalPipeline, nullptr);
     vkDestroyPipeline(device, rtRestirGiSpatialPipeline, nullptr);
+    for (auto& level : rtFogPipelines) {
+        for (VkPipeline pipeline : level) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+    }
+    destroyVolumeTextures();
     destroyRadianceCache();
     vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
     vkDestroyDescriptorPool(device, rtDescriptorPool, nullptr);

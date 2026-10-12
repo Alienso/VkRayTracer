@@ -17,7 +17,8 @@
 // Can a ray pass through parts of this material? Then the shader has to look at every hit on it:
 // for holes (alpha), and so shadow rays can pass through glass, tinted.
 static bool needsHitTest(const Material& material) {
-    return material.alphaMode != AlphaMode::Opaque || material.transmission > 0.0f;
+    return material.alphaMode != AlphaMode::Opaque || material.transmission > 0.0f || material.fogDensity > 0.0f ||
+           material.invisibleSurface;
 }
 
 static VkTransformMatrixKHR toVkTransform(const glm::mat4& m) {
@@ -68,6 +69,11 @@ void Renderer::updateScene() {
         }
     }
 
+    // 1b: varying fog needs its mesh's distance field (Volumes.cpp); baked when a mesh first needs it
+    if ((geometryReuploaded || gpuAssets.materialsDirty) && syncDistanceFields() && rtDescriptorSet != VK_NULL_HANDLE) {
+        updateRayTracingDescriptorSet();
+    }
+
     // 2: the scene's render list -> TLAS instances, one per list instance. Only remade when the list was (an object
     //    changed or moved), a material changed (the opaque flags), or the geometry was re-uploaded (BLAS addresses).
     bool rebuild = renderList->instanceRevision() != builtRenderListRevision || gpuAssets.materialsDirty || geometryReuploaded;
@@ -84,19 +90,21 @@ void Renderer::updateScene() {
             VkAccelerationStructureInstanceKHR instance{};  // zeroed, so memcmp below compares only real data
             instance.transform = toVkTransform(world);
             instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
-            instance.mask = 0xFF;
+            const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
+            // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt and the shadow
+            // rays through varying fog look at alone: 0x02 even fog, 0x04 varying (see "Fog" there)
+            instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : 0x01;
             instance.instanceShaderBindingTableRecordOffset = 0;
             instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             // Cut-out (alpha) materials are "not opaque": every ray asks the shader whether a hit on them counts.
             // Everything else stays on the fast path where the hardware decides alone. A material change remakes
             // the instances, so switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
-            const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
             instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
                                                      : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
             instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;
             frameInstances.push_back(instance);
             frameGpuInstances.push_back({renderList->motions[renderInstance.motion], glm::mat4x3(world),
-                                         glm::inverse(glm::mat3(world))});
+                                         glm::inverse(glm::mat3(world)), renderInstance.mesh});
             primitiveCount += gpuAssets.meshInfos[renderInstance.mesh].indexCount / 3;
         }
     }
@@ -209,6 +217,14 @@ void Renderer::uploadSceneGeometry() {
         info.indexCount = static_cast<uint32_t>(mesh.indices.size());
         info.hasNormals = mesh.hasNormals ? 1 : 0;
         info.hasTangents = mesh.hasTangents ? 1 : 0;
+        // (from the vertices: not every built-in mesh fills in its bounds)
+        info.boundsMin = glm::vec3(mesh.vertices.empty() ? 0.0f : 1e30f);
+        info.boundsMax = glm::vec3(mesh.vertices.empty() ? 0.0f : -1e30f);
+        for (const SceneVertex& vertex : mesh.vertices) {
+            info.boundsMin = glm::min(info.boundsMin, vertex.position);
+            info.boundsMax = glm::max(info.boundsMax, vertex.position);
+        }
+        info.distanceField = -1;  // syncDistanceFields
         gpuAssets.meshInfos.push_back(info);
 
         vertices.insert(vertices.end(), mesh.vertices.begin(), mesh.vertices.end());

@@ -25,6 +25,7 @@ layout(binding = 7, rgba16f) uniform readonly image2D normalRoughnessImage;
 layout(binding = 8, r32f) uniform readonly image2D specularHitDistanceImage;
 layout(binding = 9, rgba16f) uniform readonly image2D historyImage;  // last frame's diffuse albedo
 layout(binding = 10, rgba32f) uniform readonly image2D radianceImage;  // the trace shader's output, render size
+layout(binding = 11, r32f) uniform readonly image2D fogAmountImage;    // how much fog the camera sees, render size
 
 // Must match DisplayPushConstants in Application.h
 layout(push_constant) uniform DisplaySettings {
@@ -33,6 +34,9 @@ layout(push_constant) uniform DisplaySettings {
     uint toneMapping;   // 0 = clamp, 1 = ACES filmic curve
     uint view;          // what to show, see the constants below
     float farDistance;  // the depth of sky pixels
+    float grainStrength;  // fog grain: 0 = off, else how far it moves a pixel's brightness (see fogGrain)
+    float grainSize;      // in output pixels
+    uint frame;           // a new grain pattern every frame
 } display;
 
 // Must match DisplayView in Application.h
@@ -112,6 +116,43 @@ vec3 guideColor(ivec2 pixel) {
     return vec3(1.0, 0.0, 1.0);
 }
 
+uint hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// How much fog the camera sees around an output pixel: the trace shader's fogAmountImage (a share of camera rays,
+// each 0 or 1 in a frame of the DLSS modes), averaged over 5x5 render pixels so the grain fades in smoothly.
+float fogAmountAround(ivec2 renderPixel) {
+    ivec2 last = imageSize(fogAmountImage) - 1;
+    float sum = 0.0;
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            sum += imageLoad(fogAmountImage, clamp(renderPixel + ivec2(x, y), ivec2(0), last)).r;
+        }
+    }
+    return sum / 25.0;
+}
+
+// Fog grain: a look, not light. DLSS removes the path tracer's noise, which in fog looked like film grain; this adds
+// grain back where the camera sees fog, after DLSS and tone mapping. A new random pattern every frame, in cells of
+// grainSize output pixels, as a brightness change of up to +-grainStrength (more often small: two random numbers
+// added), the same for the three colors.
+vec3 fogGrain(vec3 color, ivec2 pixel, ivec2 renderPixel) {
+    float fog = fogAmountAround(renderPixel);
+    if (fog <= 0.0) {
+        return color;
+    }
+    uvec2 cell = uvec2(vec2(pixel) / display.grainSize);
+    uint h = hash(cell.x ^ hash(cell.y ^ hash(display.frame)));
+    float noise = float(h & 0xFFFFu) / 65535.0 + float(h >> 16) / 65535.0 - 1.0;  // -1..1, peaked at 0
+    return clamp(color * (1.0 + display.grainStrength * fog * noise), 0.0, 1.0);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(displayImage);
@@ -132,6 +173,9 @@ void main() {
         color = color * display.exposure * (display.autoExposure != 0 ? measuredExposure : 1.0);
         if (display.toneMapping != 0) {
             color = toneMapACES(color);
+        }
+        if (display.grainStrength > 0.0) {
+            color = fogGrain(color, pixel, renderPixel);
         }
     }
     // Linear values; values above 1 are clamped when stored as 8 bit. The blit to the sRGB swapchain encodes them.

@@ -281,6 +281,18 @@ std::vector<GpuMaterial> Renderer::packMaterials() const {
         gpu.diffuseTransmissionUvTransform = m.diffuseTransmissionUvTransform;
         gpu.diffuseTransmissionColorUvTransform = m.diffuseTransmissionColorUvTransform;
         gpu.solid = m.solid ? 1 : 0;
+        gpu.fogDensity = std::max(m.fogDensity, 0.0f);
+        gpu.fogColor = glm::clamp(m.fogColor, glm::vec3(0.0f), glm::vec3(1.0f));
+        gpu.fogForward = glm::clamp(m.fogForward, -0.95f, 0.95f);
+        gpu.invisible = m.invisibleSurface ? 1 : 0;
+        gpu.fogNoise = m.fogNoise ? 1 : 0;
+        // The noise texture repeats every fogNoiseBlobs blobs (Volumes.cpp)
+        gpu.fogNoiseScale = 1.0f / (fogNoiseBlobs * std::max(m.fogNoiseSize, 1e-4f));
+        gpu.fogCoverage = glm::clamp(m.fogCoverage, 0.0f, 1.0f);
+        gpu.fogEdge = std::max(m.fogEdge, 0.0f);
+        // Each seed its own place in the texture: steps of the golden ratio spread them evenly
+        gpu.fogNoiseOffset = glm::fract(static_cast<float>(m.fogNoiseSeed) * glm::vec3(0.6180340f, 0.7548777f, 0.5698403f));
+        gpu.fogDrift = m.fogDrift * gpu.fogNoiseScale;
         // Beer's law: after distance d, exp(-absorption * d) of the light is left. glTF gives the color left
         // after attenuationDistance, so absorption = -ln(color) / distance per channel.
         if (m.solid && m.attenuationDistance > 0.0f) {

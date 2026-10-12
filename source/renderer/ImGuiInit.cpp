@@ -126,6 +126,16 @@ void Renderer::buildRenderingUi() {
     ImGui::SeparatorText("Image");
     buildExposureUi();
     ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
+    ImGui::Checkbox("Fog grain", &settings.fogGrain);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Film-like grain where the camera sees fog, added to the finished image (after DLSS, which\n"
+                          "removes the path tracer's own noise). A look only: the light is unchanged. Also in\n"
+                          "Accumulation and in captures; turn it off for a clean image.");
+    }
+    ImGui::BeginDisabled(!settings.fogGrain);
+    ImGui::SliderFloat("Grain strength", &settings.fogGrainStrength, 0.0f, 1.0f);
+    ImGui::SliderFloat("Grain size", &settings.fogGrainSize, 1.0f, 4.0f, "%.1f px");
+    ImGui::EndDisabled();
 }
 
 // ReSTIR DI (see RESTIR_DI_PLAN.md)

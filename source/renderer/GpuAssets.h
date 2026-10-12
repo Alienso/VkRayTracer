@@ -18,6 +18,7 @@
 #include <map>
 #include <utility>
 #include <vector>
+#include <glm/glm.hpp>
 
 struct AccelerationStructure {
     VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
@@ -37,6 +38,9 @@ struct MeshInfo {
     uint32_t hasNormals;
     uint32_t hasTangents;
     float unitScale;  // file units per mesh unit (the glTF node's scale), for absorption distances
+    glm::vec3 boundsMin;  // the mesh's box, in its own space
+    glm::vec3 boundsMax;
+    int32_t distanceField;  // in the volume textures: distance to the surface over that box (Volumes.cpp); -1: none
 };
 
 // A texture on the GPU. Samplers are shared between textures with the same settings.
@@ -80,6 +84,12 @@ struct GpuAssets {
     VkDeviceMemory materialBufferMemory;
     bool materialBufferCreated = false;
     bool materialsDirty = false;  // edited since the last upload: copied in this frame's command buffer
+
+    // 3D textures (one bindless array in the shader, Volumes.cpp): entry 0 the fog noise, then the distance fields of
+    // the meshes that have varying fog, baked when one first needs it and kept by mesh id like the BLASes
+    GpuTexture fogNoise;
+    std::map<uint64_t, GpuTexture> distanceFields;  // key: AssetStore::meshIds()
+    std::vector<GpuTexture> volumeTextures;         // as in the descriptor array (MeshInfo::distanceField)
 };
 
 // GPU objects to destroy once no frame in flight can use them any more. Something released while preparing frame

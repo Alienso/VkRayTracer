@@ -17,6 +17,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // RESTIR_PASS = 3, its shading (restirGiShade).
 layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
 layout(constant_id = 1) const uint RESTIR_PASS = 0;
+// FOG = 1: some material has fog inside or an invisible surface (see "Fog"). Each pass has a pipeline without the fog's
+// code too, for scenes without: it costs registers (168 instead of 128), and with them 12% of the time, fog or not.
+layout(constant_id = 2) const uint FOG = 0;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
@@ -29,6 +32,9 @@ layout(binding = 14, rgba16f) uniform writeonly image2D diffuseAlbedoImage;
 layout(binding = 15, rgba16f) uniform writeonly image2D specularAlbedoImage;
 layout(binding = 16, rgba16f) uniform writeonly image2D normalRoughnessImage;  // world-space normal, roughness in alpha
 layout(binding = 17, r32f) uniform writeonly image2D specularHitDistanceImage; // 0 = unknown
+// The share of camera rays that scattered in fog before any reflection (through glass counts), averaged like the
+// radiance: on average 1 - the fog's transmittance up to the first surface. For the fog grain (display.comp).
+layout(binding = 33, r32f) uniform image2D fogAmountImage;
 
 // Must match SceneUniforms in Application.h
 layout(binding = 3) uniform SceneUniforms {
@@ -111,6 +117,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
     uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see triangleSolidAngle), 0 = by area
     uint portalCount;               // entries in the portal list (binding 31): two per pair
+    float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -132,6 +139,9 @@ struct MeshInfo {
     uint hasNormals;
     uint hasTangents;
     float unitScale;        // file units per mesh unit (the glTF node's scale), for absorption distances
+    vec3 boundsMin;         // the mesh's box, in its own space
+    vec3 boundsMax;
+    int distanceField;      // in volumeTextures: the distance to its surface over that box; -1: none (Volumes.cpp)
 };
 
 layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
@@ -170,6 +180,16 @@ struct Material {
     mat3x2 diffuseTransmissionUvTransform;
     mat3x2 diffuseTransmissionColorUvTransform;
     int normalVarianceTexture;     // R: the bumps the normal map's level averages away, as GGX alpha (see traceClosest)
+    float fogDensity;              // fog inside the closed mesh, per unit of distance; 0 = none (see "Fog")
+    vec3 fogColor;                 // the share of the light it scatters that goes on
+    float fogForward;              // Henyey-Greenstein g of its scattering (fogPhase)
+    uint invisible;                // 1 = rays pass the surface unchanged (only the fog inside shows)
+    uint fogNoise;                 // varying fog (see "Varying density"): 1 = patchy, by the noise
+    float fogNoiseScale;           // noise texture repeats per mesh unit
+    float fogCoverage;             // 0..1: about the share of the volume with fog
+    float fogEdge;                 // fades out over this distance towards the surface (mesh units); 0 = sharp
+    vec3 fogNoiseOffset;           // where in the noise texture (from the material's seed)
+    vec3 fogDrift;                 // how fast the noise moves through the mesh, in noise texture repeats per second
 };
 layout(binding = 8, scalar) readonly buffer Materials { Material materials[]; };
 
@@ -207,6 +227,7 @@ struct InstanceData {
                          // identity for objects that didn't move
     mat4x3 objectToWorld;  // used instead of the ray query's matrices, so a stored hit (see "Primary hits") is
     mat3 worldToObject;    // rebuilt the same way. Without the translation (what normals need)
+    uint meshIndex;        // as its custom index in the TLAS (fog volumes are known by their instance, see "Fog")
 };
 layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
 
@@ -255,6 +276,8 @@ const uint EMISSIVE_MIS = 2;
 // All textures of all models in one array. Neighboring pixels can hit different materials, so the
 // index differs between the threads of a warp: nonuniformEXT tells the compiler to handle that.
 layout(binding = 7) uniform sampler2D textures[];
+// The fog's 3D textures (Volumes.cpp): 0 the noise, then the distance fields of meshes with varying fog
+layout(binding = 32) uniform sampler3D volumeTextures[];
 
 // The HDR environment map: equirectangular (u: around the horizon, v: from straight up to straight down)
 layout(binding = 21) uniform sampler2D environmentMap;
@@ -360,6 +383,7 @@ const uint SAMPLE_SUN = 1u;       // a point on the sun's disc
 const uint SAMPLE_SKY = 2u;       // a direction picked by the sky's brightness
 const uint SAMPLE_EMISSIVE = 3u;  // a glowing triangle, and a point on it
 const uint SAMPLE_BOUNCE = 4u;    // the bounce: lobe, direction, Russian roulette
+const uint SAMPLE_FOG = 5u;       // where the ray scatters in fog, and the lamps' light in it (fogLampLight)
 uint sobolPixelSeed = 0u;  // this pixel's scrambling seed (blue noise: the same for all); 0 = off (white noise)
 uint sobolIndex = 0u;      // this path's number among its pixel's samples
 ivec2 sobolPixel = ivec2(0);
@@ -584,8 +608,11 @@ float opacityAt(uint materialIndex, vec2 uv) {
 // Decides whether a ray hits or passes through a cut-out surface at a candidate hit (see traceClosest).
 // A see-through (blend) surface stops a ray with chance alpha. Over many rays, alpha of the light is stopped
 // and 1 - alpha passes, which is exactly what blending means: no sorting of transparent layers needed.
-bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
+bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed, bool invisibleCounts) {
     MeshInfo mesh = meshInfos[meshIndex];
+    if (FOG != 0 && !invisibleCounts && materials[mesh.materialIndex].invisible != 0) {
+        return false;
+    }
     uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
     vec2 uv0 = vertices[mesh.vertexOffset + indices[firstIndex + 0]].uv;
     vec2 uv1 = vertices[mesh.vertexOffset + indices[firstIndex + 1]].uv;
@@ -599,13 +626,24 @@ bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed)
 // The traversal loop. Hits on opaque instances are accepted by the hardware on its own. Instances with
 // cut-out materials are flagged "not opaque" in the TLAS (see updateScene): for those, the traversal stops
 // at every hit as a "candidate" and the shader decides whether it counts. Confirmed hits shorten the ray,
-// so the closest confirmed one ends up committed.
-void traverse(rayQueryEXT rayQuery, inout uint seed) {
+// so the closest confirmed one ends up committed. invisibleCounts: surfaces of invisible materials are hits too
+// (intersectClosest goes on through them itself, following which fog the ray is in); else they are passed.
+// passed: the instance and triangle (x, y) the ray has just gone through (intersectClosest), and the one before (z, w),
+// ~0u: none. Two: where two volumes share a surface, the ray goes on from that same distance past one and then the
+// other, and must not find the first again.
+bool notPassed(rayQueryEXT rayQuery, uvec4 passed) {
+    uvec2 triangle = uvec2(rayQueryGetIntersectionInstanceIdEXT(rayQuery, false),
+                           rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false));
+    return triangle != passed.xy && triangle != passed.zw;
+}
+
+void traverse(rayQueryEXT rayQuery, inout uint seed, bool invisibleCounts, uvec4 passed) {
     while (rayQueryProceedEXT(rayQuery)) {
         if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+            (FOG == 0 || notPassed(rayQuery, passed)) &&
             candidateIsSolid(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
                              rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
-                             rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed)) {
+                             rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed, invisibleCounts)) {
             rayQueryConfirmIntersectionEXT(rayQuery);
         }
     }
@@ -652,7 +690,373 @@ struct Intersection {
     float t;             // along the ray's last part (after the last portal it went through)
     float travelled;     // the length of its parts before that (0: no portal). -1: lost in portals (see below)
     uint crossings;      // how many portals it went through
+    bool inFog;          // it scattered in fog first, at t along its last part (no hit then, see "Fog")
+    uint fogMedium;      // in which (the material)
+    // The lamps' light in its fog (fogLampLight): a stretch of the last part inside fog, picked by its majorant times
+    // its length among them (lampWeight: theirs in all, 0: none), the fog volumes there and their majorant
+    vec2 lampSpan;
+    uvec2 lampMedia;
+    float lampMajorant;
+    float lampWeight;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Fog
+//
+// Fog is a material: a closed mesh whose material has a fog thickness (Material.fogDensity) is filled with fog. Of
+// light going a distance d through fog of density s, exp(-s * d) gets through; the rest scatters: the share fogColor
+// of it goes on in a new direction (fogPhase), the rest is absorbed. Its surface is either invisible (Material.invisible:
+// rays pass it unchanged, only the fog shows: haze, smoke, a cloud) or the material's own (solid glass with fog inside:
+// murky water, milky glass). The built-in "Fog box" is a cube of invisible fog. The density is the same throughout
+// ("even"), or varies from point to point (see "Varying density" below).
+//
+// Media. A path keeps which fog volumes it is in (its "media": up to MAX_MEDIA instances, packed: the first slots taken,
+// the free ones after them, so loops over them stop at the first free one; see enterMedium), and changes
+// them where it goes through a volume's surface: invisible ones in intersectClosest, glass ones where the path refracts
+// (tracePath). A volume is an instance, not a material: the same fog material on two objects is two volumes, each with
+// its own part of the noise, and where volumes overlap their densities add up. Where the camera is: mediumAt. A ray that
+// leaves fog it didn't know it was in (one too many at once, or one mediumAt didn't see) catches up: the stretch before
+// was inside it.
+// Where a ray scatters: delta tracking (Woodcock et al. 1965; Novak et al. 2018). It takes tentative steps of random
+// length -log(1 - u) / majorant, the majorant being at least the density anywhere (the media's thicknesses added up),
+// and at each it scatters with chance density / majorant, else steps on ("null collision"). In even fog the density is
+// the majorant, so the first step scatters: the ray query only needs to look that far. The ray's chance of getting past
+// a stretch is exactly the share of light that does, so what it hits behind the fog needs no weight. The steps have no
+// memory: at every surface it passes (an invisible one, a portal) they start over, as if the ray started there. Of
+// overlapping volumes, the one it scatters in is picked by its share of the density there. Where it scatters is a vertex
+// of the path like a surface (fogHit): lit by light sampling, the phase function in place of the BRDF, and the path goes
+// on from it. Shadow rays add up their length inside even fog, in whatever order its surfaces come
+// (shadowTransmittance); varying fog needs its stretches in order (varyingTransmittance).
+// The density is the same for every color, so that chance and the light's loss always agree; the color is in the
+// scattered light only, not in what passes straight through.
+// Not in the fog's light: ReSTIR (its scatter points aren't surfaces), and the radiance cache (paths don't end at
+// them).
+// Lamps (the punctual lights) are the exception to the light sampling at scatter points. Their light falls off as
+// 1 / distance^2, and the points the fog picks land near one only rarely, then very bright: the glow around a lamp
+// would sparkle forever. Instead every stretch of a path takes their light along its whole length, at a point picked
+// near the lamp (fogLampLight), and scatter points leave them out.
+//
+// Varying density (FOG = 2). A fog material with noise (Material.fogNoise) or an edge fade (fogEdge) has a density that
+// changes from point to point (fogDensityAt): its thickness, times the noise (a tiling 3D texture read in the mesh's own
+// space, so it moves, turns and scales with the object; cut down by the coverage), times the fade (from the mesh's
+// signed distance field: how far inside its surface). Both are 0..1, so the thickness is the volume's majorant. The
+// textures: volumeTextures (Volumes.cpp). Outside the mesh the distance field says so, and the density is 0: a stretch
+// of a ray through the volume's bounding box holds all its fog, whatever the mesh's shape. Shadow rays use that
+// (varyingTransmittance): ratio tracking (Novak et al. 2014) along the box, the same tentative steps, the light
+// multiplied by 1 - density / majorant at each, with no random end; unbiased, and smooth where the fog is thin. Thin
+// parts under a high majorant cost steps that find nothing (null collisions): the price of varying fog.
+
+const uint NO_MEDIUM = 0xFFFFu;
+const uvec2 OUTSIDE = uvec2(0xFFFFFFFFu);  // media: in no fog (4 slots of 16 bits, each an instance or NO_MEDIUM)
+const uint MAX_MEDIA = 4;                   // volumes a path knows it is in at once (more: forgotten, see above)
+const uint MAX_VOLUME_CROSSINGS = 8;        // invisible surfaces a ray goes through (beyond: it stops at the next one)
+const uint FOG_MASK = 0x02u;                // TLAS groups of the fog volumes (mediumAt): even ones
+const uint VARYING_FOG_MASK = 0x04u;        // varying ones
+// Tentative steps along one stretch at most. Only a safety net against a stuck GPU: reached, the rest of the stretch
+// is passed as if clear. Thickness 10 over 100 units takes ~1000.
+const uint MAX_FOG_STEPS = 4096;
+
+uint mediaSlot(uvec2 media, uint slot) {
+    return ((slot < 2u ? media.x : media.y) >> ((slot & 1u) * 16u)) & 0xFFFFu;
+}
+
+void setMediaSlot(inout uvec2 media, uint slot, uint instance) {
+    uint shift = (slot & 1u) * 16u;
+    uint word = ((slot < 2u ? media.x : media.y) & ~(0xFFFFu << shift)) | (instance << shift);
+    if (slot < 2u) {
+        media.x = word;
+    } else {
+        media.y = word;
+    }
+}
+
+// Packed media, one after the other: the first, and the others moved down a slot (a loop over them:
+// for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)), as few steps as there are volumes)
+uint firstMedium(uvec2 media) {
+    return media.x & 0xFFFFu;
+}
+
+uvec2 otherMedia(uvec2 media) {
+    return uvec2((media.x >> 16u) | (media.y << 16u), (media.y >> 16u) | 0xFFFF0000u);
+}
+
+bool inMedium(uvec2 media, uint instance) {
+    for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        if (firstMedium(rest) == instance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Into the volume of an instance: in front of the others (already in it: unchanged; all slots taken: the one entered
+// longest ago is forgotten; instances past 16 bits can't be media)
+uvec2 enterMedium(uvec2 media, uint instance) {
+    if (instance < NO_MEDIUM && !inMedium(media, instance)) {
+        media = uvec2((media.x << 16u) | instance, (media.y << 16u) | (media.x >> 16u));
+    }
+    return media;
+}
+
+// Out of it: the others stay, packed
+uvec2 leaveMedium(uvec2 media, uint instance) {
+    uvec2 kept = OUTSIDE;
+    uint count = 0;
+    for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        if (firstMedium(rest) != instance) {
+            setMediaSlot(kept, count++, firstMedium(rest));
+        }
+    }
+    return kept;
+}
+
+uint mediumMaterial(uint instance) {
+    return meshInfos[instances[instance].meshIndex].materialIndex;
+}
+
+bool fogVaries(uint material) {
+    return FOG >= 2 && (materials[material].fogNoise != 0 || materials[material].fogEdge > 0.0);
+}
+
+// The density of the fog of volume `instance` at world point p, inside it (see "Varying density")
+float fogDensityAt(uint instance, vec3 p) {
+    uint material = mediumMaterial(instance);
+    float density = materials[material].fogDensity;
+    if (!fogVaries(material)) {
+        return density;
+    }
+    vec3 local = instances[instance].worldToObject * (p - instances[instance].objectToWorld[3]);
+    if (materials[material].fogNoise != 0) {
+        // Drifting fog: the noise is read further back along the drift the longer it has drifted (wrapped: the
+        // texture repeats every 1, and the product stays small enough for float precision)
+        vec3 drifted = materials[material].fogNoiseOffset - fract(materials[material].fogDrift * scene.fogTime);
+        float noise = textureLod(volumeTextures[0], local * materials[material].fogNoiseScale + drifted, 0.0).r;
+        // The noise is spread evenly over 0..1 (Volumes.cpp): the top `coverage` of it is fog, rising from 0
+        float coverage = materials[material].fogCoverage;
+        density *= clamp((noise - (1.0 - coverage)) / max(coverage, 1e-3), 0.0, 1.0);
+    }
+    // The mesh's signed distance (negative inside): none outside, faded towards the surface inside
+    uint mesh = instances[instance].meshIndex;
+    int field = meshInfos[mesh].distanceField;
+    if (field >= 0 && density > 0.0) {
+        vec3 lower = meshInfos[mesh].boundsMin;
+        vec3 uvw = (local - lower) / max(meshInfos[mesh].boundsMax - lower, vec3(1e-6));
+        float inside = -textureLod(volumeTextures[nonuniformEXT(field)], uvw, 0.0).r;
+        float edge = materials[material].fogEdge;
+        density *= inside <= 0.0 ? 0.0 : edge > 0.0 ? smoothstep(0.0, 1.0, inside / edge) : 1.0;
+    }
+    return density;
+}
+
+// The media's majorant: their thicknesses added up. uneven: some of them varies.
+float mediaMajorant(uvec2 media, out bool uneven) {
+    float majorant = 0.0;
+    uneven = false;
+    for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        uint material = mediumMaterial(firstMedium(rest));
+        majorant += materials[material].fogDensity;
+        uneven = uneven || fogVaries(material);
+    }
+    return majorant;
+}
+
+// Delta tracking (see "Fog") from the tentative step at t up to end: where the ray scatters, and in which volume
+// (medium); end and NO_MEDIUM if it gets through
+float deltaTrack(uvec2 media, vec3 origin, vec3 direction, float t, float end, float majorant, inout uint seed,
+                 out uint medium) {
+    medium = NO_MEDIUM;
+    for (uint step = 0; step < MAX_FOG_STEPS && t < end; step++) {
+        vec3 p = origin + direction * t;
+        float u = randomFloat(seed) * majorant;
+        for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+            u -= fogDensityAt(firstMedium(rest), p);
+            if (u < 0.0) {
+                medium = firstMedium(rest);
+                return t;
+            }
+        }
+        t -= log(1.0 - randomFloat(seed)) / majorant;
+    }
+    return end;
+}
+
+// The share of light that gets through the fog of one volume from t = a to b along a ray: ratio tracking (see
+// "Varying density"). Where little is left, Russian roulette: it goes on with chance transmittance / 0.1, counted as
+// 0.1, which keeps the average.
+float ratioTrack(uint instance, vec3 origin, vec3 direction, float a, float b, inout uint seed) {
+    float majorant = materials[mediumMaterial(instance)].fogDensity;
+    float transmittance = 1.0;
+    float t = a;
+    for (uint step = 0; step < MAX_FOG_STEPS; step++) {
+        t -= log(1.0 - randomFloat(seed)) / majorant;
+        if (t >= b) {
+            break;
+        }
+        transmittance *= 1.0 - fogDensityAt(instance, origin + direction * t) / majorant;
+        if (transmittance < 0.1) {
+            if (randomFloat(seed) * 0.1 >= transmittance) {
+                return 0.0;
+            }
+            transmittance = 0.1;
+        }
+    }
+    return transmittance;
+}
+
+// Whether a ray along direction crosses a triangle from the outside (the side its vertex normals point to, as in
+// hitFromIntersection)
+bool entersMesh(MeshInfo mesh, uvec3 corner, vec3 weights, mat3 worldToObject, vec3 direction) {
+    vec3 p0 = vertices[corner.x].position;
+    vec3 outward = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0) * worldToObject;
+    if (mesh.hasNormals != 0) {
+        vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
+                            + vertices[corner.z].normal * weights.z;
+        if (dot(outward, smoothNormal * worldToObject) < 0.0) {
+            outward = -outward;
+        }
+    }
+    return dot(outward, direction) < 0.0;
+}
+
+// The next surface of a fog volume along a ray, from tMin up to tMax, among the TLAS groups in mask, leaving out the
+// triangles `passed` (the ones the ray just went through, see traverse). false: none. instance, primitive, t: which and
+// where; entering: from its outside.
+bool nextFogSurface(vec3 origin, vec3 direction, float tMin, float tMax, uint mask, uvec4 passed, out uint instance,
+                    out int primitive, out float t, out bool entering) {
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, mask, origin, tMin, direction, tMax);
+    while (rayQueryProceedEXT(rayQuery)) {
+        // (fog volumes are all "not opaque": for the shadow rays)
+        if (notPassed(rayQuery, passed)) {
+            rayQueryConfirmIntersectionEXT(rayQuery);
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        return false;
+    }
+    instance = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+    primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+    t = rayQueryGetIntersectionTEXT(rayQuery, true);
+    MeshInfo mesh = meshInfos[rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true)];
+    uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
+    uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+    entering = entersMesh(mesh, corner, vec3(1.0 - bary.x - bary.y, bary.x, bary.y), instances[instance].worldToObject,
+                          direction);
+    return true;
+}
+
+// Going on along a ray from a surface at t: from the same distance (a surface right there, like a floor under a fog
+// box, still counts), only that triangle left out (rounding: it may be a hair closer)
+float pastSurface(float tMin, float t) {
+    return max(tMin, t - max(1e-4, t * 1e-5));
+}
+
+// The fog volumes p is in: the fog surfaces straight above it, in order; a volume whose first one is seen from the
+// inside holds p. Up to MAX_VOLUME_CROSSINGS surfaces and MAX_MEDIA volumes.
+uvec2 mediumAt(vec3 p) {
+    uvec2 media = OUTSIDE;
+    uvec2 seen = OUTSIDE;
+    float tMin = 0.0;
+    uvec4 passed = uvec4(~0u);
+    for (uint crossing = 0; crossing < MAX_VOLUME_CROSSINGS; crossing++) {
+        uint instance;
+        int primitive;
+        float t;
+        bool entering;
+        if (!nextFogSurface(p, vec3(0.0, 1.0, 0.0), tMin, RAY_FAR, FOG_MASK | VARYING_FOG_MASK, passed, instance,
+                            primitive, t, entering)) {
+            break;
+        }
+        if (!inMedium(seen, instance)) {
+            if (mediaSlot(seen, MAX_MEDIA - 1) != NO_MEDIUM) {
+                break;  // no room to remember more
+            }
+            seen = enterMedium(seen, instance);
+            if (!entering) {
+                media = enterMedium(media, instance);
+            }
+        }
+        tMin = pastSurface(tMin, t);
+        passed = uvec4(instance, uint(primitive), passed.xy);
+    }
+    return media;
+}
+
+// The share of scattered light that goes into a direction at cosine cosTheta to the light's own, per solid angle
+// (Henyey-Greenstein: g = 0: every way alike, towards 1: mostly on forward)
+float fogPhase(float cosTheta, float g) {
+    float d = 1.0 + g * g - 2.0 * g * cosTheta;
+    return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+}
+
+// A direction picked by fogPhase around `forward` (the ray's); pdf = fogPhase of it
+vec3 sampleFogDirection(vec3 forward, float g, vec2 u, out float pdf) {
+    float cosTheta = 1.0 - 2.0 * u.x;
+    if (abs(g) > 1e-3) {
+        float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+        cosTheta = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    pdf = fogPhase(cosTheta, g);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * PI * u.y;
+    vec3 tangent, bitangent;
+    buildBasis(forward, tangent, bitangent);
+    return normalize(tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + forward * cosTheta);
+}
+
+// A stretch [a, b] of a ray inside fog (the volumes media, their majorant), for the lamps' light (see Intersection):
+// kept with a chance of its majorant times its length among all so far
+void addLampSpan(inout Intersection hit, float a, float b, uvec2 media, float majorant, inout uint seed) {
+    float weight = majorant * (b - a);
+    if (CACHE_UPDATE_PASS != 0 || scene.punctualLightCount == 0 || !(weight > 0.0)) {
+        return;
+    }
+    hit.lampWeight += weight;
+    if (randomFloat(seed) * hit.lampWeight < weight) {
+        hit.lampSpan = vec2(a, b);
+        hit.lampMedia = media;
+        hit.lampMajorant = majorant;
+    }
+}
+
+// The stretch of a ray (up to end) inside the bounding box of an instance's mesh; x >= y: none
+vec2 boxSpan(uint instance, vec3 origin, vec3 direction, float end) {
+    uint mesh = instances[instance].meshIndex;
+    // In the mesh's space: the same t along the ray (the direction isn't normalized there)
+    vec3 o = instances[instance].worldToObject * (origin - instances[instance].objectToWorld[3]);
+    vec3 d = instances[instance].worldToObject * direction;
+    vec3 inverse = 1.0 / mix(d, vec3(1e-30), equal(d, vec3(0.0)));
+    vec3 a = (meshInfos[mesh].boundsMin - o) * inverse;
+    vec3 b = (meshInfos[mesh].boundsMax - o) * inverse;
+    vec3 near = min(a, b), far = max(a, b);
+    return vec2(max(max(near.x, near.y), max(near.z, 0.0)), min(min(far.x, far.y), min(far.z, end)));
+}
+
+// Varying fog in shadow rays: the share of light that gets through it between origin and origin + direction * end
+// (see "Varying density"). Its volumes: the ones the ray starts in (media; the even ones are shadowTransmittance's), and
+// the ones whose surfaces it crosses (crossed, noted in shadowTransmittance's traversal). Each is ratio-tracked along the
+// ray's stretch through its bounding box: outside the mesh its density is 0, so that holds all its fog, whatever the
+// mesh's shape, without knowing where the ray goes in and out.
+float varyingTransmittance(vec3 origin, vec3 direction, float end, uvec2 media, uvec2 crossed, inout uint seed) {
+    uvec2 volumes = crossed;
+    for (uvec2 rest = media; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        if (fogVaries(mediumMaterial(firstMedium(rest)))) {
+            volumes = enterMedium(volumes, firstMedium(rest));
+        }
+    }
+    float transmittance = 1.0;
+    for (uvec2 rest = volumes; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        vec2 span = boxSpan(firstMedium(rest), origin, direction, end);
+        if (span.x < span.y) {
+            transmittance *= ratioTrack(firstMedium(rest), origin, direction, span.x, span.y, seed);
+            if (transmittance <= 0.0) {
+                return 0.0;
+            }
+        }
+    }
+    return transmittance;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Portals
@@ -721,27 +1125,119 @@ bool portalBetween(vec3 origin, vec3 direction, float distance) {
     return scene.portalCount > 0 && nearestPortal(origin, direction, distance, -1, t) >= 0;
 }
 
-// The closest hit along a ray (cut-outs decided with seed, see traverse), through portals: origin and direction
-// become the last part's (the hit's t is along it). false: nothing hit, the ray leaves the scene along direction;
-// or, with travelled = -1, it was lost in portals.
-bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, out Intersection hit) {
+// The closest hit along a ray (cut-outs decided with seed, see traverse), through portals and invisible surfaces:
+// origin and direction become the last part's (the hit's t is along it). false: nothing hit, the ray leaves the
+// scene along direction; or, with travelled = -1, it was lost in portals; or, with inFog, it scattered in fog first.
+// media: the fog volumes it starts in (see "Fog"), changed by the invisible surfaces it goes through. fogU >= 0: it may
+// scatter in fog (the first step is picked with fogU, later ones with seed); -1: it passes fog unchanged.
+bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, inout uvec2 media, float fogU,
+                      out Intersection hit) {
     hit.travelled = 0.0;
     hit.crossings = 0;
+    hit.inFog = false;
+    hit.fogMedium = NO_MEDIUM;
+    hit.lampSpan = vec2(0.0);
+    hit.lampMedia = OUTSIDE;
+    hit.lampMajorant = 0.0;
+    hit.lampWeight = 0.0;
+    bool fog = fogU >= 0.0;
     int skip = -1;
-    for (uint part = 0; part <= MAX_PORTAL_CROSSINGS; part++) {
+    float tMin = 0.0;
+    uint volumes = 0;  // invisible surfaces gone through
+    uvec4 passed = uvec4(~0u);  // the last two (see traverse)
+    // Where it last went through invisible surfaces (-1: none), and the media before them. A surface at that same
+    // distance (a floor under a fog box) counts as in front of them: it is in the fog the ray came through, so its
+    // shadow and bounce rays start in that fog. (Before, the floor under a fog box was lit as if outside it: its
+    // shadow rays to a light inside crossed no fog surface.)
+    float passedT = -1.0;
+    uvec2 mediaBefore = media;
+    for (uint part = 0; part <= MAX_PORTAL_CROSSINGS + MAX_VOLUME_CROSSINGS; part++) {
         float portalT = RAY_FAR;
         int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, RAY_FAR, skip, portalT) : -1;
-        float tMin = skip >= 0 ? PORTAL_GAP : 0.0;
+        float tMax = portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : RAY_FAR;
+        bool uneven = false;
+        float majorant = FOG != 0 && fog ? mediaMajorant(media, uneven) : 0.0;
+        // The first tentative step. In even fog it is where the ray scatters, so the ray query only needs to look that
+        // far; in varying fog the query finds the surface first, and the steps go on up to it (deltaTrack).
+        float fogT = RAY_FAR;
+        if (majorant > 0.0) {
+            fogT = tMin - log(1.0 - (fogU >= 0.0 ? fogU : randomFloat(seed))) / majorant;
+            fogU = -1.0;
+        }
         rayQueryEXT rayQuery;
         rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, tMin, direction,
-                              portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : RAY_FAR);
-        traverse(rayQuery, seed);
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+                              uneven ? tMax : min(tMax, fogT));
+        traverse(rayQuery, seed, volumes < MAX_VOLUME_CROSSINGS, passed);
+        bool surface = rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+        float end = surface ? rayQueryGetIntersectionTEXT(rayQuery, true) : tMax;
+        if (FOG != 0 && fogT < end) {
+            uint medium;
+            fogT = deltaTrack(media, origin, direction, fogT, end, majorant, seed, medium);
+            if (medium != NO_MEDIUM) {
+                addLampSpan(hit, tMin, fogT, media, majorant, seed);
+                hit.t = fogT;
+                hit.inFog = true;
+                hit.fogMedium = mediumMaterial(medium);
+                return false;
+            }
+        }
+        if (surface) {
             hit.meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true);
             hit.instanceIndex = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
             hit.primitive = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
             hit.barycentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-            hit.t = rayQueryGetIntersectionTEXT(rayQuery, true);
+            hit.t = end;
+            MeshInfo mesh = meshInfos[hit.meshIndex];
+            uint material = mesh.materialIndex;
+            float boundaryDensity = materials[material].fogDensity;
+            bool invisible = materials[material].invisible != 0;
+            if (FOG != 0 && (invisible || boundaryDensity > 0.0)) {
+                // A volume's surface: into it or out of it
+                uint firstIndex = mesh.indexOffset + uint(hit.primitive) * 3;
+                uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
+                vec3 weights = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics.x, hit.barycentrics.y);
+                bool entering = entersMesh(mesh, corner, weights, instances[hit.instanceIndex].worldToObject, direction);
+                if (!entering && boundaryDensity > 0.0 && !inMedium(media, hit.instanceIndex)) {
+                    // Out of fog it didn't know it was in: the stretch before was inside it too (see "Fog"). The others
+                    // let the ray through up to here, so only this one's steps decide.
+                    media = enterMedium(media, hit.instanceIndex);
+                    if (fog) {
+                        uint caught;
+                        float catchUp = deltaTrack(enterMedium(OUTSIDE, hit.instanceIndex), origin, direction,
+                                                   tMin - log(1.0 - (fogU >= 0.0 ? fogU : randomFloat(seed))) / boundaryDensity,
+                                                   hit.t, boundaryDensity, seed, caught);
+                        fogU = -1.0;
+                        addLampSpan(hit, tMin, catchUp, media, majorant + boundaryDensity, seed);
+                        if (caught != NO_MEDIUM) {
+                            hit.t = catchUp;
+                            hit.inFog = true;
+                            hit.fogMedium = material;
+                            return false;
+                        }
+                    }
+                } else {
+                    addLampSpan(hit, tMin, hit.t, media, majorant, seed);
+                }
+                if (invisible) {
+                    // On through it, along the same ray
+                    if (passedT < 0.0 || hit.t > passedT + max(1e-4, passedT * 1e-5)) {
+                        passedT = hit.t;
+                        mediaBefore = media;
+                    }
+                    if (boundaryDensity > 0.0) {
+                        media = entering ? enterMedium(media, hit.instanceIndex) : leaveMedium(media, hit.instanceIndex);
+                    }
+                    tMin = pastSurface(tMin, hit.t);
+                    passed = uvec4(hit.instanceIndex, uint(hit.primitive), passed.xy);
+                    volumes++;
+                    continue;
+                }
+            } else {
+                addLampSpan(hit, tMin, hit.t, media, majorant, seed);
+            }
+            if (passedT >= 0.0 && hit.t <= passedT + max(1e-4, passedT * 1e-5)) {
+                media = mediaBefore;
+            }
             return true;
         }
         if (portal < 0) {
@@ -753,9 +1249,18 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
         origin = toPartner * vec4(origin + direction * portalT, 1.0);
         direction = normalize(mat3(toPartner) * direction);
         skip = portal ^ 1;
+        tMin = PORTAL_GAP;
+        passedT = -1.0;
+        hit.lampWeight = 0.0;  // the lamps' light: only in the last part (see fogLampLight)
     }
     hit.travelled = -1.0;
     return false;
+}
+
+// The same for rays that only look (no fog of their own)
+bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, out Intersection hit) {
+    uvec2 media = OUTSIDE;
+    return intersectClosest(origin, direction, seed, media, -1.0, hit);
 }
 
 // The surface at an intersection of a ray along direction: position, normals, material.
@@ -894,6 +1399,47 @@ void tiltTowardsViewer(inout Hit hit, vec3 direction) {
     if (cosViewer < 1e-3) {
         hit.normal = normalize(hit.normal - direction * (1e-3 - cosViewer));
     }
+}
+
+// A path's scatter point in fog (see "Fog") as a Hit, so the path's loop lights it and bounces from it like a
+// surface: marked by its material (isFog), the fog's material in meshIndex, facing back along the ray, light from
+// every side (two-sided, as diffuse transmission), no ReSTIR and no cache (restirSurface, cacheableSurface). Its
+// color is in the throughput.
+const uint FOG_MATERIAL = 0xFFFFFFFFu;
+
+Hit fogHit(vec3 position, vec3 direction, float t, uint medium) {
+    Hit hit;
+    hit.found = true;
+    hit.t = t;
+    hit.position = position;
+    hit.normal = -direction;
+    hit.geometricNormal = -direction;
+    hit.tangent = vec3(0.0);
+    hit.uv = vec2(0.0);
+    hit.uvFootprintX = vec2(0.0);
+    hit.uvFootprintY = vec2(0.0);
+    hit.meshIndex = medium;
+    hit.instanceIndex = 0;
+    hit.materialIndex = FOG_MATERIAL;
+    hit.lightIndex = -1;
+    hit.frontFace = true;
+    hit.objectScale = 1.0;
+    hit.albedo = materials[medium].fogColor;
+    hit.alpha = 1.0;
+    hit.metallic = 0.0;
+    hit.roughness = 1.0;
+    hit.transmission = 0.0;
+    hit.ior = 1.0;
+    hit.solid = false;
+    hit.absorption = vec3(0.0);
+    hit.diffuseTransmission = 1.0;
+    hit.diffuseTransmissionColor = vec3(1.0);
+    hit.emissive = vec3(0.0);
+    return hit;
+}
+
+bool isFog(Hit hit) {
+    return FOG != 0 && hit.materialIndex == FOG_MATERIAL;
 }
 
 Hit traceClosest(vec3 origin, vec3 direction, inout uint seed, float coneWidth, float coneSpread) {
@@ -1306,13 +1852,22 @@ bool sampleGlassExit(Hit hit, vec3 v, vec3 random, out vec3 l) {
 // so it can be summed in any order.
 // A portal's opening on the way blocks the light, except with throughEnd >= 0: a light image (portalLightImage),
 // whose ray must go through that end's opening first and then on from its partner, maxDistance being the whole way.
-vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int throughEnd, inout uint seed,
+// Fog (see "Fog"): invisible surfaces let the light through; its length inside even fog counts like the absorption,
+// plus the fog it starts in (media) and ends in. Not knowing it started in fog, it learns it where it leaves it. Varying
+// fog: varyingTransmittance, after the surfaces have let the light through.
+vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int throughEnd, inout uint seed, uvec2 media,
                          out bool crossedGlass, out bool crossedSolidGlass) {
     crossedGlass = false;
     crossedSolidGlass = false;
     vec3 tint = vec3(1.0);
     int skip = -1;
     float tMin = 0.0;
+    // The even fog's density where the part starts (and, after the loop, where it ends)
+    float fogInside = 0.0;
+    for (uvec2 rest = media; FOG != 0 && firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        uint material = mediumMaterial(firstMedium(rest));
+        fogInside += fogVaries(material) ? 0.0 : materials[material].fogDensity;
+    }
     // (Cache update paths have no light images: a second part made them take 168 registers instead of 128)
     [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 ? 1u : 2u); part++) {
         // Up to the opening it must go through (part 0 of a light image), or to the end; any other opening blocks
@@ -1325,6 +1880,8 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
         rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, tMin, direction,
                               portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : max(maxDistance, tMin));
         vec3 opticalDepth = vec3(0.0);
+        float fogDepth = 0.0;  // even fog: density * (leaving distance - entering distance) over its surfaces
+        uvec2 crossed = OUTSIDE;  // varying fog volumes whose surfaces it crosses
         while (rayQueryProceedEXT(rayQuery)) {
             if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
                 continue;
@@ -1345,6 +1902,21 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
             }
 
             Material material = materials[mesh.materialIndex];
+            if (FOG != 0 && (material.fogDensity > 0.0 || material.invisible != 0)) {
+                if (fogVaries(mesh.materialIndex)) {
+                    // Varying fog: only which volume (see varyingTransmittance, after this)
+                    crossed = enterMedium(crossed, rayQueryGetIntersectionInstanceIdEXT(rayQuery, false));
+                } else if (material.fogDensity > 0.0) {
+                    bool entering = entersMesh(mesh, corner, weights,
+                                               mat3(rayQueryGetIntersectionWorldToObjectEXT(rayQuery, false)), direction);
+                    float t = rayQueryGetIntersectionTEXT(rayQuery, false);
+                    fogDepth += material.fogDensity * (entering ? -t : t);
+                    fogInside += entering ? material.fogDensity : -material.fogDensity;
+                }
+                if (material.invisible != 0) {
+                    continue;
+                }
+            }
             float transmission = material.transmission;
             if (transmission > 0.0 && material.transmissionTexture >= 0) {
                 transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
@@ -1396,6 +1968,13 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
             return vec3(0.0);
         }
         tint *= exp(-max(opticalDepth, vec3(0.0)));
+        // The fog it is in at the end goes on to there (inside < 0: it left fog it didn't know it was in)
+        fogInside = max(fogInside, 0.0);
+        tint *= exp(-max(fogDepth + fogInside * (portal >= 0 ? portalT : maxDistance), 0.0));
+        if (FOG >= 2 && any(greaterThan(tint, vec3(0.0)))) {
+            // (after a portal: from the media it started in, as if the partner's side were the same place)
+            tint *= varyingTransmittance(origin, direction, portal >= 0 ? portalT : maxDistance, media, crossed, seed);
+        }
         if (portal < 0) {
             break;
         }
@@ -1857,6 +2436,56 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
     return s;
 }
 
+// The light fog scatters into a ray from the punctual lights along its stretches inside fog (Intersection.lampSpan):
+// one stretch, picked by its majorant times its length, one light picked at random, at one point picked by equi-angular sampling
+// (Kulla & Fajardo 2012, "Importance Sampling Techniques for Path Tracing in Participating Media"): evenly by the
+// angle under which the lamp sees the ray, i.e. as densely as its 1 / distance^2. A directional light: evenly along
+// the stretch.
+// No loss on the way from origin to that point: the stretch ends where the path scatters, if it does, and a point
+// gets onto it exactly as often as light from it would get through (see "Fog"); averaged, that is the loss.
+// Portals: only the ray's last part (origin, direction), the one it scattered or hit something in.
+vec3 fogLampLight(vec3 origin, vec3 direction, Intersection stretch, uint bounce, inout uint seed) {
+    vec2 span = stretch.lampSpan;
+    vec4 u = pathSample(bounce, SAMPLE_FOG, seed);  // x: where the ray scatters (intersectClosest)
+    uint count = scene.punctualLightCount;
+    PunctualLight light = punctualLights[min(uint(u.y * float(count)), count - 1)];
+    float t, pdf;
+    if (light.type == LIGHT_DIRECTIONAL) {
+        t = mix(span.x, span.y, u.z);
+        pdf = 1.0 / (span.y - span.x);
+    } else {
+        float along = dot(light.position - origin, direction);  // the ray's point nearest the lamp
+        float height = max(length(light.position - origin - direction * along), 1e-4);  // and its distance
+        float angleA = atan((span.x - along) / height);
+        float angleB = atan((span.y - along) / height);
+        float offset = height * tan(mix(angleA, angleB, u.z));
+        t = along + offset;
+        pdf = height / ((angleB - angleA) * (height * height + offset * offset));
+    }
+    vec3 point = origin + direction * t;
+    LightSample s = punctualLightSample(light, point);
+    if (all(equal(s.light, vec3(0.0))) || !(pdf > 0.0)) {
+        return vec3(0.0);
+    }
+    // What the fog there scatters towards the ray, per unit of length: each volume's density, color and phase
+    vec3 scattering = vec3(0.0);
+    float cosTheta = dot(direction, s.direction);
+    for (uvec2 rest = stretch.lampMedia; firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        uint material = mediumMaterial(firstMedium(rest));
+        scattering += fogDensityAt(firstMedium(rest), point) * materials[material].fogColor
+                      * fogPhase(cosTheta, materials[material].fogForward);
+    }
+    if (all(equal(scattering, vec3(0.0)))) {
+        return vec3(0.0);  // a clear spot of varying fog
+    }
+    // The stretch's chance was its majorant * length / lampWeight
+    float scale = float(count) * stretch.lampWeight / (stretch.lampMajorant * (span.y - span.x) * pdf);
+    bool crossedGlass, crossedSolidGlass;
+    return s.light * scale * scattering
+           * shadowTransmittance(point, s.direction, s.distance, -1, seed, stretch.lampMedia, crossedGlass,
+                                 crossedSolidGlass);
+}
+
 // A light seen through portal end `end`: where it appears from this side, moved back through the portal. A shadow
 // ray towards it goes through the end's opening and on from the partner to the light itself (shadowTransmittance
 // with throughEnd), the same distance in all, so falloff and spot cones come out right. which: 0 = the sun, k =
@@ -2054,7 +2683,7 @@ vec4 restirPreviousPoint(RestirSurface surface, uint instanceIndex) {
 // Surfaces that use ReSTIR: rough enough that a picked light sample finds the light they reflect. A near-mirror
 // reflects a light in a tiny cone that a bounce ray finds far better; those keep the usual light sampling + MIS.
 bool restirSurface(Hit hit) {
-    return hit.roughness >= scene.restirMinRoughness && hit.transmission <= 0.0;
+    return hit.roughness >= scene.restirMinRoughness && hit.transmission <= 0.0 && !isFog(hit);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2097,7 +2726,7 @@ uint restirGiFreshIndex(ivec2 pixel) {
 // Second surfaces whose light can be reused from another first surface: not glass (its light depends on where it
 // is seen from through it), and not too smooth (likewise; restirGiMinRoughness, 0 = any).
 bool restirGiSampleSurface(Hit hit) {
-    return hit.transmission <= 0.0 && !hit.solid && hit.roughness >= scene.restirGiMinRoughness;
+    return hit.transmission <= 0.0 && !hit.solid && hit.roughness >= scene.restirGiMinRoughness && !isFog(hit);
 }
 
 // A sky direction in 32 bits: the cell of the sky's sampling (see environmentCellPdf) and 32 x 32 places within
@@ -2207,6 +2836,9 @@ bool blocksLight(uint meshIndex, int primitive, vec2 bary, inout uint seed) {
 // Glass: lets light through without being metal (shadow rays and the BRDF candidates' rays pass it)
 bool isGlassAt(uint materialIndex, vec2 uv) {
     Material material = materials[materialIndex];
+    if (FOG != 0 && material.invisible != 0) {
+        return true;  // (fog: invisible surfaces)
+    }
     float transmission = material.transmission;
     if (transmission > 0.0 && material.transmissionTexture >= 0) {
         transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
@@ -2220,7 +2852,7 @@ bool isGlassAt(uint materialIndex, vec2 uv) {
 
 bool isGlassHit(Intersection hit) {
     MeshInfo mesh = meshInfos[hit.meshIndex];
-    if (materials[mesh.materialIndex].transmission <= 0.0) {
+    if (materials[mesh.materialIndex].transmission <= 0.0 && (FOG == 0 || materials[mesh.materialIndex].invisible == 0)) {
         return false;  // almost every hit: no vertex or texture reads
     }
     uint firstIndex = mesh.indexOffset + uint(hit.primitive) * 3;
@@ -2331,7 +2963,8 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             vec3 l, weight;
             float pdf, lobeRoughness;
             bool transmitted, specularLobe;
-            Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0, 0.0, 0u);
+            Intersection none = Intersection(0u, 0u, 0, vec2(0.0), 0.0, 0.0, 0u, false, NO_MEDIUM, vec2(0.0), OUTSIDE, 0.0,
+                                             0.0);
             vec3 random = vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed));
             if (!sampleBrdf(hit, toLocal(frame, v), random, l, weight, pdf, lobeRoughness, transmitted, specularLobe)) {
                 if (i == lightCandidates) {
@@ -2580,8 +3213,10 @@ bool guideMirror(Hit hit) {
 // A chain longer than maxBounces keeps the first mirror's guides.
 // Its own trace from the camera, after the path (see main), rather than following the path's bounces: anything
 // the path's loop keeps, or traces in it, costs registers in every pixel (that took the trace shader from 128 to
-// 168). The path only notes that the camera sees a mirror (guidesSeeMirror).
-bool guidesSeeMirror = false;
+// 168). The path only notes that the camera sees a mirror (guidesRetrace).
+// The same when the camera ray scattered in the fog (see "Fog"): the path never got to the surface, and it changes
+// from frame to frame which pixels do; the guides stay those of what the camera sees behind the fog.
+bool guidesRetrace = false;
 
 void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     mat3 toCamera = mat3(1.0);
@@ -2593,7 +3228,7 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     for (uint i = 0; i <= scene.maxBounces; i++) {
         Intersection intersection;
         if (!intersectClosest(origin, direction, seed, intersection)) {
-            if (i > 0 && intersection.travelled >= 0.0) {
+            if (intersection.travelled >= 0.0) {
                 storeSkyGuides(pixel, cameraDirection);
             }
             return;
@@ -2602,9 +3237,8 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
         tiltTowardsViewer(hit, direction);
         distance += hit.t;
         if (!guideMirror(hit)) {
-            if (i > 0) {
-                storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, distance, toCamera, tint);
-            }
+            storeSurfaceGuides(pixel, hit, direction, cameraDirection, i > 0 || intersection.travelled != 0.0,
+                               distance, toCamera, tint);
             return;
         }
         toCamera = toCamera * (mat3(1.0) - 2.0 * outerProduct(hit.normal, hit.normal));
@@ -2645,7 +3279,8 @@ bool traceCameraRay(ivec2 pixel, inout vec3 direction, inout uint seed, out Inte
             hit = hitFromIntersection(intersection, direction, coneSpread * travelled, coneSpread);
             tiltTowardsViewer(hit, direction);
         }
-        if (!found || !guideMirror(hit) || i == scene.maxBounces) {
+        // With fog the image pass decides where the camera ray scatters, along a straight line (tracePath)
+        if (!found || !guideMirror(hit) || i == scene.maxBounces || FOG != 0) {
             if (travelled > 0.0 && scene.writeGuides != 0) {
                 if (found) {
                     storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, travelled + hit.t, toCamera, tint);
@@ -2696,7 +3331,7 @@ const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this
 const float CACHE_MIN_RAY_CELLS = 2.0;
 
 bool cacheableSurface(Hit hit) {
-    return hit.transmission <= 0.0 && hit.roughness >= CACHE_ROUGHNESS;
+    return hit.transmission <= 0.0 && hit.roughness >= CACHE_ROUGHNESS && !isFog(hit);
 }
 
 // The cell of a surface point: where the table search starts (slot) and the cell's id (fingerprint, never 0).
@@ -2779,6 +3414,8 @@ bool loadPrimaryHit(ivec2 pixel, inout uint seed, out Intersection intersection,
     seed = stored.seed;
     intersection.travelled = stored.travelled;
     intersection.crossings = 0;
+    intersection.inFog = false;
+    intersection.lampWeight = 0.0;
     tint = vec3(1.0);
     if (stored.travelled > 0.0) {
         direction = stored.direction;
@@ -2813,6 +3450,9 @@ bool primaryHitStored(ivec2 pixel) {
 // near the point where the GPU fits fewer pixels at a time, or moves values out to slow memory (the Debug tab
 // shows both: register count and local memory). Recomputing something cheap, reading it from the uniforms, or
 // storing it right away is usually faster than keeping it.
+// The current path's camera ray scattered in fog (see fogAmountImage)
+float cameraRayFog = 0.0;
+
 vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, bool usePrimaryHit) {
     // The sun is a small glowing disc in the sky. Its total light (PI * sunColor, see below) is spread evenly
     // over the disc's solid angle. Like glowing triangles, it is found both by shadow rays aimed at it and by
@@ -2888,6 +3528,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // pixel collected before. 3 = it found no surface that can be one.
     uint giState = 0;
     vec3 giImageLight = vec3(0.0);
+    // The fog the path is in (see "Fog")
+    uvec2 media = FOG != 0 ? mediumAt(origin) : OUTSIDE;
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
@@ -2900,12 +3542,15 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         Intersection intersection;
         bool found;
         vec3 rayDirection = direction;  // before any portal (the camera ray's, for the guides)
-        if (bounce == 0 && usePrimaryHit && primaryHitStored(pixel)) {
+        float fogU = FOG != 0 ? pathSample(bounce, SAMPLE_FOG, seed).x : -1.0;
+        bool storedHit = bounce == 0 && usePrimaryHit && primaryHitStored(pixel);
+        bool storedBounce = bounce == 1 && sharedBounce
+                            && (bounceHits[primaryHitIndex(pixel)].weightBRoughness & BOUNCE_RETRACE) == 0u;
+        if (storedHit) {
             vec3 tint;
             found = loadPrimaryHit(pixel, seed, intersection, direction, tint);
             throughput = tint;
-        } else if (bounce == 1 && sharedBounce
-                   && (bounceHits[primaryHitIndex(pixel)].weightBRoughness & BOUNCE_RETRACE) == 0u) {
+        } else if (storedBounce) {
             BounceHit stored = bounceHits[primaryHitIndex(pixel)];
             found = stored.meshIndex != ~0u;
             intersection.meshIndex = stored.meshIndex;
@@ -2915,8 +3560,37 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             intersection.t = stored.t;
             intersection.travelled = 0.0;
             intersection.crossings = 0;
-        } else {
-            found = intersectClosest(origin, direction, seed, intersection);
+            intersection.inFog = false;
+            intersection.lampWeight = 0.0;
+        }
+        // The ray; with fog also the camera ray to a stored hit again: the RESTIR_PASS's hit is the surface, this decides
+        // whether it scatters in fog before it (with fog, no mirrors on the way: see traceCameraRay). One call for both:
+        // the compiled shader has one copy of it (two took the varying fog's from 25 ms to 36 in a Cornell box).
+        if (!storedBounce && (FOG != 0 || !storedHit)) {
+            vec3 tracedOrigin = origin;
+            vec3 tracedDirection = direction;
+            Intersection traced;
+            bool tracedFound = intersectClosest(tracedOrigin, tracedDirection, seed, media, fogU, traced);
+            if (FOG == 0 || !storedHit) {
+                found = tracedFound;
+                intersection = traced;
+                origin = tracedOrigin;
+                direction = tracedDirection;
+            } else if (traced.inFog) {
+                found = false;
+                intersection = traced;
+            } else {
+                intersection.lampSpan = traced.lampSpan;
+                intersection.lampMedia = traced.lampMedia;
+                intersection.lampMajorant = traced.lampMajorant;
+                intersection.lampWeight = traced.lampWeight;
+            }
+        }
+        // The lamps' light fog scatters into this stretch (not the final ray's: as at its end, see below). Not in
+        // update paths: one more shadow ray took them from 128 registers to 168; their scatter points light-sample
+        // the lamps instead (noisier, but the cache averages it).
+        if (CACHE_UPDATE_PASS == 0 && intersection.lampWeight > 0.0 && bounce < scene.maxBounces) {
+            ADD_LIGHT(throughput * fogLampLight(origin, direction, intersection, bounce, seed));
         }
         bool crossedPortal = intersection.travelled != 0.0;
         portalCrossings += intersection.crossings;
@@ -2924,6 +3598,19 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         hit.found = found;
         if (found) {
             hit = hitFromIntersection(intersection, direction, coneWidth, coneSpread);
+        }
+        if (FOG != 0 && intersection.inFog) {
+            // Scattered in fog before anything: the path's vertex is there. Its color: the share that goes on; in
+            // glass, also what its absorption took on the way (in world units here)
+            uint medium = intersection.fogMedium;
+            if (reflections == 0 && giState != 2) {
+                cameraRayFog = 1.0;  // the camera sees this fog (see fogAmountImage)
+            }
+            hit = fogHit(origin + direction * intersection.t, direction, intersection.travelled + intersection.t, medium);
+            throughput *= materials[medium].fogColor * exp(-materials[medium].absorption * intersection.t);
+            if (bounce == 0 && wantGuides) {
+                guidesRetrace = true;  // the guides: of what is behind the fog
+            }
         }
         previousVertex = currentVertex;
         currentVertex = -1;
@@ -2969,9 +3656,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         }
         tiltTowardsViewer(hit, direction);
         // Seen in mirrors through the RESTIR_PASS's stored hit: that pass wrote the guides (traceCameraRay)
-        if (bounce == 0 && wantGuides && !(crossedPortal && intersection.crossings == 0)) {
+        if (bounce == 0 && wantGuides && !(crossedPortal && intersection.crossings == 0) && !isFog(hit)) {
             storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, hit.t, mat3(1.0), vec3(1.0));
-            guidesSeeMirror = guideMirror(hit);
+            guidesRetrace = guideMirror(hit);
         }
 
         // Leaving a solid from the inside: the ray just travelled hit.t through it, losing light (Beer's law).
@@ -3080,7 +3767,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         bool leavingGlass = hit.solid && !hit.frontFace && hit.transmission > 0.0;
         // The first surface with ReSTIR DI: slot 2 takes the reservoir's sample instead of a glowing triangle,
         // the sky slot is left out, and the punctual ones if the reservoir has them (more than a few lights)
-        bool restirVertex = bounce == 0 && usePrimaryHit && reservoirs[restirIndex(pixel, false)].light != RESTIR_NOT_USED;
+        bool restirVertex = bounce == 0 && usePrimaryHit && !isFog(hit)
+                            && reservoirs[restirIndex(pixel, false)].light != RESTIR_NOT_USED;
         if (CACHE_UPDATE_PASS == 0 && bounce == 0 && usePrimaryHit && scene.restirGi != 0 && restirSurface(hit)
                 && intersection.crossings == 0) {  // through portals no, in mirrors yes (see "Mirrors and ReSTIR")
             giState = 1;
@@ -3093,7 +3781,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
             clampDepth = giState == 2 ? 0u : reflections + 1;  // light this surface reflects
-            uint lightSlots = restirVertex && scene.restirPunctualCandidates > 0 ? 3 : 3 + punctualLightSamples();
+            // (none at a scatter point in the fog: the stretches before take the lamps' light, see fogLampLight)
+            uint lightSlots = (restirVertex && scene.restirPunctualCandidates > 0) || (isFog(hit) && CACHE_UPDATE_PASS == 0)
+                              ? 3 : 3 + punctualLightSamples();
             uint imageSlots = CACHE_UPDATE_PASS != 0 ? 0 : scene.portalCount * (1 + punctualLightSamples());
             [[dont_unroll]] for (uint slot = 0; slot < lightSlots + imageSlots; slot++) {
                 LightSample s = noLightSample();
@@ -3154,8 +3844,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     continue;
                 }
                 float pdfBounce;  // how likely the bounce sampling would have picked this direction
-                vec3 contribution = s.light * evaluateBrdfWorld(hit, hit.normal, -direction, s.direction, pdfBounce)
-                                    * abs(cosLight);
+                vec3 contribution;
+                if (isFog(hit)) {
+                    pdfBounce = fogPhase(dot(direction, s.direction), materials[hit.meshIndex].fogForward);
+                    contribution = s.light * pdfBounce;
+                } else {
+                    contribution = s.light * evaluateBrdfWorld(hit, hit.normal, -direction, s.direction, pdfBounce)
+                                   * abs(cosLight);
+                }
                 if (all(equal(contribution, vec3(0.0)))) {
                     continue;  // a dark spot of an emissive texture, or a direction the surface doesn't reflect into
                 }
@@ -3163,8 +3859,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 vec3 transmittance = vec3(1.0);
                 if (s.shadowed) {
                     vec3 shadowOrigin = shadowRayStart(hit, behind, s);
-                    transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, imageEnd, seed, crossedGlass,
-                                                        crossedSolidGlass);
+                    transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, imageEnd, seed, media,
+                                                        crossedGlass, crossedSolidGlass);
                     // The reservoir's sample is blocked: kept with W = 0, so every sample handed on to the next
                     // frame is known to be seen from its own surface (restirTemporal counts on that)
                     if (restirVertex && slot == 2 && all(equal(transmittance, vec3(0.0)))) {
@@ -3197,12 +3893,17 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         bool transmitted = false;
         bool specularLobe = true;
         vec4 bounceRandom = pathSample(bounce, SAMPLE_BOUNCE, seed);  // xyz: the direction, w: Russian roulette
-        if (leavingGlass) {
+        if (isFog(hit)) {
+            // On from the fog in a direction picked by its phase function: weight 1 (phase / pdf)
+            l = toLocal(frame, sampleFogDirection(direction, materials[hit.meshIndex].fogForward, bounceRandom.xy, bouncePdf));
+            lobeRoughness = 1.0;
+            specularLobe = false;
+        } else if (leavingGlass) {
             if (!sampleGlassExit(hit, v, bounceRandom.xyz, l)) {
                 break;
             }
             transmitted = true;  // in or out, the path stays "through glass" for the light rules above
-        } else if (restirVertex && scene.restirBrdfCandidates > 0 && scene.accumulate == 0) {
+        } else if (restirVertex && scene.restirBrdfCandidates > 0 && scene.accumulate == 0 && FOG == 0) {
             // Picked and traced already: the ReSTIR pass's BRDF candidate (same sampling, its own random numbers).
             // Not when accumulating: the bounce then shares its direction with the light choice, which changes how
             // the noise averages out over frames (Sponza: the same single-frame error, but 29% more after 8 frames,
@@ -3241,6 +3942,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         float side = dot(direction, hit.geometricNormal);
         if (throughSurface ? side >= 0.0 : side <= 0.0) {
             break;
+        }
+        // Through a solid's surface: into its fog or out of it (see "Fog")
+        if (FOG != 0 && throughSurface && hit.solid && materials[hit.materialIndex].fogDensity > 0.0) {
+            media = hit.frontFace ? enterMedium(media, hit.instanceIndex) : leaveMedium(media, hit.instanceIndex);
         }
         throughput *= weight;
         // Continue from just off the surface, on the side the new ray goes to.
@@ -3399,7 +4104,7 @@ bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
     bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
     vec3 shadowOrigin = shadowRayStart(hit, behind, s);
     bool crossedGlass, crossedSolidGlass;
-    vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, seed, crossedGlass,
+    vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, seed, OUTSIDE, crossedGlass,
                                              crossedSolidGlass);
     return any(greaterThan(transmittance, vec3(0.0)));
 }
@@ -3554,7 +4259,7 @@ void restirPass(ivec2 pixel, ivec2 size) {
                 bool behind = dot(hit.geometricNormal, s.direction) < 0.0;
                 vec3 shadowOrigin = shadowRayStart(hit, behind, s);
                 bool crossedGlass, crossedSolidGlass;
-                vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, candidateSeed,
+                vec3 transmittance = shadowTransmittance(shadowOrigin, s.direction, s.distance, -1, candidateSeed, OUTSIDE,
                                                          crossedGlass, crossedSolidGlass);
                 if (all(equal(transmittance, vec3(0.0)))) {
                     reservoir.W = 0.0;
@@ -3904,7 +4609,7 @@ bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed) {
     }
     rayQueryEXT rayQuery;
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, direction, stop);
-    traverse(rayQuery, seed);
+    traverse(rayQuery, seed, false, uvec4(~0u));
     return rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
@@ -4098,6 +4803,13 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
     float pdf;
     vec3 light = evaluateBrdfWorld(hit, hit.normal, -direction, l, pdf) * abs(dot(hit.normal, l)) * r.radiance * r.W
                  * tint;
+    if (FOG != 0) {
+        // The image pass's camera ray gets to the surface with the fog's transmittance; scattered, its path has no GI.
+        // (Up to just before the surface: a shadow ray would count it as blocking)
+        bool crossedGlass, crossedSolidGlass;
+        light *= shadowTransmittance(scene.cameraPosition.xyz, direction, intersection.t * 0.999, -1, seed,
+                                     mediumAt(scene.cameraPosition.xyz), crossedGlass, crossedSolidGlass);
+    }
     // As the image pass's: one of samplesPerPixel paths, and the running average when accumulating
     light /= float(scene.samplesPerPixel);
     if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {
@@ -4188,15 +4900,18 @@ void main() {
     }
 
     vec3 color = vec3(0.0);
+    float fogAmount = 0.0;
     for (uint s = 0; s < scene.samplesPerPixel; s++) {
         startPathSamples(pixel, s);
         vec3 direction = sampleCameraRay(pixel, size, seed);
         // DLSS gets one sample per pixel anyway: the first path writes the guides. The RESTIR_PASS traced the
         // first sample's camera ray.
+        cameraRayFog = 0.0;
         color += tracePath(scene.cameraPosition.xyz, direction, seed, s == 0,
                            s == 0 && (scene.restirDi != 0 || scene.restirGi != 0));
+        fogAmount += cameraRayFog;
     }
-    if (guidesSeeMirror) {
+    if (guidesRetrace) {
         // the first sample's camera ray again (as above)
         uint guideSeed = pixelSeed(pixel);
         startPathSamples(pixel, 0u);
@@ -4204,12 +4919,15 @@ void main() {
         storeMirrorGuides(pixel, direction, guideSeed);
     }
     color /= float(scene.samplesPerPixel);
+    fogAmount /= float(scene.samplesPerPixel);
 
     // Running average: the n-th frame gets weight 1/(n+1), so every frame counts equally.
     if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {
         vec3 previous = imageLoad(radianceImage, pixel).rgb;
         color = mix(previous, color, 1.0 / float(scene.accumulatedFrames + 1));
+        fogAmount = mix(imageLoad(fogAmountImage, pixel).r, fogAmount, 1.0 / float(scene.accumulatedFrames + 1));
     }
+    imageStore(fogAmountImage, pixel, vec4(fogAmount));
     // Stays linear and unbounded. Exposure and tone mapping only affect the displayed image (display.comp),
     // so changing them does not restart accumulation.
     imageStore(radianceImage, pixel, vec4(color, 1.0));

@@ -110,8 +110,9 @@ void Renderer::destroyDisplayImages() {
 
 // Descriptors: 0 = HDR image (read: DLSS output or the radiance image), 1 = display image (write),
 // 2 = exposure state (read), 3-9 = the DLSS input images and the history image (read, for the guide debug views),
-// 10 = the radiance image at render size (read, for the trace shader's debug views)
-static const uint32_t displayBindingCount = 11;
+// 10 = the radiance image at render size (read, for the trace shader's debug views), 11 = the fog amount (read, for
+// the fog grain)
+static const uint32_t displayBindingCount = 12;
 
 void Renderer::createDisplayResources() {
     VkDescriptorSetLayoutBinding bindings[displayBindingCount];
@@ -179,7 +180,7 @@ void Renderer::updateDisplayDescriptorSet() {
             displayedHdrView(), displayImageView, VK_NULL_HANDLE,
             linearDepthImage.view, motionVectorImage.view, diffuseAlbedoImage.view, specularAlbedoImage.view,
             normalRoughnessImage.view, specularHitDistanceImage.view, guideHistoryImage.view,
-            radianceImageView,
+            radianceImageView, fogAmountImage.view,
     };
     VkDescriptorImageInfo imageInfos[displayBindingCount]{};
     VkDescriptorBufferInfo exposureInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
@@ -229,6 +230,9 @@ void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
     }
     push.view = static_cast<uint32_t>(view);
     push.farDistance = Configuration::cameraFar;
+    push.grainStrength = settings.fogGrain ? settings.fogGrainStrength : 0.0f;
+    push.grainSize = std::max(settings.fogGrainSize, 1.0f);
+    push.frame = static_cast<uint32_t>(frameNumber);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipelineLayout, 0, 1,
