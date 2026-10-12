@@ -9,6 +9,10 @@
 // The point light variant replaces the ceiling panel by a point light (KHR_lights_punctual's kind) just below
 // it, as bright straight down as the panel: the same room with sharp shadows and a lit ceiling.
 //
+// The mirror maze: a few hallways where every surface is a clean mirror (walls, floor and ceiling), open only at
+// the entrance and the exit, lit by many small lamps. Every lamp and every wall is seen again and again in the
+// mirrors, so it's hard to tell what is real: a test for reflections (DLSS guides, noise in reflected surfaces).
+//
 // The portal rim: two glowing cubes (blue for the A ends, orange for the B ends) that the Scene stretches into the
 // bars of the portals' frames.
 //
@@ -22,9 +26,11 @@
 static const char* cornellBoxName = "Cornell box";
 static const char* cornellBoxWithBlocksName = "Cornell box (classic, with blocks)";
 static const char* cornellBoxPointLightName = "Cornell box (blocks, point light)";
+static const char* cubeName = "Cube";
+static const char* mirrorMazeName = "Mirror maze";
 
 const std::vector<std::string>& builtInModelNames() {
-    static const std::vector<std::string> names = {cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName};
+    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName};
     return names;
 }
 
@@ -114,6 +120,26 @@ static Mesh cubeMesh(const std::string& name, uint32_t material) {
     return mesh;
 }
 
+static Model createCube() {
+    Model model;
+    model.name = cubeName;
+
+    const glm::vec3 color = {1.0f, 1.0f, 1.0f};
+    Material material = matte("white", color);
+    material.roughness = 1.0f;
+    material.emissiveColor = color;
+    material.emissiveStrength = 0.0f;
+
+    model.materials.push_back(material);
+    model.meshes.push_back(cubeMesh("mesh", 0));
+    model.instances.push_back({0, glm::mat4(1.0f)});
+
+    model.boundsMin = glm::vec3(-0.5f);
+    model.boundsMax = glm::vec3(0.5f);
+
+    return model;
+}
+
 static Model createPortalRim() {
     Model model;
     model.name = portalRimModelName();
@@ -194,7 +220,106 @@ static Model createCornellBox(bool withBlocks, bool pointLight) {
     return model;
 }
 
+// Hallways of square cells (cellSize wide, `height` tall) on a grid, x to the east, z to the south. The entrance
+// is the south side of the first cell (facing the default camera), the exit the east side of the last.
+static Model createMirrorMaze() {
+    Model model;
+    model.name = mirrorMazeName;
+
+    enum { Mirror, CeilingLamp, WallLamp };
+    // Silver: almost white, so a reflection seen through many mirrors fades slowly (and Max bounces ends it)
+    Material mirror = matte("mirror", {0.95f, 0.95f, 0.93f});
+    mirror.metallic = 1.0f;
+    mirror.roughness = 0.0f;
+    model.materials.push_back(mirror);
+    Material ceilingLamp = matte("ceiling lamps", {0.8f, 0.8f, 0.8f});
+    ceilingLamp.emissiveColor = {1.0f, 0.88f, 0.7f};  // warm
+    ceilingLamp.emissiveStrength = 12.0f;
+    model.materials.push_back(ceilingLamp);
+    Material wallLamp = matte("wall lamps", {0.8f, 0.8f, 0.8f});
+    wallLamp.emissiveColor = {0.75f, 0.85f, 1.0f};    // cool
+    wallLamp.emissiveStrength = 6.0f;
+    model.materials.push_back(wallLamp);
+
+    const float cellSize = 2.0f, h = cellSize * 0.5f;
+    const float height = 3.0f;
+    const float lift = 0.002f;  // above the scene's floor, as the Cornell box's
+
+    // The way through (north is -z), with a dead end branching off it. Cells are linked only along the way and
+    // the branch: neighbors that aren't linked have a mirror between them.
+    const std::vector<glm::ivec2> way = {{0, 0}, {0, 1}, {0, 2}, {1, 2}, {2, 2}, {2, 3}, {2, 4}, {3, 4}, {4, 4}, {4, 3}, {4, 2}};
+    const std::vector<glm::ivec2> branch = {{1, 2}, {1, 3}, {1, 4}};
+    std::vector<glm::ivec2> cells = way;
+    cells.insert(cells.end(), branch.begin() + 1, branch.end());
+    std::vector<std::pair<glm::ivec2, glm::ivec2>> links;
+    for (const std::vector<glm::ivec2>* list : {&way, &branch}) {
+        for (size_t i = 1; i < list->size(); i++) {
+            links.push_back({(*list)[i - 1], (*list)[i]});
+        }
+    }
+    auto linked = [&](glm::ivec2 a, glm::ivec2 b) {
+        return std::any_of(links.begin(), links.end(), [&](const auto& l) {
+            return (l.first == a && l.second == b) || (l.first == b && l.second == a);
+        });
+    };
+    auto inMaze = [&](glm::ivec2 c) { return std::find(cells.begin(), cells.end(), c) != cells.end(); };
+    const glm::ivec2 entrance = way.front(), entranceSide = {0, -1};
+    const glm::ivec2 exit = way.back(), exitSide = {1, 0};
+
+    Mesh mirrors, ceilingLamps, wallLamps;
+    mirrors.name = "mirrors";
+    mirrors.materialIndex = Mirror;
+    ceilingLamps.name = "ceiling lamps";
+    ceilingLamps.materialIndex = CeilingLamp;
+    wallLamps.name = "wall lamps";
+    wallLamps.materialIndex = WallLamp;
+    const glm::vec3 up = {0.0f, 1.0f, 0.0f};
+    for (glm::ivec2 cell : cells) {
+        glm::vec3 c = {cell.x * cellSize, 0.0f, -cell.y * cellSize};
+        addQuad(mirrors, c + glm::vec3(-h, lift, h), c + glm::vec3(h, lift, h), c + glm::vec3(h, lift, -h),
+                c + glm::vec3(-h, lift, -h));  // floor
+        addQuad(mirrors, c + glm::vec3(-h, height, -h), c + glm::vec3(h, height, -h), c + glm::vec3(h, height, h),
+                c + glm::vec3(-h, height, h));  // ceiling
+        // A square lamp in the middle of the ceiling, a hair below it, facing down
+        const float lamp = 0.3f, lampY = height - 0.002f;
+        addQuad(ceilingLamps, c + glm::vec3(-lamp, lampY, -lamp), c + glm::vec3(lamp, lampY, -lamp),
+                c + glm::vec3(lamp, lampY, lamp), c + glm::vec3(-lamp, lampY, lamp));
+
+        for (glm::ivec2 side : {glm::ivec2(1, 0), glm::ivec2(-1, 0), glm::ivec2(0, 1), glm::ivec2(0, -1)}) {
+            glm::ivec2 neighbor = cell + side;
+            if (linked(cell, neighbor) || (cell == entrance && side == entranceSide) || (cell == exit && side == exitSide)) {
+                continue;  // open
+            }
+            glm::vec3 out = {static_cast<float>(side.x), 0.0f, static_cast<float>(-side.y)};
+            glm::vec3 along = glm::cross(out, up);  // wound so the normal points into the cell
+            // Between two cells of the maze one mirror serves both: made by the cell with the smaller coordinates
+            if (!inMaze(neighbor) || cell.x < neighbor.x || (cell.x == neighbor.x && cell.y < neighbor.y)) {
+                glm::vec3 p = c + out * h;
+                addQuad(mirrors, p - along * h + up * lift, p + along * h + up * lift, p + along * h + up * height,
+                        p - along * h + up * height);
+            }
+            // A thin lamp strip along the wall at waist height, just off the mirror (on each side of a shared one)
+            glm::vec3 q = c + out * (h - 0.01f);
+            const float stripLength = h * 0.8f, stripLow = 1.0f, stripHigh = 1.06f;
+            addQuad(wallLamps, q - along * stripLength + up * stripLow, q + along * stripLength + up * stripLow,
+                    q + along * stripLength + up * stripHigh, q - along * stripLength + up * stripHigh);
+        }
+    }
+    for (Mesh* mesh : {&mirrors, &ceilingLamps, &wallLamps}) {
+        mesh->hasNormals = true;
+        computeBounds(*mesh);
+        model.instances.push_back({static_cast<uint32_t>(model.meshes.size()), glm::mat4(1.0f)});
+        model.meshes.push_back(std::move(*mesh));
+    }
+    model.boundsMin = model.meshes[0].boundsMin;  // the mirrors enclose everything
+    model.boundsMax = model.meshes[0].boundsMax;
+    return model;
+}
+
 Model createBuiltInModel(const std::string& name) {
+    if (name == cubeName) {
+        return createCube();
+    }
     if (name == cornellBoxName) {
         return createCornellBox(false, false);
     }
@@ -203,6 +328,9 @@ Model createBuiltInModel(const std::string& name) {
     }
     if (name == cornellBoxPointLightName) {
         return createCornellBox(true, true);
+    }
+    if (name == mirrorMazeName) {
+        return createMirrorMaze();
     }
     if (name == portalRimModelName()) {
         return createPortalRim();

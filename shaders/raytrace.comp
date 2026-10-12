@@ -2508,12 +2508,15 @@ void storeSkyGuides(ivec2 pixel, vec3 direction) {
 // (energy compensated) reflection doesn't return; light going through glass counts as specular (it stays sharp,
 // like a reflection). The specular hit distance is 0 (unknown) unless the bounce from here reflects (tracePath).
 // direction: the ray's last part (after portals), cameraDirection: the camera ray's own. Seen through a portal, the
-// surface is where it appears: hit.t along the camera ray (portals don't move with the camera), not where it is.
-void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirection, bool throughPortal) {
+// surface is where it appears: `distance` (the whole length) along the camera ray (portals don't move with the
+// camera), not where it is. Seen through mirrors (storeMirrorGuides) likewise, its normal turned the way the
+// mirrors turn it (toCamera) and its albedos tinted by their color (tint).
+void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirection, bool virtualPosition,
+                        float distance, mat3 toCamera, vec3 tint) {
     // A point on an object that moved is reprojected with the object's own motion as well
-    vec4 position = vec4(throughPortal ? scene.cameraPosition.xyz + cameraDirection * hit.t : hit.position, 1.0);
-    vec4 previousPosition = throughPortal ? position : instances[hit.instanceIndex].motion * position;
-    imageStore(linearDepthImage, pixel, vec4(hit.t * dot(cameraDirection, scene.cameraForward.xyz)));
+    vec4 position = vec4(virtualPosition ? scene.cameraPosition.xyz + cameraDirection * distance : hit.position, 1.0);
+    vec4 previousPosition = virtualPosition ? position : instances[hit.instanceIndex].motion * position;
+    imageStore(linearDepthImage, pixel, vec4(distance * dot(cameraDirection, scene.cameraForward.xyz)));
     imageStore(motionVectorImage, pixel, vec4(motionVector(position, previousPosition), 0.0, 0.0));
     ReflectionEnergy energy = reflectionEnergy(hit, dot(hit.normal, -direction));
     vec3 base = (1.0 - hit.metallic) * (1.0 - energy.dielectricAlbedo) * hit.albedo;
@@ -2527,10 +2530,59 @@ void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirecti
         diffuseAlbedo = vec3(1.0);
         specularAlbedo = vec3(0.0);
     }
-    imageStore(diffuseAlbedoImage, pixel, vec4(diffuseAlbedo, 1.0));
-    imageStore(specularAlbedoImage, pixel, vec4(specularAlbedo, 1.0));
-    imageStore(normalRoughnessImage, pixel, vec4(hit.normal, hit.roughness));
+    imageStore(diffuseAlbedoImage, pixel, vec4(diffuseAlbedo * tint, 1.0));
+    imageStore(specularAlbedoImage, pixel, vec4(specularAlbedo * tint, 1.0));
+    imageStore(normalRoughnessImage, pixel, vec4(toCamera * hit.normal, hit.roughness));
     imageStore(specularHitDistanceImage, pixel, vec4(0.0));
+}
+
+// A perfect mirror for the guides: smooth (roughness 0) metal. A smooth non-metal isn't one: what it shows is
+// mostly its own color (or what is behind it, glass), the reflection only a few percent.
+bool guideMirror(Hit hit) {
+    return hit.roughness <= 0.0 && hit.metallic >= 0.99 && hit.transmission <= 0.0 && luminance(hit.emissive) <= 0.0;
+}
+
+// Mirrors and the guides (primary surface replacement, as NVIDIA recommends for DLSS RR). DLSS keeps edges and
+// texture by the guides of the surface the camera sees; a mirror's are flat and plain, so DLSS can't tell what it
+// shows from noise and smudges it. When the camera sees a mirror, this follows the reflection to the first surface
+// that isn't one and writes the guides again, for that surface as it appears in the mirrors: at the whole length
+// along the camera ray (the reflections are rigid, so the image of a still point stands still), its normal
+// mirrored back by each mirror's plane, its albedo tinted by the mirrors' color. The sky: as seen directly.
+// A chain longer than maxBounces keeps the first mirror's guides.
+// Its own trace from the camera, after the path (see main), rather than following the path's bounces: anything
+// the path's loop keeps, or traces in it, costs registers in every pixel (that took the trace shader from 128 to
+// 168). The path only notes that the camera sees a mirror (guidesSeeMirror).
+bool guidesSeeMirror = false;
+
+void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
+    mat3 toCamera = mat3(1.0);
+    vec3 tint = vec3(1.0);
+    float distance = 0.0;
+    vec3 origin = scene.cameraPosition.xyz;
+    vec3 direction = cameraDirection;
+    float coneSpread = scene.pixelSpreadAngle;  // the camera ray's cone, which the mirrors don't widen
+    for (uint i = 0; i <= scene.maxBounces; i++) {
+        Intersection intersection;
+        if (!intersectClosest(origin, direction, seed, intersection)) {
+            if (i > 0 && intersection.travelled >= 0.0) {
+                storeSkyGuides(pixel, cameraDirection);
+            }
+            return;
+        }
+        Hit hit = hitFromIntersection(intersection, direction, coneSpread * distance, coneSpread);
+        tiltTowardsViewer(hit, direction);
+        distance += hit.t;
+        if (!guideMirror(hit)) {
+            if (i > 0) {
+                storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, distance, toCamera, tint);
+            }
+            return;
+        }
+        toCamera = toCamera * (mat3(1.0) - 2.0 * outerProduct(hit.normal, hit.normal));
+        tint *= fresnelSchlick(hit.albedo, dot(hit.normal, -direction));
+        direction = reflect(direction, hit.normal);
+        origin = offsetRay(hit.position, hit.geometricNormal);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2824,7 +2876,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         }
         tiltTowardsViewer(hit, direction);
         if (bounce == 0 && wantGuides) {
-            storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal);
+            storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, hit.t, mat3(1.0), vec3(1.0));
+            guidesSeeMirror = guideMirror(hit);
         }
 
         // Leaving a solid from the inside: the ray just travelled hit.t through it, losing light (Beer's law).
@@ -3085,7 +3138,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         coneSpread += 2.0 * ggxAlpha(lobeRoughness);
         previousLobeRough = !transmitted && lobeRoughness >= CACHE_ROUGHNESS;
         if (bounce == 0 && wantGuides) {
-            firstBounceSpecular = specularLobe;
+            firstBounceSpecular = specularLobe && !guideMirror(hit);  // a mirror: storeMirrorGuides wrote it
         }
         direction = sharedBounce && bounce == 0 ? bounceHits[primaryHitIndex(pixel)].direction : toWorld(frame, l);
         // Around the smooth normal, a direction can still end up on the wrong side of the actual triangle.
@@ -4029,6 +4082,13 @@ void main() {
         // first sample's camera ray.
         color += tracePath(scene.cameraPosition.xyz, direction, seed, s == 0,
                            s == 0 && (scene.restirDi != 0 || scene.restirGi != 0));
+    }
+    if (guidesSeeMirror) {
+        // the first sample's camera ray again (as above)
+        uint guideSeed = pixelSeed(pixel);
+        startPathSamples(pixel, 0u);
+        vec3 direction = sampleCameraRay(pixel, size, guideSeed);
+        storeMirrorGuides(pixel, direction, guideSeed);
     }
     color /= float(scene.samplesPerPixel);
 
