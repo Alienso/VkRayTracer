@@ -920,7 +920,6 @@ SceneUniforms Renderer::buildSceneUniforms() {
     // GI samples carry the light they saw (Lo): after the lighting changed (as for the radiance cache, above) it is
     // out of date, so drop them, as when lights are added or removed. Lights that move rely on the age limit.
     uniforms.restirGiHistoryValid = restirGiHistoryAvailable && !restirLightsChanged && !lightingChanged ? 1 : 0;
-    uniforms.previousCameraPosition = glm::vec4(previousCameraPosition, 1.0f);
     // Bounce light clamp (DLSS modes, see clampBounceLight in the shader). The limit is set on screen, so it is
     // divided by the exposure: the GPU's from a few frames ago (exposureInfo), or the manual one. After the
     // comparison above: it changes every frame with the auto exposure.
@@ -938,7 +937,6 @@ SceneUniforms Renderer::buildSceneUniforms() {
     }
     restirHistoryAvailable = restirPass;
     restirGiHistoryAvailable = uniforms.restirGi != 0;
-    previousCameraPosition = renderList->camera.position;
     // Jitter (DLSS mode): a different sub-pixel offset of the whole image every frame, so DLSS sees every part of
     // each pixel over a few frames. In pixels, -0.5..0.5. DLSS SR's guide asks for 8 phases per output pixel (more
     // when each render pixel covers several output pixels); RR's for "at least 32", as it has no reason to limit them.

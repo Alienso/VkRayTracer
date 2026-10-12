@@ -111,7 +111,6 @@ layout(binding = 3) uniform SceneUniforms {
     uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
     uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see triangleSolidAngle), 0 = by area
     uint portalCount;               // entries in the portal list (binding 31): two per pair
-    vec4 previousCameraPosition;   // last frame's (for last frame's view directions)
 } scene;
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
@@ -219,6 +218,12 @@ struct PrimaryHit {
     vec2 barycentrics;
     float t;
     uint seed;           // the pixel's random numbers after the ray (cut-outs use some), for the image pass to go on with
+    // Seen in mirrors (see "Mirrors and ReSTIR"): the ray's length before its last part (0: no mirror), the last
+    // part's direction, and the mirrors' color (half floats)
+    float travelled;
+    vec3 direction;
+    uint tintRG;
+    uint tintB;
 };
 layout(binding = 25, scalar) buffer PrimaryHits { PrimaryHit primaryHits[]; };
 // The camera ray went through a portal: the pixel doesn't use ReSTIR (its first surface is not where the camera
@@ -1945,7 +1950,7 @@ struct Reservoir {
 layout(binding = 26, scalar) buffer Reservoirs { Reservoir reservoirs[]; };  // 3 parts of one per render pixel
 
 // What the reuse needs to know about a pixel's first surface: enough for its target (restirTarget) without its
-// textures. 32 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Application.h.
+// textures. 48 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Application.h.
 struct RestirSurface {
     vec3 position;
     uint normal;             // octahedral, 2 x 16 bits
@@ -1953,6 +1958,10 @@ struct RestirSurface {
     uint albedoRoughness;    // 4 x 8 bits
     uint material;           // metallic, (ior - 1) / 2, diffuse transmission (8 bits each)
     uint diffuseTransmissionColor;
+    // Where the camera sees it (its position, or in mirrors its image: see "Mirrors and ReSTIR") and the way
+    // towards the viewer (octahedral): for view directions and depths, and to find it on last frame's image
+    vec3 seenAt;
+    uint view;
 };
 layout(binding = 27, scalar) buffer RestirSurfaces { RestirSurface restirSurfaces[]; };  // 2 halves, as above
 
@@ -1992,9 +2001,12 @@ vec3 decodeDirection(uint packed) {
     return normalize(n);
 }
 
-RestirSurface packRestirSurface(Hit hit) {
+// seenAt: where the camera sees it, v: towards the viewer
+RestirSurface packRestirSurface(Hit hit, vec3 seenAt, vec3 v) {
     RestirSurface surface;
     surface.position = hit.position;
+    surface.seenAt = seenAt;
+    surface.view = encodeDirection(v);
     surface.normal = encodeDirection(hit.normal);
     surface.geometricNormal = encodeDirection(hit.geometricNormal);
     surface.albedoRoughness = packUnorm4x8(vec4(hit.albedo, hit.roughness));
@@ -2020,6 +2032,23 @@ Hit unpackRestirSurface(RestirSurface surface) {
     hit.diffuseTransmissionColor = unpackUnorm4x8(surface.diffuseTransmissionColor).rgb;
     hit.transmission = 0.0;  // ReSTIR surfaces have none
     return hit;
+}
+
+// The way from a stored surface towards whoever saw it (the camera, or in mirrors its mirror image)
+vec3 restirSurfaceView(RestirSurface surface) {
+    return decodeDirection(surface.view);
+}
+
+// A stored surface's view depth with this frame's camera: of where the camera sees it
+float restirSurfaceDepth(RestirSurface surface) {
+    return dot(surface.seenAt - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+}
+
+// Where a stored surface (this frame's) was on last frame's image: its point moved back by its object's motion,
+// or its image in mirrors, which stands still with the mirrors (moving mirrors aren't followed)
+vec4 restirPreviousPoint(RestirSurface surface, uint instanceIndex) {
+    return surface.seenAt != surface.position ? vec4(surface.seenAt, 1.0)
+                                              : instances[instanceIndex].motion * vec4(surface.position, 1.0);
 }
 
 // Surfaces that use ReSTIR: rough enough that a picked light sample finds the light they reflect. A near-mirror
@@ -2585,6 +2614,57 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     }
 }
 
+// Mirrors and ReSTIR. ReSTIR works on the first surface the camera sees; in a mirror that is the mirror, too smooth
+// for it, and what the mirror shows got none: plain light sampling, far noisier than the same surface seen directly.
+// So the RESTIR_PASS follows the camera ray through mirrors (guideMirror) to the first surface that isn't one, and
+// that becomes the pixel's surface: for ReSTIR DI and GI, and for the image pass, which goes on from it with the
+// last part's direction and the mirrors' color as its throughput (loadPrimaryHit). The mirrors themselves aren't
+// shaded: a perfect mirror's light sampling finds next to nothing, its light comes with its reflection.
+// For the reuse, such a surface is seen from the camera's mirror image: its view direction is the last part's
+// (RestirSurface.view), and its depth and last frame's pixel are those of where the camera sees it (seenAt), which
+// stands still with the mirrors. Through a portal anywhere on the way: not stored, as before (PRIMARY_THROUGH_PORTAL).
+// It also writes the guides of pixels that see a mirror (as storeMirrorGuides); the image pass leaves them.
+// direction: the camera ray's, then its last part's. travelled: the length before the last part (0: no mirror).
+// hit: the surface (unset if nothing was hit), its t along the last part.
+bool traceCameraRay(ivec2 pixel, inout vec3 direction, inout uint seed, out Intersection intersection, out Hit hit,
+                    out vec3 tint, out float travelled, out bool throughPortal) {
+    vec3 cameraDirection = direction;
+    vec3 origin = scene.cameraPosition.xyz;
+    mat3 toCamera = mat3(1.0);
+    tint = vec3(1.0);
+    travelled = 0.0;
+    throughPortal = false;
+    float coneSpread = scene.pixelSpreadAngle;  // the camera ray's cone, which the mirrors don't widen
+    for (uint i = 0; i <= scene.maxBounces; i++) {
+        bool found = intersectClosest(origin, direction, seed, intersection);
+        if (intersection.travelled != 0.0) {
+            throughPortal = true;
+            return found;
+        }
+        if (found) {
+            hit = hitFromIntersection(intersection, direction, coneSpread * travelled, coneSpread);
+            tiltTowardsViewer(hit, direction);
+        }
+        if (!found || !guideMirror(hit) || i == scene.maxBounces) {
+            if (travelled > 0.0 && scene.writeGuides != 0) {
+                if (found) {
+                    storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, travelled + hit.t, toCamera, tint);
+                } else {
+                    storeSkyGuides(pixel, cameraDirection);
+                }
+            }
+            return found;
+        }
+        // A mirror: on along the reflection, its image mirrored by the mirror's plane
+        toCamera = toCamera * (mat3(1.0) - 2.0 * outerProduct(hit.normal, hit.normal));
+        tint *= fresnelSchlick(hit.albedo, dot(hit.normal, -direction));
+        travelled += hit.t;
+        origin = offsetRay(hit.position, hit.geometricNormal);
+        direction = reflect(direction, hit.normal);
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Radiance cache
 //
@@ -2674,9 +2754,14 @@ uint primaryHitIndex(ivec2 pixel) {
     return uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
 }
 
-void storePrimaryHit(ivec2 pixel, bool found, Intersection intersection, uint seed) {
+void storePrimaryHit(ivec2 pixel, bool found, Intersection intersection, uint seed, bool throughPortal,
+                     float travelled, vec3 direction, vec3 tint) {
     PrimaryHit stored;
-    stored.meshIndex = intersection.travelled != 0.0 ? PRIMARY_THROUGH_PORTAL : found ? intersection.meshIndex : ~0u;
+    stored.meshIndex = throughPortal ? PRIMARY_THROUGH_PORTAL : found ? intersection.meshIndex : ~0u;
+    stored.travelled = travelled;
+    stored.direction = direction;
+    stored.tintRG = packHalf2x16(tint.rg);
+    stored.tintB = packHalf2x16(vec2(tint.b, 0.0));
     stored.instanceIndex = intersection.instanceIndex;
     stored.primitive = intersection.primitive;
     stored.barycentrics = intersection.barycentrics;
@@ -2687,12 +2772,18 @@ void storePrimaryHit(ivec2 pixel, bool found, Intersection intersection, uint se
 
 // false: the camera ray hit nothing. The pixel's random numbers go on from where the RESTIR_PASS left them, so
 // the path continues exactly as if the image pass had traced the ray itself. (Not for a ray through a portal: see
-// primaryHitStored.)
-bool loadPrimaryHit(ivec2 pixel, inout uint seed, out Intersection intersection) {
+// primaryHitStored.) Seen in mirrors: direction becomes the ray's last part, tint the mirrors' color, and the
+// intersection's travelled the length before it (crossings stays 0: that tells it from a portal's).
+bool loadPrimaryHit(ivec2 pixel, inout uint seed, out Intersection intersection, inout vec3 direction, out vec3 tint) {
     PrimaryHit stored = primaryHits[primaryHitIndex(pixel)];
     seed = stored.seed;
-    intersection.travelled = 0.0;
+    intersection.travelled = stored.travelled;
     intersection.crossings = 0;
+    tint = vec3(1.0);
+    if (stored.travelled > 0.0) {
+        direction = stored.direction;
+        tint = vec3(unpackHalf2x16(stored.tintRG), unpackHalf2x16(stored.tintB).x);
+    }
     if (stored.meshIndex >= PRIMARY_THROUGH_PORTAL) {
         return false;
     }
@@ -2810,7 +2901,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         bool found;
         vec3 rayDirection = direction;  // before any portal (the camera ray's, for the guides)
         if (bounce == 0 && usePrimaryHit && primaryHitStored(pixel)) {
-            found = loadPrimaryHit(pixel, seed, intersection);
+            vec3 tint;
+            found = loadPrimaryHit(pixel, seed, intersection, direction, tint);
+            throughput = tint;
         } else if (bounce == 1 && sharedBounce
                    && (bounceHits[primaryHitIndex(pixel)].weightBRoughness & BOUNCE_RETRACE) == 0u) {
             BounceHit stored = bounceHits[primaryHitIndex(pixel)];
@@ -2875,7 +2968,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             break;
         }
         tiltTowardsViewer(hit, direction);
-        if (bounce == 0 && wantGuides) {
+        // Seen in mirrors through the RESTIR_PASS's stored hit: that pass wrote the guides (traceCameraRay)
+        if (bounce == 0 && wantGuides && !(crossedPortal && intersection.crossings == 0)) {
             storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, hit.t, mat3(1.0), vec3(1.0));
             guidesSeeMirror = guideMirror(hit);
         }
@@ -2988,7 +3082,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // the sky slot is left out, and the punctual ones if the reservoir has them (more than a few lights)
         bool restirVertex = bounce == 0 && usePrimaryHit && reservoirs[restirIndex(pixel, false)].light != RESTIR_NOT_USED;
         if (CACHE_UPDATE_PASS == 0 && bounce == 0 && usePrimaryHit && scene.restirGi != 0 && restirSurface(hit)
-                && !crossedPortal) {
+                && intersection.crossings == 0) {  // through portals no, in mirrors yes (see "Mirrors and ReSTIR")
             giState = 1;
         }
         if (!leavingGlass) {
@@ -3313,10 +3407,10 @@ bool restirVisible(Reservoir r, Hit hit, inout uint seed) {
 // The same surface point in last frame's image (ReSTIR DI's and GI's temporal reuse): where it was (the object's
 // motion, last frame's camera), and a stored surface there that matches. gi: look for a GI reservoir instead of a DI
 // one. False if there is none.
-bool restirFindPrevious(Hit hit, uint instanceIndex, bool gi, bool shuffle, inout uint seed, out uint previousIndex,
-                        out Hit previousHit) {
+bool restirFindPrevious(Hit hit, vec4 previousPosition, bool gi, bool shuffle, inout uint seed, out uint previousIndex,
+                        out Hit previousHit, out vec3 previousV) {
     previousIndex = 0;
-    vec4 previousPosition = instances[instanceIndex].motion * vec4(hit.position, 1.0);
+    previousV = vec3(0.0, 0.0, 1.0);
     if ((scene.previousViewProjection * previousPosition).w <= 0.0) {
         return false;  // behind last frame's camera
     }
@@ -3352,11 +3446,13 @@ bool restirFindPrevious(Hit hit, uint instanceIndex, bool gi, bool shuffle, inou
         if (gi ? giReservoirs[index].M == 0.0 : reservoirs[index].light == RESTIR_NOT_USED) {
             continue;
         }
-        Hit surface = unpackRestirSurface(restirSurfaces[index]);
-        float depth = (scene.previousViewProjection * vec4(surface.position, 1.0)).w;
+        RestirSurface stored = restirSurfaces[index];
+        Hit surface = unpackRestirSurface(stored);
+        float depth = (scene.previousViewProjection * vec4(stored.seenAt, 1.0)).w;
         if (dot(surface.normal, hit.normal) >= 0.5 && abs(depth - expectedDepth) <= 0.1 * max(depth, expectedDepth)) {
             previousIndex = index;
             previousHit = surface;
+            previousV = restirSurfaceView(stored);  // last frame's view
             return true;
         }
     }
@@ -3375,18 +3471,18 @@ bool restirFindPrevious(Hit hit, uint instanceIndex, bool gi, bool shuffle, inou
 // frame's own sample doesn't: it may come from older frames, but the image pass tested it from that surface and
 // set W = 0 if blocked (without that test the merge came out too bright: Sponza +2.6%). Then the weights add up to
 // 1 for every sample either surface can produce: no bias.
-Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
+Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, vec4 previousPoint, inout uint seed) {
     if (scene.restirTemporal == 0 || scene.restirHistoryValid == 0) {
         return r;
     }
     uint previousIndex;
     Hit previousHit;
-    if (!restirFindPrevious(hit, hit.instanceIndex, false, (scene.restirPermutation & 16u) != 0u, seed, previousIndex,
-                            previousHit)) {
+    vec3 previousV;
+    if (!restirFindPrevious(hit, previousPoint, false, (scene.restirPermutation & 16u) != 0u, seed, previousIndex,
+                            previousHit, previousV)) {
         return r;
     }
     Reservoir previous = reservoirs[previousIndex];
-    vec3 previousV = normalize(scene.previousCameraPosition.xyz - previousHit.position);
     float previousM = min(previous.M, scene.restirMaxHistory * r.M);
 
     // Targets of both samples at both surfaces
@@ -3421,12 +3517,16 @@ Reservoir restirTemporal(Reservoir r, Hit hit, vec3 v, inout uint seed) {
 void restirPass(ivec2 pixel, ivec2 size) {
     uint seed = pixelSeed(pixel);
     startPathSamples(pixel, 0u);
-    vec3 direction = sampleCameraRay(pixel, size, seed);
+    vec3 cameraDirection = sampleCameraRay(pixel, size, seed);
+    vec3 direction = cameraDirection;
     Intersection intersection;
-    vec3 origin = scene.cameraPosition.xyz;
-    bool found = intersectClosest(origin, direction, seed, intersection);
-    storePrimaryHit(pixel, found, intersection, seed);
-    found = found && intersection.travelled == 0.0;  // seen through a portal: no ReSTIR (see PRIMARY_THROUGH_PORTAL)
+    Hit hit;
+    vec3 tint;
+    float travelled;
+    bool throughPortal;
+    bool found = traceCameraRay(pixel, direction, seed, intersection, hit, tint, travelled, throughPortal);
+    storePrimaryHit(pixel, found, intersection, seed, throughPortal, travelled, direction, tint);
+    found = found && !throughPortal;  // seen through a portal: no ReSTIR (see PRIMARY_THROUGH_PORTAL)
 
     Reservoir reservoir;
     reservoir.light = RESTIR_NOT_USED;
@@ -3434,9 +3534,11 @@ void restirPass(ivec2 pixel, ivec2 size) {
     reservoir.W = 0.0;
     reservoir.M = 0.0;
     if (found) {
-        // The same surface the image pass will see (see tracePath's first bounce)
-        Hit hit = hitFromIntersection(intersection, direction, 0.0, scene.pixelSpreadAngle);
-        tiltTowardsViewer(hit, direction);
+        // The same surface the image pass will see (see tracePath's first bounce). Where the camera sees it, and
+        // where that was last frame (as restirPreviousPoint).
+        vec3 seenAt = travelled > 0.0 ? scene.cameraPosition.xyz + cameraDirection * (travelled + hit.t) : hit.position;
+        vec4 previousPoint = travelled > 0.0 ? vec4(seenAt, 1.0)
+                                             : instances[hit.instanceIndex].motion * vec4(hit.position, 1.0);
         if (restirSurface(hit) && scene.restirDi != 0) {
             // Random numbers of their own: the image pass goes on with the pixel's (its bounce directions must
             // not depend on which light was picked)
@@ -3458,10 +3560,10 @@ void restirPass(ivec2 pixel, ivec2 size) {
                     reservoir.W = 0.0;
                 }
             }
-            reservoir = restirTemporal(reservoir, hit, -direction, candidateSeed);
+            reservoir = restirTemporal(reservoir, hit, -direction, previousPoint, candidateSeed);
         }
         if (restirSurface(hit)) {
-            restirSurfaces[restirIndex(pixel, false)] = packRestirSurface(hit);
+            restirSurfaces[restirIndex(pixel, false)] = packRestirSurface(hit, seenAt, -direction);
         }
     }
     reservoirs[restirSpatialOn() ? restirTemporalIndex(pixel) : restirIndex(pixel, false)] = reservoir;
@@ -3494,8 +3596,9 @@ float restirSpatialCanonicalMis(Reservoir canonical, RestirLightPoint canonicalP
         }
         ivec2 neighbor = pixel + restirNeighborOffset(n, start, scene.restirSpatialRadius);
         float M = reservoirs[restirTemporalIndex(neighbor)].M;
-        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
-        float canonicalThere = restirTargetAt(canonicalPoint, surface, normalize(scene.cameraPosition.xyz - surface.position));
+        RestirSurface stored = restirSurfaces[restirIndex(neighbor, false)];
+        Hit surface = unpackRestirSurface(stored);
+        float canonicalThere = restirTargetAt(canonicalPoint, surface, restirSurfaceView(stored));
         if (canonicalThere > 0.0 && !restirVisible(canonical, surface, seed)) {
             canonicalThere = 0.0;
         }
@@ -3538,9 +3641,10 @@ void restirSpatial(ivec2 pixel, ivec2 size) {
         reservoirs[ownIndex] = canonical;
         return;
     }
-    Hit hit = unpackRestirSurface(restirSurfaces[ownIndex]);
-    vec3 v = normalize(scene.cameraPosition.xyz - hit.position);
-    float depth = dot(hit.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+    RestirSurface own = restirSurfaces[ownIndex];
+    Hit hit = unpackRestirSurface(own);
+    vec3 v = restirSurfaceView(own);
+    float depth = restirSurfaceDepth(own);
     uint seed = pcgHash(pixelSeed(pixel) ^ 0x2545f491u);
     vec2 start = vec2(randomFloat(seed), randomFloat(seed));
     bool disoccluded = canonical.M <= restirFreshCount() + 0.5;
@@ -3560,8 +3664,9 @@ void restirSpatial(ivec2 pixel, ivec2 size) {
         if (r.light == RESTIR_NOT_USED) {
             continue;
         }
-        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
-        float neighborDepth = dot(surface.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+        RestirSurface stored = restirSurfaces[restirIndex(neighbor, false)];
+        Hit surface = unpackRestirSurface(stored);
+        float neighborDepth = restirSurfaceDepth(stored);
         if (dot(surface.normal, hit.normal) >= 0.5 && abs(neighborDepth - depth) <= 0.1 * max(neighborDepth, depth)
                 && abs(surface.roughness - hit.roughness) <= 0.25) {
             used |= 1u << n;
@@ -3588,8 +3693,9 @@ void restirSpatial(ivec2 pixel, ivec2 size) {
         }
         ivec2 neighbor = pixel + restirNeighborOffset(n, start, scene.restirSpatialRadius);
         Reservoir r = reservoirs[restirTemporalIndex(neighbor)];
-        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
-        vec3 neighborV = normalize(scene.cameraPosition.xyz - surface.position);
+        RestirSurface stored = restirSurfaces[restirIndex(neighbor, false)];
+        Hit surface = unpackRestirSurface(stored);
+        vec3 neighborV = restirSurfaceView(stored);
         float share = (r.M + canonicalM) / mSum;
         // The canonical sample's weight for this comparison
         if (canonicalHere > 0.0) {
@@ -3668,20 +3774,21 @@ float restirGiTarget(Hit hit, vec3 v, GiReservoir r) {
 // to the fresh sample. Last frame's own sample needs none: shading dropped it (W = 0) if its surface didn't see it.
 bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed);
 GiReservoir restirGiTemporal(GiReservoir r, ivec2 pixel) {
-    Hit hit = unpackRestirSurface(restirSurfaces[restirIndex(pixel, false)]);
+    RestirSurface own = restirSurfaces[restirIndex(pixel, false)];
+    Hit hit = unpackRestirSurface(own);
     uint seed = pcgHash(pixelSeed(pixel) ^ 0x68e31da4u);
     uint previousIndex;
     Hit previousHit;
-    if (!restirFindPrevious(hit, primaryHits[primaryHitIndex(pixel)].instanceIndex, true,
-                            scene.restirGiPermutation != 0, seed, previousIndex, previousHit)) {
+    vec3 previousV;
+    if (!restirFindPrevious(hit, restirPreviousPoint(own, primaryHits[primaryHitIndex(pixel)].instanceIndex), true,
+                            scene.restirGiPermutation != 0, seed, previousIndex, previousHit, previousV)) {
         return r;
     }
     GiReservoir previous = giReservoirs[previousIndex];
     if ((previous.age & 0xFFFFu) >= scene.restirGiMaxAge) {
         return r;  // held long enough (its Lo may be out of date too)
     }
-    vec3 v = normalize(scene.cameraPosition.xyz - hit.position);
-    vec3 previousV = normalize(scene.previousCameraPosition.xyz - previousHit.position);
+    vec3 v = restirSurfaceView(own);
     float previousM = min(previous.M, scene.restirGiMaxHistory * r.M);
 
     // Targets of both samples at both surfaces, per solid angle at this one
@@ -3757,8 +3864,8 @@ void restirGiTemporalPass(ivec2 pixel, bool inside) {
     if (scene.restirGiBoilingFilter > 0.0) {
         float weight = 0.0;
         if (r.W > 0.0) {
-            Hit hit = unpackRestirSurface(restirSurfaces[restirIndex(pixel, false)]);
-            weight = restirGiTarget(hit, normalize(scene.cameraPosition.xyz - hit.position), r) * r.W;
+            RestirSurface own = restirSurfaces[restirIndex(pixel, false)];
+            weight = restirGiTarget(unpackRestirSurface(own), restirSurfaceView(own), r) * r.W;
         }
         giBoilingWeights[gl_LocalInvocationIndex] = weight;
         barrier();
@@ -3804,8 +3911,9 @@ bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed) {
 // A neighbor's surface for the GI spatial pass: as DI's test (normals within 60 degrees, view depths within 10%,
 // roughness within 0.25), and as RTXDI's, diffuse albedos (luminance) within 0.25: the target weighs a sample by
 // the surface's BRDF, so a dark and a bright surface prefer different ones.
-bool restirGiSimilar(Hit hit, float depth, Hit surface) {
-    float surfaceDepth = dot(surface.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+bool restirGiSimilar(Hit hit, float depth, RestirSurface stored) {
+    Hit surface = unpackRestirSurface(stored);
+    float surfaceDepth = restirSurfaceDepth(stored);
     return dot(surface.normal, hit.normal) >= 0.5 && abs(surfaceDepth - depth) <= 0.1 * max(surfaceDepth, depth)
            && abs(surface.roughness - hit.roughness) <= 0.25
            && abs(luminance(surface.albedo) - luminance(hit.albedo)) <= 0.25;
@@ -3829,8 +3937,9 @@ float restirGiSpatialCanonicalMis(GiReservoir canonical, float canonicalArea, fl
         }
         ivec2 neighbor = pixel + restirNeighborOffset(n, start, scene.restirGiSpatialRadius);
         float M = giReservoirs[restirGiFreshIndex(neighbor)].M;
-        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
-        float there = restirGiAreaTarget(surface, normalize(scene.cameraPosition.xyz - surface.position), canonical);
+        RestirSurface stored = restirSurfaces[restirIndex(neighbor, false)];
+        Hit surface = unpackRestirSurface(stored);
+        float there = restirGiAreaTarget(surface, restirSurfaceView(stored), canonical);
         if (there > 0.0 && !restirGiVisible(surface, canonical.position, canonical.normal, seed)) {
             there = 0.0;
         }
@@ -3852,9 +3961,10 @@ void restirGiSpatial(ivec2 pixel, ivec2 size) {
         giReservoirs[ownIndex] = canonical;
         return;
     }
-    Hit hit = unpackRestirSurface(restirSurfaces[ownIndex]);
-    vec3 v = normalize(scene.cameraPosition.xyz - hit.position);
-    float depth = dot(hit.position - scene.cameraPosition.xyz, scene.cameraForward.xyz);
+    RestirSurface own = restirSurfaces[ownIndex];
+    Hit hit = unpackRestirSurface(own);
+    vec3 v = restirSurfaceView(own);
+    float depth = restirSurfaceDepth(own);
     uint seed = pcgHash(pixelSeed(pixel) ^ 0x3c6ef372u);
     vec2 start = vec2(randomFloat(seed), randomFloat(seed));
     bool disoccluded = canonical.M <= 1.5;
@@ -3874,7 +3984,7 @@ void restirGiSpatial(ivec2 pixel, ivec2 size) {
         if (M == 0.0) {
             continue;
         }
-        if (restirGiSimilar(hit, depth, unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]))) {
+        if (restirGiSimilar(hit, depth, restirSurfaces[restirIndex(neighbor, false)])) {
             used |= 1u << n;
             k += 1.0;
             mSum += M;
@@ -3899,8 +4009,9 @@ void restirGiSpatial(ivec2 pixel, ivec2 size) {
         }
         ivec2 neighbor = pixel + restirNeighborOffset(n, start, scene.restirGiSpatialRadius);
         GiReservoir r = giReservoirs[restirGiFreshIndex(neighbor)];
-        Hit surface = unpackRestirSurface(restirSurfaces[restirIndex(neighbor, false)]);
-        vec3 neighborV = normalize(scene.cameraPosition.xyz - surface.position);
+        RestirSurface stored = restirSurfaces[restirIndex(neighbor, false)];
+        Hit surface = unpackRestirSurface(stored);
+        vec3 neighborV = restirSurfaceView(stored);
         float share = (r.M + canonicalM) / mSum;
         if (canonicalArea > 0.0) {
             float canonicalThere = restirGiAreaTarget(surface, neighborV, canonical);
@@ -3971,7 +4082,8 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
     startPathSamples(pixel, 0u);
     vec3 direction = sampleCameraRay(pixel, size, seed);
     Intersection intersection;
-    if (!loadPrimaryHit(pixel, seed, intersection)) {
+    vec3 tint;
+    if (!loadPrimaryHit(pixel, seed, intersection, direction, tint)) {
         return;
     }
     Hit hit = hitFromIntersection(intersection, direction, 0.0, scene.pixelSpreadAngle);
@@ -3984,7 +4096,8 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
     float side = dot(r.position - hit.position, hit.geometricNormal);
     vec3 l = normalize(r.position - offsetRay(hit.position, side < 0.0 ? -hit.geometricNormal : hit.geometricNormal));
     float pdf;
-    vec3 light = evaluateBrdfWorld(hit, hit.normal, -direction, l, pdf) * abs(dot(hit.normal, l)) * r.radiance * r.W;
+    vec3 light = evaluateBrdfWorld(hit, hit.normal, -direction, l, pdf) * abs(dot(hit.normal, l)) * r.radiance * r.W
+                 * tint;
     // As the image pass's: one of samplesPerPixel paths, and the running average when accumulating
     light /= float(scene.samplesPerPixel);
     if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {

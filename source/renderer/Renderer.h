@@ -104,7 +104,6 @@ struct SceneUniforms {
     uint32_t pathSampling;           // the path's main decisions: 0 = white noise, 1 = Sobol, 2 = Sobol + blue noise
     uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
     uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
-    alignas(16) glm::vec4 previousCameraPosition;  // last frame's camera (std140: a vec4 starts at a multiple of 16)
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
@@ -122,6 +121,10 @@ struct GpuPrimaryHit {
     glm::vec2 barycentrics;
     float t;
     uint32_t seed;
+    float travelled;         // seen in mirrors: the ray's length before its last part (0: no mirror)
+    glm::vec3 direction;     // its last part's direction
+    uint32_t tintRG;         // the mirrors' color (half floats)
+    uint32_t tintB;
 };
 
 // One per render pixel, binding 28: the image path's first bounce at a ReSTIR surface, traced by the ReSTIR pass as
@@ -167,6 +170,8 @@ struct GpuRestirSurface {
     uint32_t albedoRoughness;
     uint32_t material;
     uint32_t diffuseTransmissionColor;
+    glm::vec3 seenAt;        // where the camera sees it (in mirrors: its image)
+    uint32_t view;           // towards the viewer (octahedral)
 };
 
 // Must match the push constants in shaders/cache_resolve.comp
@@ -701,7 +706,6 @@ private:
     bool restirLightsChanged = false;  // this frame uploads new lights (their indices may have changed)
     uint32_t restirCurrentHalf = 0;
     bool restirGiHistoryAvailable = false;  // ReSTIR GI ran last frame, at this size
-    glm::vec3 previousCameraPosition = glm::vec3(0.0f);
 
     // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
     // from this frame's position to last frame's (object motion). Binding 12, uploaded every frame.
