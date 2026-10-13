@@ -18,7 +18,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
 layout(constant_id = 1) const uint RESTIR_PASS = 0;
 // FOG = 1: some material has fog inside or an invisible surface (see "Fog"). Each pass has a pipeline without the fog's
-// code too, for scenes without: it costs registers (168 instead of 128), and with them 12% of the time, fog or not.
+// code too, for scenes without: less code (image paths 289 KB instead of 366, varying fog 396). The register counts
+// don't follow the size: the driver gives the plain image paths 168 and the fog ones 128 (2026-10-13).
 layout(constant_id = 2) const uint FOG = 0;
 // FEATURES: which of the scene features below the pipeline has the code for (a bit each, all by default). Without one,
 // the scene must not use it: the code assumes it away (no portals, lamps, glass, cut-outs or diffuse transmission).
@@ -47,7 +48,7 @@ layout(binding = 17, r32f) uniform writeonly image2D specularHitDistanceImage; /
 // radiance: on average 1 - the fog's transmittance up to the first surface. For the fog grain (display.comp).
 layout(binding = 33, r32f) uniform image2D fogAmountImage;
 
-// Must match SceneUniforms in Application.h
+// Must match SceneUniforms in Renderer.h
 layout(binding = 3) uniform SceneUniforms {
     mat4 viewProjection;          // this frame, without jitter: world -> clip (Vulkan: y down)
     mat4 previousViewProjection;  // last frame's
@@ -76,7 +77,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint shadowsEnabled;
     uint accumulatedFrames; // frames already averaged into radianceImage (0 = start over)
     uint accumulate;        // 0 = show only this frame
-    uint debugView;         // 0 = path traced, otherwise one property of the first hit, see DebugView in Application.h
+    uint debugView;         // 0 = path traced, otherwise one property of the first hit, see DebugView in Renderer.h
     uint emissiveTriangleCount;
     uint emissiveSampling;  // 0 = bounces only, 1 = light sampling only, 2 = both with MIS
     uint blurCaustics;      // 1 = path regularization, see tracePath
@@ -92,7 +93,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint sunMis;            // 1 = the sun has a size: bounce rays find it too, shared with its shadow rays by MIS
     float sunPdf;           // pdf of a shadow ray towards the sun: 1 / the disc's solid angle
     float sunRadianceScale; // sunColor * this = the light of one point of the disc
-    uint textureMipmaps;    // 1 = textures are read at the level that fits the hit's footprint (ray cones, see traceClosest)
+    uint textureMipmaps;    // 1 = textures are read at the level that fits the hit's footprint (ray cones, see uvFootprint)
     float pixelSpreadAngle; // angle between neighboring camera rays (radians): how fast a pixel's footprint grows
     uint normalMapFiltering; // 1 = bumps that a normal map's smaller levels average away widen the reflection (Toksvig)
     uint restirDi;          // 1 = ReSTIR DI: the RESTIR_PASS traced the camera rays and picked a light sample per pixel
@@ -126,7 +127,7 @@ layout(binding = 3) uniform SceneUniforms {
     float restirGiRadianceClamp;    // 0 = off; else the most a GI sample's Lo may be (luminance)
     uint restirGiTemporalVisibility;  // 1 = the temporal reuse is unbiased (a ray from last frame's surface)
     uint pathSampling;              // the path's main decisions (pathSample): 0 = white noise, 1 = Sobol, 2 = + blue noise
-    uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see triangleSolidAngle), 0 = by area
+    uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see sphericalSolidAngle), 0 = by area
     uint portalCount;               // entries in the portal list (binding 31): two per pair
     float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
 } scene;
@@ -148,7 +149,7 @@ struct Vertex {
     vec4 tangent;   // xyz: direction in which U grows, w: +-1 bitangent sign
 };
 
-// Must match MeshInfo in Application.h. All meshes share the vertex and index buffers;
+// Must match MeshInfo in GpuAssets.h. All meshes share the vertex and index buffers;
 // this says where one mesh's part starts. Indices are relative to the mesh's first vertex.
 struct MeshInfo {
     uint materialIndex;
@@ -168,7 +169,7 @@ layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
 layout(binding = 5, scalar) readonly buffer Indices { uint indices[]; };
 layout(binding = 6, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
 
-// Must match GpuMaterial in Application.h. Each value is a constant, multiplied by its texture if the index is >= 0.
+// Must match GpuMaterial in Renderer.h. Each value is a constant, multiplied by its texture if the index is >= 0.
 struct Material {
     vec4 baseColor;         // linear RGB + alpha
     vec3 emissive;          // light given off, already multiplied by the strength
@@ -199,7 +200,7 @@ struct Material {
     int diffuseTransmissionColorTexture; // RGB: tint
     mat3x2 diffuseTransmissionUvTransform;
     mat3x2 diffuseTransmissionColorUvTransform;
-    int normalVarianceTexture;     // R: the bumps the normal map's level averages away, as GGX alpha (see traceClosest)
+    int normalVarianceTexture;     // R: the bumps the normal map's level averages away, as GGX alpha (see hitFromIntersection)
     float fogDensity;              // fog inside the closed mesh, per unit of distance; 0 = none (see "Fog")
     vec3 fogColor;                 // the share of the light it scatters that goes on
     float fogForward;              // Henyey-Greenstein g of its scattering (fogPhase)
@@ -223,7 +224,7 @@ const uint ALPHA_OPAQUE = 0;
 const uint ALPHA_MASK = 1;
 const uint ALPHA_BLEND = 2;
 
-// Must match EmissiveTriangle in Application.h. Every triangle of every glowing instance, in world space.
+// Must match EmissiveTriangle in Renderer.h. Every triangle of every glowing instance, in world space.
 struct EmissiveTriangle {
     vec3 p0, p1, p2;
     vec2 uv0, uv1, uv2;
@@ -241,7 +242,7 @@ layout(binding = 10, scalar) readonly buffer InstanceFirstLight { int instanceFi
 // entry [roughness * SIZE + view angle], total for a given F0 = F0 * x + y.
 layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbedo[]; };
 
-// Per TLAS instance. Must match GpuInstance in Application.h.
+// Per TLAS instance. Must match GpuInstance in Renderer.h.
 struct InstanceData {
     mat4 motion;         // takes a point on it from this frame's world position to last frame's (object motion);
                          // identity for objects that didn't move
@@ -251,7 +252,7 @@ struct InstanceData {
 };
 layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
 
-// The camera rays' hits (RESTIR_PASS), one per render pixel, row by row. Must match GpuPrimaryHit in Application.h.
+// The camera rays' hits (RESTIR_PASS), one per render pixel, row by row. Must match GpuPrimaryHit in Renderer.h.
 struct PrimaryHit {
     uint meshIndex;      // ~0: the camera ray hit nothing, PRIMARY_THROUGH_PORTAL: it crossed a portal (not stored)
     uint instanceIndex;
@@ -271,7 +272,7 @@ layout(binding = 25, scalar) buffer PrimaryHits { PrimaryHit primaryHits[]; };
 // sees it), and the image pass traces the ray again itself
 const uint PRIMARY_THROUGH_PORTAL = 0xFFFFFFFDu;
 // The first bounce of the image path at a ReSTIR surface, picked and traced by the RESTIR_PASS as its BRDF
-// candidate (see restirCandidates), one per render pixel. Must match GpuBounceHit in Application.h.
+// candidate (see restirCandidates), one per render pixel. Must match GpuBounceHit in Renderer.h.
 struct BounceHit {
     uint meshIndex;      // ~0: the ray left the scene, BOUNCE_NONE: no bounce (the path ends at the first surface)
     uint instanceIndex;
@@ -287,7 +288,7 @@ struct BounceHit {
 layout(binding = 28, scalar) buffer BounceHits { BounceHit bounceHits[]; };
 const uint BOUNCE_NONE = 0xFFFFFFFEu;
 const uint BOUNCE_RETRACE = 4u << 24;
-const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Application::specularAlbedoSize
+const uint SPECULAR_ALBEDO_SIZE = 32;  // must match Renderer::specularAlbedoSize
 
 const uint EMISSIVE_BOUNCES_ONLY = 0;
 const uint EMISSIVE_LIGHT_SAMPLING = 1;
@@ -305,7 +306,7 @@ layout(binding = 21) uniform sampler2D environmentMap;
 // environmentHeight rows, then for each row the running sums over its environmentWidth columns.
 layout(binding = 22, scalar) readonly buffer EnvironmentDistribution { float environmentCdf[]; };
 
-// Must match GpuPunctualLight in Application.h. The lights that came with the models (KHR_lights_punctual), in
+// Must match GpuPunctualLight in Renderer.h. The lights that came with the models (KHR_lights_punctual), in
 // world space: points, spots and directional lights without size, so only shadow rays reach them.
 struct PunctualLight {
     vec3 position;
@@ -321,7 +322,7 @@ const uint LIGHT_DIRECTIONAL = 0;
 const uint LIGHT_POINT = 1;
 const uint LIGHT_SPOT = 2;
 
-// Must match LightTreeNode in Application.h. A binary tree over the glowing triangles that light sampling can pick,
+// Must match LightTreeNode in Renderer.h. A binary tree over the glowing triangles that light sampling can pick,
 // node 0 is the root (see buildLightTree in Lights.cpp and pickFromLightTree below).
 struct LightTreeNode {
     vec3 boundsMin;
@@ -625,7 +626,7 @@ float opacityAt(uint materialIndex, vec2 uv) {
     return alpha;
 }
 
-// Decides whether a ray hits or passes through a cut-out surface at a candidate hit (see traceClosest).
+// Decides whether a ray hits or passes through a cut-out surface at a candidate hit (see traverse).
 // A see-through (blend) surface stops a ray with chance alpha. Over many rays, alpha of the light is stopped
 // and 1 - alpha passes, which is exactly what blending means: no sorting of transparent layers needed.
 bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed, bool invisibleCounts) {
@@ -643,9 +644,10 @@ bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed,
     return opacity >= 1.0 || (opacity > 0.0 && randomFloat(seed) < opacity);
 }
 
-// The traversal loop. Hits on opaque instances are accepted by the hardware on its own. Instances with
-// cut-out materials are flagged "not opaque" in the TLAS (see updateScene): for those, the traversal stops
-// at every hit as a "candidate" and the shader decides whether it counts. Confirmed hits shorten the ray,
+// The traversal loop. Hits on opaque instances are accepted by the hardware on its own. Instances a ray can pass
+// through (cut-outs, glass, fog) are flagged "not opaque" in the TLAS (see updateScene): for those, the traversal stops
+// at every hit as a "candidate" and the shader decides whether it counts (unless PATH_RAY_FLAGS makes the ray treat
+// everything as opaque: no cut-outs or fog in this pipeline). Confirmed hits shorten the ray,
 // so the closest confirmed one ends up committed. invisibleCounts: surfaces of invisible materials are hits too
 // (intersectClosest goes on through them itself, following which fog the ray is in); else they are passed.
 // passed: the instance and triangle (x, y) the ray has just gone through (intersectClosest), and the one before (z, w),
@@ -733,8 +735,9 @@ struct Intersection {
 //
 // Media. A path keeps which fog volumes it is in (its "media": up to MAX_MEDIA instances, packed: the first slots taken,
 // the free ones after them, so loops over them stop at the first free one; see enterMedium), and changes
-// them where it goes through a volume's surface: invisible ones in intersectClosest, glass ones where the path refracts
-// (tracePath). A volume is an instance, not a material: the same fog material on two objects is two volumes, each with
+// them where it goes through a volume's surface: invisible ones in intersectClosest, others where the path passes
+// through the surface (tracePath; thin glass too), and at a portal's partner (mediumAt, in intersectClosest). A volume
+// is an instance, not a material: the same fog material on two objects is two volumes, each with
 // its own part of the noise, and where volumes overlap their densities add up. Where the camera is: mediumAt. A ray that
 // leaves fog it didn't know it was in (one too many at once, or one mediumAt didn't see) catches up: the stretch before
 // was inside it.
@@ -1101,7 +1104,7 @@ struct Portal {
     vec3 normal;         // the side it faces
     float halfHeight;
     vec3 right;          // along its width; its height is along cross(normal, right)
-    uint shape;          // PORTAL_RECTANGLE, PORTAL_ELLIPSE
+    uint shape;          // 0 rectangle, PORTAL_ELLIPSE (PortalShape in Portal.h)
     mat4x3 toPartner;
 };
 layout(binding = 31, scalar) readonly buffer Portals { Portal portals[]; };
@@ -1111,8 +1114,6 @@ const uint MAX_PORTAL_CROSSINGS = 8;
 // is left out, so a portal set flush into a wall shows what is behind its partner, not the wall.
 const float PORTAL_GAP = 1e-3;
 
-// The nearest opening a ray crosses before maxT, and its distance t; -1: none. skip: an end to leave out (the one
-// the ray just came out of: it starts on that plane).
 // Whether a ray crosses end i's opening before maxT, and where (t)
 bool portalOpeningHit(uint i, vec3 origin, vec3 direction, float maxT, out float t) {
     vec3 normal = portals[i].normal;
@@ -1127,6 +1128,8 @@ bool portalOpeningHit(uint i, vec3 origin, vec3 direction, float maxT, out float
     return portals[i].shape == PORTAL_ELLIPSE ? dot(p, p) <= 1.0 : max(abs(p.x), abs(p.y)) <= 1.0;
 }
 
+// The nearest opening a ray crosses before maxT, and its distance t; -1: none. skip: an end to leave out (the one
+// the ray just came out of: it starts on that plane).
 int nearestPortal(vec3 origin, vec3 direction, float maxT, int skip, out float t) {
     t = maxT;
     int nearest = -1;
@@ -1149,8 +1152,9 @@ bool portalBetween(vec3 origin, vec3 direction, float distance) {
 // The closest hit along a ray (cut-outs decided with seed, see traverse), through portals and invisible surfaces:
 // origin and direction become the last part's (the hit's t is along it). false: nothing hit, the ray leaves the
 // scene along direction; or, with travelled = -1, it was lost in portals; or, with inFog, it scattered in fog first.
-// media: the fog volumes it starts in (see "Fog"), changed by the invisible surfaces it goes through. fogU >= 0: it may
-// scatter in fog (the first step is picked with fogU, later ones with seed); -1: it passes fog unchanged.
+// media: the fog volumes it starts in (see "Fog"), changed by the invisible surfaces it goes through and, for rays
+// that may scatter, looked up again past each portal (mediumAt). fogU >= 0: it may scatter in fog (the first step is
+// picked with fogU, later ones with seed); -1: it passes fog unchanged.
 bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, inout uvec2 media, float fogU,
                       out Intersection hit) {
     hit.travelled = 0.0;
@@ -1894,7 +1898,8 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
         uint material = mediumMaterial(firstMedium(rest));
         fogInside += fogVaries(material) ? 0.0 : materials[material].fogDensity;
     }
-    // (Cache update paths have no light images: a second part made them take 168 registers instead of 128)
+    // (One part without portals. Cache update paths have no light images: a second part made them take 168 registers
+    // instead of 128)
     [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 || !FEATURE_PORTALS ? 1u : 2u); part++) {
         // Up to the opening it must go through (part 0 of a light image), or to the end; any other opening blocks
         float portalT = maxDistance;
@@ -1913,8 +1918,8 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
                 rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
                 continue;
             }
-            // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass):
-            // whatever is read early stays in registers through the tests, on top of the whole path's state.
+            // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass and
+            // even fog): whatever is read early stays in registers through the tests, on top of the whole path's state.
             MeshInfo mesh = meshInfos[rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false)];
             uint firstIndex = mesh.indexOffset + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false)) * 3;
             uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
@@ -1967,7 +1972,7 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
                 vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
                                     + vertices[corner.z].normal * weights.z;
                 if (dot(outward, smoothNormal * worldToObject) < 0.0) {
-                    outward = -outward;  // as in traceClosest: the vertex normals define the outside
+                    outward = -outward;  // as in hitFromIntersection: the vertex normals define the outside
                 }
             }
             float cosTheta = dot(normalize(outward), direction);
@@ -2596,7 +2601,7 @@ const uint LIGHT_KIND_TRIANGLE = 1;        // a glowing triangle; point: barycen
 const uint LIGHT_KIND_PUNCTUAL = 2;        // a punctual light
 const uint LIGHT_KIND_SKY = 3;             // the sky; point: see encodeSkyPoint
 
-// Must match GpuReservoir in Application.h
+// Must match GpuReservoir in Renderer.h
 struct Reservoir {
     uint light;   // kind << 30 | index
     uint point;   // where on the light
@@ -2606,7 +2611,7 @@ struct Reservoir {
 layout(binding = 26, scalar) buffer Reservoirs { Reservoir reservoirs[]; };  // 3 parts of one per render pixel
 
 // What the reuse needs to know about a pixel's first surface: enough for its target (restirTarget) without its
-// textures. 48 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Application.h.
+// textures. 48 bytes; the material in 8 bits per value. Must match GpuRestirSurface in Renderer.h.
 struct RestirSurface {
     vec3 position;
     uint normal;             // octahedral, 2 x 16 bits
@@ -2732,7 +2737,7 @@ bool restirSurface(Hit hit) {
 // reused right next to its surface, would get a huge weight. As RTXDI, a reuse with J outside 1/10..10 is skipped,
 // and J is clamped to 1/3..3 (a bias: some light lost near corners, for fewer fireflies).
 
-// Must match GpuGiReservoir in Application.h
+// Must match GpuGiReservoir in Renderer.h
 struct GiReservoir {
     vec3 position;   // x2
     uint normal;     // x2's geometric normal, towards x1 (octahedral)
@@ -3536,8 +3541,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // Otherwise a glossy table reflecting the window would only get the shadow rays, which rarely hit its narrow
     // reflection: fireflies. So the sky needs to know about solid glass, and the last reflection's pdf.
     bool throughSolidGlass = false;  // went through solid glass since the last reflection
-    // Portals gone through since the last reflection. Light sampling reaches the sun through one of them (light
-    // images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing surface, the
+    // Portals gone through since the last reflection. Light sampling reaches the sun and the punctual lights through
+    // one of them (light images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing surface, the
     // sky, the sun after two) counts fully, and isn't that surface's direct light for the radiance cache either
     // (paths that end in the cache rely on shadow rays for that).
     uint portalCrossings = 0;
@@ -4856,7 +4861,8 @@ void restirGiShade(ivec2 pixel, ivec2 size) {
 }
 
 // Debug view "ReSTIR light": the kind of light each pixel's sample is on. Glowing triangle: orange, punctual light:
-// purple, sky: blue, none found: dark red, blocked (W = 0, set by the image pass's shadow ray): black. Grey: no ReSTIR.
+// purple, sky: blue, none found: dark red, blocked (W = 0, set by the ReSTIR passes' visibility rays; the image pass
+// doesn't run in this view): black. Grey: no ReSTIR.
 vec3 restirDebugLight(ivec2 pixel) {
     if (scene.restirDi == 0) {
         return vec3(0.05);

@@ -151,6 +151,7 @@ void Renderer::createLogicalDevice(){
 
     // Features are enabled through a pNext chain:
     // features2 -> vulkan13Features -> vulkan12Features -> accelerationStructureFeatures -> rayQueryFeatures
+    // -> atomicFloatFeatures (-> executableFeatures)
     VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rayQueryFeatures.rayQuery = VK_TRUE;
@@ -632,7 +633,7 @@ bool checkDeviceExtensionSupport(VkPhysicalDevice device) {
     return requiredExtensions.empty();
 }
 
-// Same chain as in createLogicalDevice, but queried to see what the GPU supports.
+// Part of createLogicalDevice's chain (not the 1.3 and atomic float features), queried to see what the GPU supports.
 bool checkDeviceFeatureSupport(VkPhysicalDevice device) {
     VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;

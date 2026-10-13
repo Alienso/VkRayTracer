@@ -128,7 +128,8 @@ void Renderer::updateExposureDescriptorSet() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
-// Recorded right after the trace dispatch. Skipped (no cost) while exposure is manual or a debug view is shown.
+// Recorded right after the trace dispatch. Skipped (no cost) while exposure is manual or a debug view other than the
+// radiance cache's is shown.
 void Renderer::recordExposure(VkCommandBuffer commandBuffer) {
     // This frame slot's fence was waited on before recording: its copy from a few frames ago is complete.
     if (exposureInfoValid || exposureWasAuto) {

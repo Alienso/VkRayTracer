@@ -1,7 +1,7 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
 
-// Display pass: exposure and tone mapping. Turns the linear HDR image (path traced; later DLSS output) into the
+// Display pass: exposure and tone mapping. Turns the linear HDR image (path traced, or DLSS's output) into the
 // 8-bit image that gets blitted to the swapchain. Kept out of the trace shader so that whatever sits between
 // the two (DLSS) gets linear, unbounded input. One thread per output pixel, in 8x8 tiles.
 //
@@ -27,7 +27,7 @@ layout(binding = 9, rgba16f) uniform readonly image2D historyImage;  // last fra
 layout(binding = 10, rgba32f) uniform readonly image2D radianceImage;  // the trace shader's output, render size
 layout(binding = 11, r32f) uniform readonly image2D fogAmountImage;    // how much fog the camera sees, render size
 
-// Must match DisplayPushConstants in Application.h
+// Must match DisplayPushConstants in Renderer.h
 layout(push_constant) uniform DisplaySettings {
     float exposure;     // manual multiplier, or the compensation (2^stops) on top of the measured exposure
     uint autoExposure;  // 1 = also multiply by measuredExposure
@@ -39,7 +39,7 @@ layout(push_constant) uniform DisplaySettings {
     uint frame;           // a new grain pattern every frame
 } display;
 
-// Must match DisplayView in Application.h
+// Must match DisplayView in Renderer.h
 const uint VIEW_COLOR = 0;
 const uint VIEW_PASS_THROUGH = 1;  // a trace shader debug view: values as they are
 const uint VIEW_DEPTH = 2;

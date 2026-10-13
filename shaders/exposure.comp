@@ -18,7 +18,7 @@ layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;  // the image di
 
 const uint BIN_COUNT = 256;  // bin 0: black (ignored), bins 1..255: log2(luminance) from minLog2 to minLog2 + log2Range
 
-// Must match ExposureState in Application.h
+// Must match ExposureState in Renderer.h
 layout(binding = 1, scalar) buffer ExposureState {
     uint histogram[BIN_COUNT];      // filled by pass 0, emptied by pass 1
     uint lastHistogram[BIN_COUNT];  // a copy for the UI
@@ -30,7 +30,7 @@ layout(binding = 1, scalar) buffer ExposureState {
     uint meteredPixels;             // pixels in the histogram without the black ones (weighted)
 } state;
 
-// Must match ExposurePushConstants in Application.h
+// Must match ExposurePushConstants in Renderer.h
 layout(push_constant, scalar) uniform PushConstants {
     uint pass;
     uint reset;           // 1 = jump straight to the target (start, or auto exposure just switched on)

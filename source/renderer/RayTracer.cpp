@@ -1,5 +1,5 @@
 //
-// Ray tracing: scene geometry, acceleration structures, output images and the compute pipeline.
+// Ray tracing: acceleration structures, output images, descriptors, the trace pipelines, the uniforms and the passes.
 //
 
 #include <unordered_map>

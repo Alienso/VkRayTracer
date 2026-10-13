@@ -63,7 +63,7 @@ struct SceneUniforms {
     uint32_t cacheUpdateTile;        // one update path per cacheUpdateTile x cacheUpdateTile pixels
     uint32_t lightTree;              // 1 = light sampling picks glowing triangles with the light tree (LightPicking)
     // Derived from the sun values above, once here instead of per pixel: kept in registers through the whole path,
-    // they made the trace shader slower (see updateUniforms)
+    // they made the trace shader slower (see buildSceneUniforms)
     uint32_t sunOn;                  // 1 = the sun gives light
     uint32_t sunMis;                 // 1 = the sun has a size, so bounce rays find it too (MIS with its shadow rays)
     float sunPdf;                    // 1 / the disc's solid angle: the pdf of a shadow ray towards it
@@ -143,8 +143,8 @@ struct GpuBounceHit {
     float pdf;
 };
 
-// Two per render pixel (this frame's and last frame's), binding 26: ReSTIR DI's light sample. Must match Reservoir in
-// shaders/raytrace.comp.
+// Three per render pixel (this frame's, last frame's, and the ReSTIR pass's result for the spatial pass), binding 26:
+// ReSTIR DI's light sample. Must match Reservoir in shaders/raytrace.comp.
 struct GpuReservoir {
     uint32_t light;
     uint32_t point;
@@ -705,10 +705,10 @@ private:
 
 
     // Two sizes (chooseExtents): the path tracer renders at renderExtent, the display pass writes outputExtent
-    // (the window, or bigger: Settings::outputSize). Equal in accumulation mode; DLSS renders smaller and upscales.
+    // (the window, or bigger: RenderSettings::outputSize). Equal in accumulation mode; DLSS renders smaller and upscales.
     VkExtent2D renderExtent{};
     VkExtent2D outputExtent{};
-    int activeOutputSize = 0;  // the Settings::outputSize the images are built for
+    int activeOutputSize = 0;  // the RenderSettings::outputSize the images are built for
 
     // Ray tracing output at render size, recreated with the swapchain
     VkImage radianceImage;  // linear HDR: running average while accumulating, else this frame (or a debug view)
@@ -728,7 +728,7 @@ private:
     VkDeviceMemory primaryHitMemory = VK_NULL_HANDLE;
     VkBuffer bounceHitBuffer = VK_NULL_HANDLE;   // GpuBounceHit per render pixel (ReSTIR: first bounce traced early)
     VkDeviceMemory bounceHitMemory = VK_NULL_HANDLE;
-    VkBuffer reservoirBuffer = VK_NULL_HANDLE;   // GpuReservoir per render pixel, this frame's and last frame's
+    VkBuffer reservoirBuffer = VK_NULL_HANDLE;   // GpuReservoir per render pixel, three parts (see GpuReservoir)
     VkDeviceMemory reservoirMemory = VK_NULL_HANDLE;
     VkBuffer restirSurfaceBuffer = VK_NULL_HANDLE;  // GpuRestirSurface per render pixel, this frame's and last frame's
     VkDeviceMemory restirSurfaceMemory = VK_NULL_HANDLE;
@@ -741,7 +741,7 @@ private:
     bool restirGiHistoryAvailable = false;  // ReSTIR GI ran last frame, at this size
 
     // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
-    // from this frame's position to last frame's (object motion). Binding 12, uploaded every frame.
+    // from this frame's position to last frame's (object motion). Binding 12, uploaded when the instances change.
     glm::mat4 previousViewProjection = glm::mat4(1.0f);
     bool hasPreviousViewProjection = false;
     uint32_t jitterIndex = 0;
@@ -753,7 +753,7 @@ private:
 
     VkDescriptorSetLayout rtDescriptorSetLayout;
     VkDescriptorPool rtDescriptorPool;
-    VkDescriptorSet rtDescriptorSet = VK_NULL_HANDLE;  // null until created, see loadScene
+    VkDescriptorSet rtDescriptorSet = VK_NULL_HANDLE;  // null until init creates it; updateScene runs before that
     VkPipelineLayout rtPipelineLayout;
     VkPipeline rtPipeline;
     VkPipeline rtCacheUpdatePipeline;  // the same shader with CACHE_UPDATE_PASS = 1
@@ -763,8 +763,8 @@ private:
     VkPipeline rtRestirGiTemporalPipeline;  // RESTIR_PASS = 4: ReSTIR GI's temporal reuse, before its shading
     VkPipeline rtRestirGiSpatialPipeline;   // RESTIR_PASS = 5: ReSTIR GI's spatial reuse, between those two
     // The same seven with FOG = 1, used while some material has fog inside or an invisible surface, and with FOG = 2
-    // while some fog varies through its volume (fogLevel). The fog's code costs registers, and with them time, even
-    // where there is no fog.
+    // while some fog varies through its volume (fogLevel). Scenes without fog use the plain ones, which leave the fog's
+    // code out (smaller; the register counts don't follow the size, see FOG in the shader).
     VkPipeline rtFogPipelines[2][7] = {};
     uint32_t fogLevel = 0;  // this frame's FOG (buildSceneUniforms)
     VkPipeline tracePipeline(VkPipeline plain) const;  // plain, or its fog version in a fog scene
@@ -877,7 +877,7 @@ private:
     VkPipelineLayout displayPipelineLayout;
     VkPipeline displayPipeline;
 
-    // GPU time of each pass (trace, exposure, display): timestamps before and after them, one set of queries
+    // GPU time of each pass (cache, ReSTIR, trace, DLSS, exposure, display): timestamps before and after them, one set of queries
     // per frame in flight, read when that frame slot is recorded again. Smoothed over ~20 frames, in ms.
     static constexpr uint32_t timestampsPerFrame = 7;  // before the cache, after cache / ReSTIR / trace / DLSS / exposure / display
     VkQueryPool timestampQueryPool = VK_NULL_HANDLE;
@@ -1057,7 +1057,7 @@ private:
     // Display.cpp
     void chooseExtents();
     void applyOutputSize();
-    // Settings::outputSize -> rows of the output image (0: the window's); names in buildRenderModeUi
+    // RenderSettings::outputSize -> rows of the output image (0: the window's); names in buildRenderModeUi
     static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
     void recreateRenderImages();
     VkImageView displayedHdrView() const;  // what exposure and display read: DLSS output or the radiance image

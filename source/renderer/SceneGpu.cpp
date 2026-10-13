@@ -15,7 +15,7 @@
 #include "renderer/Renderer.h"
 
 // Can a ray pass through parts of this material? Then the shader has to look at every hit on it:
-// for holes (alpha), and so shadow rays can pass through glass, tinted.
+// for holes (alpha), so shadow rays can pass through glass, tinted, and for the surfaces of fog volumes.
 static bool needsHitTest(const Material& material) {
     return material.alphaMode != AlphaMode::Opaque || material.transmission > 0.0f || material.fogDensity > 0.0f ||
            material.invisibleSurface;
@@ -91,14 +91,15 @@ void Renderer::updateScene() {
             instance.transform = toVkTransform(world);
             instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
             const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
-            // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt and the shadow
-            // rays through varying fog look at alone: 0x02 even fog, 0x04 varying (see "Fog" there)
+            // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt looks at alone:
+            // 0x02 even fog, 0x04 varying (see "Fog" there). The rest: 0x01.
             instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : 0x01;
             instance.instanceShaderBindingTableRecordOffset = 0;
             instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-            // Cut-out (alpha) materials are "not opaque": every ray asks the shader whether a hit on them counts.
-            // Everything else stays on the fast path where the hardware decides alone. A material change remakes
-            // the instances, so switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
+            // Materials a ray can pass through (needsHitTest) are "not opaque": rays ask the shader whether a hit on
+            // them counts (except in the basic shader without fog, whose rays treat everything as opaque). Everything
+            // else stays on the fast path where the hardware decides alone. A material change remakes the instances,
+            // so switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
             instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
                                                      : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
             instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;

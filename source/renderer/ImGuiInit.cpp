@@ -83,7 +83,7 @@ void Renderer::buildRenderingUi() {
                           "errors differ too: fine-grained noise instead of blotches, easier for DLSS to filter.");
     }
     ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 64);
-    ImGui::TextDisabled("1 = direct sunlight only, more = light bouncing between surfaces");
+    ImGui::TextDisabled("1 = direct light only (sun, sky, lamps, glowing surfaces), more = light bouncing between surfaces");
     ImGui::Combo("Emissive light", &settings.emissiveSampling,
                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
     ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");
@@ -164,7 +164,7 @@ void Renderer::buildRestirUi() {
     ImGui::SliderInt("BRDF candidates", &settings.restirBrdfCandidates, 0, 4);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip("Light candidates: points on glowing triangles (light tree), each per pixel and frame.\n"
-                          "Sky candidates: directions picked by the sky's brightness (HDR maps only).\n"
+                          "Sky candidates: directions picked by the sky's brightness (whenever the sky is sampled: see Sample the sky).\n"
                           "BRDF candidates: directions the surface reflects into, a ray each (the light a glossy\n"
                           "surface mirrors).");
     }

@@ -22,7 +22,7 @@ layout(binding = 1, rgba32f) uniform image2D referenceImage;
 // x = measured luminance, y = reference luminance, z = pixel count.
 layout(binding = 2, scalar) writeonly buffer GroupSums { vec4 groupSums[]; };
 
-// Must match NoisePushConstants in Application.h
+// Must match NoisePushConstants in Renderer.h
 layout(push_constant, scalar) uniform PushConstants {
     uint pass;
     float floorLuminance;  // see above

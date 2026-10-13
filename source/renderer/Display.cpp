@@ -34,7 +34,7 @@ void Renderer::chooseExtents() {
     renderExtent = dlssActive() ? dlssRenderExtent(activeRenderMode, outputExtent) : outputExtent;
 }
 
-// A new Settings::outputSize: new images. Called once per frame before drawing.
+// A new RenderSettings::outputSize: new images. Called once per frame before drawing.
 void Renderer::applyOutputSize() {
     settings.outputSize = std::clamp(settings.outputSize, 0, static_cast<int>(std::size(outputHeights)) - 1);
     if (settings.outputSize == activeOutputSize) {
@@ -174,7 +174,7 @@ void Renderer::createDisplayResources() {
     vkDestroyShaderModule(device, shaderModule, nullptr);
 }
 
-// The images are recreated with the swapchain; called from recreateSwapChain.
+// The images are recreated with the swapchain, the output size and the render mode; called from recreateRenderImages.
 void Renderer::updateDisplayDescriptorSet() {
     VkImageView views[displayBindingCount] = {
             displayedHdrView(), displayImageView, VK_NULL_HANDLE,

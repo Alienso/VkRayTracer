@@ -471,6 +471,6 @@ void Renderer::buildNoiseUi() {
         ImGui::SetTooltip("rel. MSE: mean of ((frame - reference) / reference)^2 over the image (luminance).\n"
                           "Unbiased: halves when the frame count doubles. Stops shrinking: biased.\n"
                           "brightness: the frame's total light compared to the reference's.\n"
-                          "region: the same inside the rectangle below (light leaking into a corner shows up there).");
+                          "region: the same inside the Region rectangle above (light leaking into a corner shows up there).");
     }
 }

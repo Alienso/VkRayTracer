@@ -263,8 +263,9 @@ void Renderer::recordLightUpload(VkCommandBuffer commandBuffer) {
 
 // ---------------------------------------------------------------------------------------------
 // Punctual lights (KHR_lights_punctual): point, spot and directional lights that come with a model. They have no
-// size, so no ray can hit them: the shader only reaches them with shadow rays, one per light (see
-// samplePunctualLights). Few lights per scene is the usual case, so there is no light picking here.
+// size, so no ray can hit them: the shader only reaches them with shadow rays, one per light up to 8, else one to a
+// light picked at random (see samplePunctualLight). Few lights per scene is the usual case, so there is no light tree
+// for them.
 
 // This frame's lights in world space, from the render list. Cheap, so every frame; uploaded only on changes.
 void Renderer::buildPunctualLightList() {
