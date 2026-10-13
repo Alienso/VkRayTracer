@@ -120,6 +120,13 @@ void Renderer::buildRenderingUi() {
     ImGui::Checkbox("Blur caustics", &settings.blurCaustics);
     ImGui::TextDisabled("light reflected by shiny surfaces onto matte ones becomes a soft glow\n"
                         "instead of slowly converging sparkles (fireflies)");
+    ImGui::Checkbox("Basic shader", &settings.basicShader);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The trace shader without the code for portals, lamps (punctual lights), glass, cut-outs\n"
+                          "and diffuse transmission: less code, fewer registers, about 14%% faster. The image stays\n"
+                          "the same only in scenes without them: there portals and lamps vanish, glass turns opaque\n"
+                          "and cut-outs solid. Switching rebuilds the shader (the window stands still a few seconds).");
+    }
     buildRadianceCacheUi();
     buildRestirUi();
 

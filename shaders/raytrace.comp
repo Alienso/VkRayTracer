@@ -20,6 +20,17 @@ layout(constant_id = 1) const uint RESTIR_PASS = 0;
 // FOG = 1: some material has fog inside or an invisible surface (see "Fog"). Each pass has a pipeline without the fog's
 // code too, for scenes without: it costs registers (168 instead of 128), and with them 12% of the time, fog or not.
 layout(constant_id = 2) const uint FOG = 0;
+// FEATURES: which of the scene features below the pipeline has the code for (a bit each, all by default). Without one,
+// the scene must not use it: the code assumes it away (no portals, lamps, glass, cut-outs or diffuse transmission).
+layout(constant_id = 3) const uint FEATURES = ~0u;
+const bool FEATURE_PORTALS = (FEATURES & 1u) != 0u;
+const bool FEATURE_LAMPS = (FEATURES & 2u) != 0u;
+const bool FEATURE_GLASS = (FEATURES & 4u) != 0u;
+const bool FEATURE_CUTOUTS = (FEATURES & 8u) != 0u;
+const bool FEATURE_DIFFUSE_TRANSMISSION = (FEATURES & 16u) != 0u;
+// Rays that stop at the first surface whatever it is can let the hardware decide alone (no candidates for the shader)
+const uint PATH_RAY_FLAGS = FEATURE_CUTOUTS || FOG != 0 ? gl_RayFlagsNoneEXT : gl_RayFlagsOpaqueEXT;
+const uint SHADOW_RAY_FLAGS = FEATURE_GLASS || FEATURE_CUTOUTS || FOG != 0 ? gl_RayFlagsNoneEXT : gl_RayFlagsOpaqueEXT;
 
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
@@ -119,6 +130,15 @@ layout(binding = 3) uniform SceneUniforms {
     uint portalCount;               // entries in the portal list (binding 31): two per pair
     float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
 } scene;
+
+// (0 in a pipeline without the feature, so its code drops out)
+uint portalCount() {
+    return FEATURE_PORTALS ? scene.portalCount : 0u;
+}
+
+uint punctualLightCount() {
+    return FEATURE_LAMPS ? scene.punctualLightCount : 0u;
+}
 
 // Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
 struct Vertex {
@@ -564,16 +584,16 @@ void evaluateMaterial(inout Hit hit) {
         hit.metallic *= metallicRoughness.b;
     }
 
-    hit.transmission = material.transmission;
-    if (material.transmissionTexture >= 0) {
+    hit.transmission = FEATURE_GLASS ? material.transmission : 0.0;
+    if (FEATURE_GLASS && material.transmissionTexture >= 0) {
         hit.transmission *= sampleTexture(material.transmissionTexture, material.transmissionUvTransform, hit).r;
     }
     hit.ior = material.ior;
     hit.solid = material.solid != 0;
     hit.absorption = material.absorption;
 
-    hit.diffuseTransmission = material.diffuseTransmission;
-    if (material.diffuseTransmissionTexture >= 0) {
+    hit.diffuseTransmission = FEATURE_DIFFUSE_TRANSMISSION ? material.diffuseTransmission : 0.0;
+    if (FEATURE_DIFFUSE_TRANSMISSION && material.diffuseTransmissionTexture >= 0) {
         hit.diffuseTransmission *= sampleTexture(material.diffuseTransmissionTexture, material.diffuseTransmissionUvTransform, hit).a;
     }
     hit.diffuseTransmissionColor = material.diffuseTransmissionColor;
@@ -592,7 +612,7 @@ void evaluateMaterial(inout Hit hit) {
 // texture). Mask is all or nothing at the cutoff; blend is in between. Opaque materials ignore alpha.
 float opacityAt(uint materialIndex, vec2 uv) {
     Material material = materials[materialIndex];
-    if (material.alphaMode == ALPHA_OPAQUE) {
+    if (!FEATURE_CUTOUTS || material.alphaMode == ALPHA_OPAQUE) {
         return 1.0;
     }
     float alpha = material.baseColor.a;
@@ -639,7 +659,8 @@ bool notPassed(rayQueryEXT rayQuery, uvec4 passed) {
 
 void traverse(rayQueryEXT rayQuery, inout uint seed, bool invisibleCounts, uvec4 passed) {
     while (rayQueryProceedEXT(rayQuery)) {
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+        if (PATH_RAY_FLAGS == gl_RayFlagsNoneEXT &&
+            rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
             (FOG == 0 || notPassed(rayQuery, passed)) &&
             candidateIsSolid(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
                              rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
@@ -707,8 +728,8 @@ struct Intersection {
 // light going a distance d through fog of density s, exp(-s * d) gets through; the rest scatters: the share fogColor
 // of it goes on in a new direction (fogPhase), the rest is absorbed. Its surface is either invisible (Material.invisible:
 // rays pass it unchanged, only the fog shows: haze, smoke, a cloud) or the material's own (solid glass with fog inside:
-// murky water, milky glass). The built-in "Fog box" is a cube of invisible fog. The density is the same throughout
-// ("even"), or varies from point to point (see "Varying density" below).
+// murky water, milky glass; thin glass: a bubble of smoke). The built-in "Fog box" is a cube of invisible fog. The
+// density is the same throughout ("even"), or varies from point to point (see "Varying density" below).
 //
 // Media. A path keeps which fog volumes it is in (its "media": up to MAX_MEDIA instances, packed: the first slots taken,
 // the free ones after them, so loops over them stop at the first free one; see enterMedium), and changes
@@ -1009,7 +1030,7 @@ vec3 sampleFogDirection(vec3 forward, float g, vec2 u, out float pdf) {
 // kept with a chance of its majorant times its length among all so far
 void addLampSpan(inout Intersection hit, float a, float b, uvec2 media, float majorant, inout uint seed) {
     float weight = majorant * (b - a);
-    if (CACHE_UPDATE_PASS != 0 || scene.punctualLightCount == 0 || !(weight > 0.0)) {
+    if (CACHE_UPDATE_PASS != 0 || punctualLightCount() == 0 || !(weight > 0.0)) {
         return;
     }
     hit.lampWeight += weight;
@@ -1109,7 +1130,7 @@ bool portalOpeningHit(uint i, vec3 origin, vec3 direction, float maxT, out float
 int nearestPortal(vec3 origin, vec3 direction, float maxT, int skip, out float t) {
     t = maxT;
     int nearest = -1;
-    for (uint i = 0; i < scene.portalCount; i++) {
+    for (uint i = 0; i < portalCount(); i++) {
         float distance;
         if (int(i) != skip && portalOpeningHit(i, origin, direction, t, distance)) {
             nearest = int(i);
@@ -1122,7 +1143,7 @@ int nearestPortal(vec3 origin, vec3 direction, float maxT, int skip, out float t
 // Whether a straight ray crosses an opening before distance (it is then blocked, see above)
 bool portalBetween(vec3 origin, vec3 direction, float distance) {
     float t;
-    return scene.portalCount > 0 && nearestPortal(origin, direction, distance, -1, t) >= 0;
+    return portalCount() > 0 && nearestPortal(origin, direction, distance, -1, t) >= 0;
 }
 
 // The closest hit along a ray (cut-outs decided with seed, see traverse), through portals and invisible surfaces:
@@ -1153,7 +1174,7 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
     uvec2 mediaBefore = media;
     for (uint part = 0; part <= MAX_PORTAL_CROSSINGS + MAX_VOLUME_CROSSINGS; part++) {
         float portalT = RAY_FAR;
-        int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, RAY_FAR, skip, portalT) : -1;
+        int portal = portalCount() > 0 ? nearestPortal(origin, direction, RAY_FAR, skip, portalT) : -1;
         float tMax = portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : RAY_FAR;
         bool uneven = false;
         float majorant = FOG != 0 && fog ? mediaMajorant(media, uneven) : 0.0;
@@ -1165,7 +1186,7 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
             fogU = -1.0;
         }
         rayQueryEXT rayQuery;
-        rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, tMin, direction,
+        rayQueryInitializeEXT(rayQuery, tlas, PATH_RAY_FLAGS, 0xFF, origin, tMin, direction,
                               uneven ? tMax : min(tMax, fogT));
         traverse(rayQuery, seed, volumes < MAX_VOLUME_CROSSINGS, passed);
         bool surface = rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
@@ -1252,6 +1273,11 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
         tMin = PORTAL_GAP;
         passedT = -1.0;
         hit.lampWeight = 0.0;  // the lamps' light: only in the last part (see fogLampLight)
+        if (FOG != 0 && fog) {
+            // The partner may be in other fog (or none): the fog the ray goes on in is the fog there. (Rays that only
+            // look pass fog unchanged and skip it.)
+            media = mediumAt(origin);
+        }
     }
     hit.travelled = -1.0;
     return false;
@@ -1869,21 +1895,22 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
         fogInside += fogVaries(material) ? 0.0 : materials[material].fogDensity;
     }
     // (Cache update paths have no light images: a second part made them take 168 registers instead of 128)
-    [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 ? 1u : 2u); part++) {
+    [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 || !FEATURE_PORTALS ? 1u : 2u); part++) {
         // Up to the opening it must go through (part 0 of a light image), or to the end; any other opening blocks
         float portalT = maxDistance;
-        int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, maxDistance, skip, portalT) : -1;
+        int portal = portalCount() > 0 ? nearestPortal(origin, direction, maxDistance, skip, portalT) : -1;
         if (portal != (part == 0 ? throughEnd : -1)) {
             return vec3(0.0);
         }
         rayQueryEXT rayQuery;
-        rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, tMin, direction,
-                              portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : max(maxDistance, tMin));
+        rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT | SHADOW_RAY_FLAGS, 0xFF, origin, tMin,
+                              direction, portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : max(maxDistance, tMin));
         vec3 opticalDepth = vec3(0.0);
         float fogDepth = 0.0;  // even fog: density * (leaving distance - entering distance) over its surfaces
         uvec2 crossed = OUTSIDE;  // varying fog volumes whose surfaces it crosses
         while (rayQueryProceedEXT(rayQuery)) {
-            if (rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            if (SHADOW_RAY_FLAGS != gl_RayFlagsNoneEXT ||
+                rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
                 continue;
             }
             // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass):
@@ -1917,7 +1944,7 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
                     continue;
                 }
             }
-            float transmission = material.transmission;
+            float transmission = FEATURE_GLASS ? material.transmission : 0.0;
             if (transmission > 0.0 && material.transmissionTexture >= 0) {
                 transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
             }
@@ -2422,11 +2449,11 @@ LightSample punctualLightSample(PunctualLight light, vec3 position) {
 // punctualLightCount times (correct on average, noisy with many lights).
 const uint MAX_PUNCTUAL_LIGHTS_PER_HIT = 8;
 uint punctualLightSamples() {
-    uint count = scene.punctualLightCount;
+    uint count = punctualLightCount();
     return count <= MAX_PUNCTUAL_LIGHTS_PER_HIT ? count : 1;
 }
 LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
-    uint count = scene.punctualLightCount;
+    uint count = punctualLightCount();
     if (count <= MAX_PUNCTUAL_LIGHTS_PER_HIT) {
         return punctualLightSample(punctualLights[index], position);
     }
@@ -2447,7 +2474,7 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
 vec3 fogLampLight(vec3 origin, vec3 direction, Intersection stretch, uint bounce, inout uint seed) {
     vec2 span = stretch.lampSpan;
     vec4 u = pathSample(bounce, SAMPLE_FOG, seed);  // x: where the ray scatters (intersectClosest)
-    uint count = scene.punctualLightCount;
+    uint count = punctualLightCount();
     PunctualLight light = punctualLights[min(uint(u.y * float(count)), count - 1)];
     float t, pdf;
     if (light.type == LIGHT_DIRECTIONAL) {
@@ -2508,7 +2535,7 @@ LightSample portalLightImage(uint end, uint which, vec3 position, inout uint see
         s.mis = scene.sunMis != 0 ? MIS_UNLESS_GLASS : MIS_NONE;
         s.shadowed = true;
     } else {
-        uint count = scene.punctualLightCount;
+        uint count = punctualLightCount();
         uint index = which - 1;
         float scale = 1.0;
         if (count > MAX_PUNCTUAL_LIGHTS_PER_HIT) {
@@ -2657,7 +2684,7 @@ Hit unpackRestirSurface(RestirSurface surface) {
     vec4 material = unpackUnorm4x8(surface.material);
     hit.metallic = material.x;
     hit.ior = 1.0 + 2.0 * material.y;
-    hit.diffuseTransmission = material.z;
+    hit.diffuseTransmission = FEATURE_DIFFUSE_TRANSMISSION ? material.z : 0.0;
     hit.diffuseTransmissionColor = unpackUnorm4x8(surface.diffuseTransmissionColor).rgb;
     hit.transmission = 0.0;  // ReSTIR surfaces have none
     return hit;
@@ -2839,7 +2866,7 @@ bool isGlassAt(uint materialIndex, vec2 uv) {
     if (FOG != 0 && material.invisible != 0) {
         return true;  // (fog: invisible surfaces)
     }
-    float transmission = material.transmission;
+    float transmission = FEATURE_GLASS ? material.transmission : 0.0;
     if (transmission > 0.0 && material.transmissionTexture >= 0) {
         transmission *= sampleTextureFull(material.transmissionTexture, material.transmissionUvTransform, uv).r;
     }
@@ -2852,7 +2879,8 @@ bool isGlassAt(uint materialIndex, vec2 uv) {
 
 bool isGlassHit(Intersection hit) {
     MeshInfo mesh = meshInfos[hit.meshIndex];
-    if (materials[mesh.materialIndex].transmission <= 0.0 && (FOG == 0 || materials[mesh.materialIndex].invisible == 0)) {
+    if ((!FEATURE_GLASS || materials[mesh.materialIndex].transmission <= 0.0)
+        && (FOG == 0 || materials[mesh.materialIndex].invisible == 0)) {
         return false;  // almost every hit: no vertex or texture reads
     }
     uint firstIndex = mesh.indexOffset + uint(hit.primitive) * 3;
@@ -2889,14 +2917,15 @@ void storeBounceHit(bool bounces, bool found, Intersection hit, vec3 direction, 
 // Stops at a portal's opening, as shadow rays do: false with travelled = -1 then (no light).
 bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Intersection hit) {
     float portalT = RAY_FAR;
-    int portal = scene.portalCount > 0 ? nearestPortal(origin, direction, RAY_FAR, -1, portalT) : -1;
+    int portal = portalCount() > 0 ? nearestPortal(origin, direction, RAY_FAR, -1, portalT) : -1;
     hit.travelled = 0.0;
     hit.crossings = 0;
     rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, 0xFF, origin, 0.0, direction,
+    rayQueryInitializeEXT(rayQuery, tlas, SHADOW_RAY_FLAGS, 0xFF, origin, 0.0, direction,
                           portal >= 0 ? max(portalT - PORTAL_GAP, 0.0) : RAY_FAR);
     while (rayQueryProceedEXT(rayQuery)) {
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+        if (SHADOW_RAY_FLAGS == gl_RayFlagsNoneEXT &&
+            rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
             blocksLight(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
                         rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
                         rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed)) {
@@ -2948,7 +2977,7 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
             point = packUnorm2x16(weights.yz);
             light = (LIGHT_KIND_TRIANGLE << 30) | uint(index);
         } else if (i < triangles + punctual) {
-            uint count = scene.punctualLightCount;
+            uint count = punctualLightCount();
             uint index = min(uint(randomFloat(seed) * float(count)), count - 1);
             light = (LIGHT_KIND_PUNCTUAL << 30) | index;
         } else if (i < lightCandidates) {
@@ -3032,7 +3061,7 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
         uint kind = light >> 30;
         float sourcePdf;  // sum over the strategies of (number of candidates * pdf), per unit of the light's measure
         if (kind == LIGHT_KIND_PUNCTUAL) {
-            sourcePdf = float(punctual) / float(scene.punctualLightCount);
+            sourcePdf = float(punctual) / float(punctualLightCount());
         } else {
             sourcePdf = (kind == LIGHT_KIND_TRIANGLE ? float(triangles) * pickProbability : float(sky)) * s.pdf
                         + float(scene.restirBrdfCandidates) * brdfPdf * toSolidAngle;
@@ -3606,7 +3635,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             if (reflections == 0 && giState != 2) {
                 cameraRayFog = 1.0;  // the camera sees this fog (see fogAmountImage)
             }
-            hit = fogHit(origin + direction * intersection.t, direction, intersection.travelled + intersection.t, medium);
+            vec3 scatterPoint = origin + direction * intersection.t;
+            // The new direction comes out of a frame built around this one, so its rounding error would grow with
+            // every scatter: after a few dozen (high Max bounces), cosines above 1 made the phase function NaN
+            direction = normalize(direction);
+            hit = fogHit(scatterPoint, direction, intersection.travelled + intersection.t, medium);
             throughput *= materials[medium].fogColor * exp(-materials[medium].absorption * intersection.t);
             if (bounce == 0 && wantGuides) {
                 guidesRetrace = true;  // the guides: of what is behind the fog
@@ -3784,7 +3817,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // (none at a scatter point in the fog: the stretches before take the lamps' light, see fogLampLight)
             uint lightSlots = (restirVertex && scene.restirPunctualCandidates > 0) || (isFog(hit) && CACHE_UPDATE_PASS == 0)
                               ? 3 : 3 + punctualLightSamples();
-            uint imageSlots = CACHE_UPDATE_PASS != 0 ? 0 : scene.portalCount * (1 + punctualLightSamples());
+            uint imageSlots = CACHE_UPDATE_PASS != 0 ? 0 : portalCount() * (1 + punctualLightSamples());
             [[dont_unroll]] for (uint slot = 0; slot < lightSlots + imageSlots; slot++) {
                 LightSample s = noLightSample();
                 int imageEnd = -1;  // the portal end this slot's light is seen through
@@ -3828,8 +3861,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     s = samplePunctualLight(slot - 3, hit.position, seed);
                 } else {
                     uint image = slot - lightSlots;
-                    imageEnd = int(image % scene.portalCount);
-                    s = portalLightImage(uint(imageEnd), image / scene.portalCount, hit.position, seed);
+                    imageEnd = int(image % portalCount());
+                    s = portalLightImage(uint(imageEnd), image / portalCount(), hit.position, seed);
                 }
                 if (all(equal(s.light, vec3(0.0)))) {
                     continue;
@@ -3943,8 +3976,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         if (throughSurface ? side >= 0.0 : side <= 0.0) {
             break;
         }
-        // Through a solid's surface: into its fog or out of it (see "Fog")
-        if (FOG != 0 && throughSurface && hit.solid && materials[hit.materialIndex].fogDensity > 0.0) {
+        // Through the surface of a mesh with fog: into its fog or out of it (see "Fog"). Solid glass, and thin glass
+        // too (a bubble of smoke: it doesn't bend the ray, but the fog is still inside)
+        if (FOG != 0 && throughSurface && materials[hit.materialIndex].fogDensity > 0.0) {
             media = hit.frontFace ? enterMedium(media, hit.instanceIndex) : leaveMedium(media, hit.instanceIndex);
         }
         throughput *= weight;
@@ -4608,7 +4642,7 @@ bool restirGiVisible(Hit hit, vec3 x2, uint x2Normal, inout uint seed) {
         return false;
     }
     rayQueryEXT rayQuery;
-    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, origin, 0.0, direction, stop);
+    rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsTerminateOnFirstHitEXT | PATH_RAY_FLAGS, 0xFF, origin, 0.0, direction, stop);
     traverse(rayQuery, seed, false, uvec4(~0u));
     return rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }

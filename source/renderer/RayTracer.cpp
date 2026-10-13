@@ -705,7 +705,10 @@ void Renderer::createRayTracingPipeline() {
     if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &rtPipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create ray tracing pipeline layout!");
     }
+    createTracePipelines(settings.basicShader);
+}
 
+void Renderer::createTracePipelines(bool basic) {
     VkShaderModule shaderModule = createShaderModule(readFile("raytrace.comp.spv"));
 
     // Seven pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
@@ -713,7 +716,8 @@ void Renderer::createRayTracingPipeline() {
     // (RESTIR_PASS = 2), GI's shading (RESTIR_PASS = 3), temporal (RESTIR_PASS = 4) and spatial reuse
     // (RESTIR_PASS = 5). The constants let the compiler drop the other passes' code from each. And each again with
     // the fog's code (FOG = 1 and 2, see tracePipeline). Compiled on threads of their own: one after the other they
-    // took about 3 seconds each.
+    // took about 3 seconds each. The basic shader (FEATURES = 0): all of them without the code for portals, lamps,
+    // glass, cut-outs and diffuse transmission.
     VkPipeline* pipelines[] = {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline, &rtRestirSpatialPipeline,
                                &rtRestirGiShadePipeline, &rtRestirGiTemporalPipeline, &rtRestirGiSpatialPipeline};
     const uint32_t passes = static_cast<uint32_t>(std::size(pipelines));
@@ -723,11 +727,12 @@ void Renderer::createRayTracingPipeline() {
         uint32_t pass = variant % passes;
         uint32_t fog = variant / passes;
         VkPipeline* pipeline = fog > 0 ? &rtFogPipelines[fog - 1][pass] : pipelines[pass];
-        compilers.emplace_back([this, pass, fog, pipeline, shaderModule, &failed] {
-            uint32_t constants[3] = {pass == 1 ? 1u : 0u, pass >= 2 ? pass - 1 : 0u, fog};
-            VkSpecializationMapEntry entries[3] = {{0, 0, sizeof(uint32_t)}, {1, sizeof(uint32_t), sizeof(uint32_t)},
-                                                   {2, 2 * sizeof(uint32_t), sizeof(uint32_t)}};
-            VkSpecializationInfo specialization{3, entries, sizeof(constants), constants};
+        compilers.emplace_back([this, pass, fog, basic, pipeline, shaderModule, &failed] {
+            uint32_t constants[4] = {pass == 1 ? 1u : 0u, pass >= 2 ? pass - 1 : 0u, fog, basic ? 0u : ~0u};
+            VkSpecializationMapEntry entries[4] = {{0, 0, sizeof(uint32_t)}, {1, sizeof(uint32_t), sizeof(uint32_t)},
+                                                   {2, 2 * sizeof(uint32_t), sizeof(uint32_t)},
+                                                   {3, 3 * sizeof(uint32_t), sizeof(uint32_t)}};
+            VkSpecializationInfo specialization{4, entries, sizeof(constants), constants};
             VkComputePipelineCreateInfo pipelineInfo{};
             pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
             pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -752,6 +757,7 @@ void Renderer::createRayTracingPipeline() {
     }
 
     vkDestroyShaderModule(device, shaderModule, nullptr);
+    basicTraceShader = basic;
 
     if (pipelineStatisticsSupported) {
         rtPipelineStatistics = "Image paths:\n" + readPipelineStatistics(rtPipeline) +
@@ -765,8 +771,35 @@ void Renderer::createRayTracingPipeline() {
                                "Cache update paths with fog:\n" + readPipelineStatistics(rtFogPipelines[0][1]) +
                                "Image paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][0]) +
                                "Cache update paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][1]);
-        std::cout << "Trace shader statistics (from the driver):\n" << rtPipelineStatistics << std::flush;
+        std::cout << "Trace shader statistics (from the driver"
+                  << (basic ? ", basic shader" : "") << "):\n" << rtPipelineStatistics << std::flush;
     }
+}
+
+void Renderer::destroyTracePipelines() {
+    for (VkPipeline* pipeline : {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline, &rtRestirSpatialPipeline,
+                                 &rtRestirGiShadePipeline, &rtRestirGiTemporalPipeline, &rtRestirGiSpatialPipeline}) {
+        vkDestroyPipeline(device, *pipeline, nullptr);
+        *pipeline = VK_NULL_HANDLE;
+    }
+    for (auto& level : rtFogPipelines) {
+        for (VkPipeline& pipeline : level) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+}
+
+// Before a frame: the basic shader switched on or off in the UI. Rebuilds all trace pipelines (a few seconds, the
+// window stands still meanwhile).
+void Renderer::updateTracePipelines() {
+    if (settings.basicShader == basicTraceShader) {
+        return;
+    }
+    vkp.deviceWaitIdle(device);  // the pipelines are replaced, no frame may use them
+    destroyTracePipelines();
+    createTracePipelines(settings.basicShader);
+    resetAccumulation = true;  // a different shader: a different image where the scene has the features
 }
 
 VkPipeline Renderer::tracePipeline(VkPipeline plain) const {
@@ -1254,18 +1287,7 @@ void Renderer::recordInstanceUpload(VkCommandBuffer commandBuffer) {
 }
 
 void Renderer::cleanupRayTracing() {
-    vkDestroyPipeline(device, rtPipeline, nullptr);
-    vkDestroyPipeline(device, rtCacheUpdatePipeline, nullptr);
-    vkDestroyPipeline(device, rtRestirPipeline, nullptr);
-    vkDestroyPipeline(device, rtRestirSpatialPipeline, nullptr);
-    vkDestroyPipeline(device, rtRestirGiShadePipeline, nullptr);
-    vkDestroyPipeline(device, rtRestirGiTemporalPipeline, nullptr);
-    vkDestroyPipeline(device, rtRestirGiSpatialPipeline, nullptr);
-    for (auto& level : rtFogPipelines) {
-        for (VkPipeline pipeline : level) {
-            vkDestroyPipeline(device, pipeline, nullptr);
-        }
-    }
+    destroyTracePipelines();
     destroyVolumeTextures();
     destroyRadianceCache();
     vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);

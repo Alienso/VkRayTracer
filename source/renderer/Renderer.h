@@ -455,6 +455,9 @@ struct RenderSettings {
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
     bool normalMapFiltering = true;  // Toksvig: distant bumpy surfaces keep their blurrier reflection
+    // The trace shader without the code for portals, lamps, glass, cut-outs and diffuse transmission (FEATURES = 0):
+    // ~14% faster, but wrong in scenes that have any of them (see basicTraceShader)
+    bool basicShader = false;
     bool radianceCache = true;      // paths stop after a diffuse bounce and read the light from the cache
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
@@ -765,6 +768,9 @@ private:
     VkPipeline rtFogPipelines[2][7] = {};
     uint32_t fogLevel = 0;  // this frame's FOG (buildSceneUniforms)
     VkPipeline tracePipeline(VkPipeline plain) const;  // plain, or its fog version in a fog scene
+    // Whether the pipelines above were built as the basic shader (settings.basicShader). They are rebuilt when it
+    // changes (updateTracePipelines, before a frame).
+    bool basicTraceShader = false;
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;
@@ -1067,6 +1073,9 @@ private:
     void createRayTracingDescriptors();
     void updateRayTracingDescriptorSet();
     void createRayTracingPipeline();
+    void createTracePipelines(bool basic);
+    void destroyTracePipelines();
+    void updateTracePipelines();
     std::string readPipelineStatistics(VkPipeline pipeline);
     SceneUniforms buildSceneUniforms();
     void recordInstanceUpload(VkCommandBuffer commandBuffer);

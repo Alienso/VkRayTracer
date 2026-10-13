@@ -130,6 +130,7 @@ void Renderer::cleanup() {
 void Renderer::drawFrame() {
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
     deferredDeletion.collect(frameNumber);  // the frame that last used this slot is done: its releases can go
+    updateTracePipelines();
 
     uint32_t imageIndex;
     VkResult result = vkp.acquireNextImage(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
