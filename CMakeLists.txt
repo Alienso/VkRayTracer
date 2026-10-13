@@ -11,19 +11,25 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-par
 include_directories(${PROJECT_SOURCE_DIR}/include/)
 include_directories(${PROJECT_SOURCE_DIR}/source/)  # project headers by folder: "renderer/Renderer.h"
 include_directories(${PROJECT_SOURCE_DIR}/include/imgui/)
-include_directories(C:/VulkanSDK/1.4.363.0/Include/)
 
 link_directories(${PROJECT_SOURCE_DIR}/lib)
-link_directories(C:/VulkanSDK/1.4.363.0/Lib/)
-link_directories(C:/VulkanSDK/1.4.363.0/Lib32/)
 
 if (WIN32)
     link_directories(${PROJECT_SOURCE_DIR}/lib/GLFW/lib-mingw-w64)
 endif(WIN32)
 
-
+# The Vulkan SDK, found through the VULKAN_SDK environment variable its installer sets
 find_package(Vulkan REQUIRED)
-find_program(glslc_executable NAMES glslc HINTS Vulkan::glslc)
+include_directories(${Vulkan_INCLUDE_DIRS})
+# The shader compiler from the same SDK (FindVulkan reports it since CMake 3.19; else look in the SDK's Bin folder)
+if (Vulkan_GLSLC_EXECUTABLE)
+    set(glslc_executable ${Vulkan_GLSLC_EXECUTABLE})
+else()
+    find_program(glslc_executable NAMES glslc HINTS "$ENV{VULKAN_SDK}/Bin")
+endif()
+if (NOT glslc_executable)
+    message(FATAL_ERROR "glslc not found: install the Vulkan SDK (it sets VULKAN_SDK)")
+endif()
 
 add_executable(vulkanDemo main.cpp
         include/imgui/imgui.cpp include/imgui/imgui.h
@@ -50,7 +56,7 @@ add_executable(vulkanDemo main.cpp
         source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
         include/cgltf/cgltf.h)
 
-target_link_libraries(vulkanDemo glfw3 gdi32 vulkan-1)
+target_link_libraries(vulkanDemo glfw3 gdi32 Vulkan::Vulkan)
 
 #add_custom_command(TARGET vulkanDemo PRE_BUILD
 #        COMMAND ${CMAKE_COMMAND} -E copy_directory

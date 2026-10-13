@@ -3473,6 +3473,9 @@ bool primaryHitStored(ivec2 pixel) {
 
 // ---------------------------------------------------------------------------------------------
 
+// The current path's camera ray scattered in fog (see fogAmountImage)
+float cameraRayFog = 0.0;
+
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
 // storeGuides: write the DLSS inputs of this path (the first hit, and the distance to the second if the first
 // bounce reflected) for this thread's pixel. usePrimaryHit: the camera ray's hit is this pixel's stored one
@@ -3484,9 +3487,6 @@ bool primaryHitStored(ivec2 pixel) {
 // near the point where the GPU fits fewer pixels at a time, or moves values out to slow memory (the Debug tab
 // shows both: register count and local memory). Recomputing something cheap, reading it from the uniforms, or
 // storing it right away is usually faster than keeping it.
-// The current path's camera ray scattered in fog (see fogAmountImage)
-float cameraRayFog = 0.0;
-
 vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, bool usePrimaryHit) {
     // The sun is a small glowing disc in the sky. Its total light (PI * sunColor, see below) is spread evenly
     // over the disc's solid angle. Like glowing triangles, it is found both by shadow rays aimed at it and by

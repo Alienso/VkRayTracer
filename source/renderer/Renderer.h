@@ -160,7 +160,7 @@ struct GpuGiReservoir {
     glm::vec3 radiance;
     float W;
     float M;
-    uint32_t unused;
+    uint32_t age;  // frames since the sample was found (bits 0-15), GI_SEEN flag; written by the shader only
 };
 
 // Two per render pixel, binding 27: the first surface, packed, for ReSTIR's reuse. Must match RestirSurface in
