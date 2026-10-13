@@ -130,5 +130,5 @@ void Renderer::createBlueNoiseTexture() {
 
 void Renderer::destroyBlueNoiseTexture() {
     vkDestroyBuffer(device, blueNoiseBuffer, nullptr);
-    vkFreeMemory(device, blueNoiseMemory, nullptr);
+    vmaFreeMemory(allocator, blueNoiseMemory);
 }

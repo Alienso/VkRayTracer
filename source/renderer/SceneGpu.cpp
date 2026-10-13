@@ -267,7 +267,7 @@ void Renderer::syncSceneGeometry() {
             indicesNeeded += meshes[m].indices.size();
         }
     }
-    auto place = [&](RangeAllocator& ranges, VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize elementSize,
+    auto place = [&](RangeAllocator& ranges, VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize elementSize,
                      uint32_t count, uint64_t& stillNeeded, uint32_t& offset) {
         if (!ranges.allocate(count, offset)) {
             // The added end is free and holds all that is still needed (this mesh included)
@@ -315,56 +315,76 @@ void Renderer::syncSceneGeometry() {
         gpuAssets.indexRanges.grow(minGeometryCapacity);
     }
 
-    // 3: the new meshes' data, through one staging buffer, each copied to its range
-    VkDeviceSize vertexBytes = 0;
-    VkDeviceSize indexBytes = 0;
+    // 3: the new meshes' data, each copied to its range through a staging buffer of at most 64 MB: filled, copied,
+    //    filled again. (One buffer for the whole load would take as much system memory as the load: 0.7 GB for Jungle
+    //    Ruins.) A mesh may be split across fillings.
+    VkDeviceSize totalBytes = 0;
     for (size_t m : added) {
-        vertexBytes += meshes[m].vertices.size() * sizeof(GpuVertex);
-        indexBytes += meshes[m].indices.size() * sizeof(uint32_t);
+        totalBytes += meshes[m].vertices.size() * sizeof(GpuVertex) + meshes[m].indices.size() * sizeof(uint32_t);
     }
-    if (vertexBytes + indexBytes > 0) {
+    if (totalBytes > 0) {
+        const VkDeviceSize stagingBytes = std::min<VkDeviceSize>(totalBytes, 64ull << 20);
         VkBuffer stagingBuffer;
-        VkDeviceMemory stagingMemory;
-        createBuffer(vertexBytes + indexBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VmaAllocation stagingMemory;
+        createBuffer(stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
         uint8_t* mapped;
-        vkMapMemory(device, stagingMemory, 0, vertexBytes + indexBytes, 0, reinterpret_cast<void**>(&mapped));
+        vmaMapMemory(allocator, stagingMemory, reinterpret_cast<void**>(&mapped));
         std::vector<VkBufferCopy> vertexCopies;
         std::vector<VkBufferCopy> indexCopies;
-        VkDeviceSize vertexAt = 0;
-        VkDeviceSize indexAt = vertexBytes;
+        VkDeviceSize used = 0;
+        auto flush = [&]() {
+            if (used == 0) {
+                return;
+            }
+            immediateSubmit([&](VkCommandBuffer cmd) {
+                if (!vertexCopies.empty()) {
+                    vkCmdCopyBuffer(cmd, stagingBuffer, gpuAssets.vertexBuffer, static_cast<uint32_t>(vertexCopies.size()),
+                                    vertexCopies.data());
+                }
+                if (!indexCopies.empty()) {
+                    vkCmdCopyBuffer(cmd, stagingBuffer, gpuAssets.indexBuffer, static_cast<uint32_t>(indexCopies.size()),
+                                    indexCopies.data());
+                }
+            });
+            vertexCopies.clear();
+            indexCopies.clear();
+            used = 0;
+        };
+        // Copies count elements (written into the staging buffer by fill(destination, first, n)) to element offset
+        // `offset` of the target buffer, in as many pieces as needed
+        auto upload = [&](std::vector<VkBufferCopy>& copies, VkDeviceSize elementSize, size_t count, uint32_t offset,
+                          auto&& fill) {
+            for (size_t done = 0; done < count;) {
+                if (stagingBytes - used < elementSize) {
+                    flush();
+                }
+                size_t n = std::min<size_t>(count - done, (stagingBytes - used) / elementSize);
+                fill(mapped + used, done, n);
+                copies.push_back({used, (offset + done) * elementSize, n * elementSize});
+                used += n * elementSize;
+                done += n;
+            }
+        };
         for (size_t m : added) {
             const Mesh& mesh = meshes[m];
             const MeshGeometry& geometry = gpuAssets.meshGeometry[ids[m]];
-            VkDeviceSize size = mesh.vertices.size() * sizeof(GpuVertex);
-            if (size > 0) {
-                GpuVertex* packed = reinterpret_cast<GpuVertex*>(mapped + vertexAt);
-                for (size_t v = 0; v < mesh.vertices.size(); v++) {
-                    packed[v] = packVertex(mesh.vertices[v]);
-                }
-                vertexCopies.push_back({vertexAt, geometry.vertexOffset * sizeof(GpuVertex), size});
-                vertexAt += size;
-            }
-            size = mesh.indices.size() * sizeof(uint32_t);
-            if (size > 0) {
-                std::memcpy(mapped + indexAt, mesh.indices.data(), size);
-                indexCopies.push_back({indexAt, geometry.indexOffset * sizeof(uint32_t), size});
-                indexAt += size;
-            }
+            upload(vertexCopies, sizeof(GpuVertex), mesh.vertices.size(), geometry.vertexOffset,
+                   [&](uint8_t* destination, size_t first, size_t n) {
+                       GpuVertex* packed = reinterpret_cast<GpuVertex*>(destination);
+                       for (size_t v = 0; v < n; v++) {
+                           packed[v] = packVertex(mesh.vertices[first + v]);
+                       }
+                   });
+            upload(indexCopies, sizeof(uint32_t), mesh.indices.size(), geometry.indexOffset,
+                   [&](uint8_t* destination, size_t first, size_t n) {
+                       std::memcpy(destination, mesh.indices.data() + first, n * sizeof(uint32_t));
+                   });
         }
-        vkUnmapMemory(device, stagingMemory);
-        immediateSubmit([&](VkCommandBuffer cmd) {
-            if (!vertexCopies.empty()) {
-                vkCmdCopyBuffer(cmd, stagingBuffer, gpuAssets.vertexBuffer, static_cast<uint32_t>(vertexCopies.size()),
-                                vertexCopies.data());
-            }
-            if (!indexCopies.empty()) {
-                vkCmdCopyBuffer(cmd, stagingBuffer, gpuAssets.indexBuffer, static_cast<uint32_t>(indexCopies.size()),
-                                indexCopies.data());
-            }
-        });
+        flush();
+        vmaUnmapMemory(allocator, stagingMemory);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
-        vkFreeMemory(device, stagingMemory, nullptr);
+        vmaFreeMemory(allocator, stagingMemory);
     }
 
     // 4: the mesh infos, all of them (mesh indices and material indices move when a model is unloaded)
@@ -400,7 +420,7 @@ void Renderer::syncSceneGeometry() {
     }
     if (gpuAssets.meshInfoBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device, gpuAssets.meshInfoBuffer, nullptr);
-        vkFreeMemory(device, gpuAssets.meshInfoBufferMemory, nullptr);
+        vmaFreeMemory(allocator, gpuAssets.meshInfoBufferMemory);
     }
     createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
@@ -408,16 +428,16 @@ void Renderer::syncSceneGeometry() {
 
 // A bigger buffer in place of a full one, with its contents (the first oldSize bytes) copied over on the GPU. The GPU
 // must be idle: the old buffer goes at once. BLASes keep their own copy of the triangles, so they don't mind.
-void Renderer::growGeometryBuffer(VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize oldSize, VkDeviceSize newSize) {
+void Renderer::growGeometryBuffer(VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize oldSize, VkDeviceSize newSize) {
     VkBuffer bigger;
-    VkDeviceMemory biggerMemory;
-    createBuffer(newSize, geometryUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bigger, biggerMemory);
+    VmaAllocation biggerMemory;
+    createBuffer(newSize, geometryUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bigger, biggerMemory, VK_NULL_HANDLE, true);
     if (buffer != VK_NULL_HANDLE) {
         if (oldSize > 0) {
             copyBuffer(buffer, bigger, oldSize);
         }
         vkDestroyBuffer(device, buffer, nullptr);
-        vkFreeMemory(device, memory, nullptr);
+        vmaFreeMemory(allocator, memory);
     }
     buffer = bigger;
     memory = biggerMemory;
@@ -430,7 +450,7 @@ void Renderer::destroySceneGeometry() {
                                   std::pair{&gpuAssets.vertexBuffer, &gpuAssets.vertexBufferMemory}}) {
         if (*buffer != VK_NULL_HANDLE) {
             vkDestroyBuffer(device, *buffer, nullptr);
-            vkFreeMemory(device, *memory, nullptr);
+            vmaFreeMemory(allocator, *memory);
             *buffer = VK_NULL_HANDLE;
             *memory = VK_NULL_HANDLE;
         }
@@ -451,6 +471,6 @@ void Renderer::releaseTexture(const GpuTexture& texture) {
     deferredDeletion.defer(frameNumber, [this, texture] {
         vkDestroyImageView(device, texture.view, nullptr);
         vkDestroyImage(device, texture.image, nullptr);
-        vkFreeMemory(device, texture.memory, nullptr);  // the sampler is shared: it stays
+        vmaFreeMemory(allocator, texture.memory);  // the sampler is shared: it stays
     });
 }

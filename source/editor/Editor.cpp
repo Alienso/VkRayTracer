@@ -24,7 +24,9 @@ void Editor::build() {
                     stats.gpuMemory.budget / 1073741824.0);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Video memory this program uses, and how much it can have without slowing down\n"
-                              "(the driver's estimate, less what other programs use)");
+                              "(the driver's estimate, less what other programs use)\n"
+                              "%u buffers and images in %u memory objects (Vulkan promises 4096 objects)",
+                              stats.gpuMemory.allocations, stats.gpuMemory.memoryObjects);
         }
     }
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);

@@ -47,7 +47,7 @@ void Renderer::createExposureResources() {
         createBuffer(sizeof(ExposureState), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      exposureReadbackBuffers[i], exposureReadbackMemories[i]);
-        vkMapMemory(device, exposureReadbackMemories[i], 0, sizeof(ExposureState), 0, &exposureReadbackMapped[i]);
+        vmaMapMemory(allocator, exposureReadbackMemories[i], &exposureReadbackMapped[i]);
         std::memset(exposureReadbackMapped[i], 0, sizeof(ExposureState));
     }
 
@@ -209,12 +209,12 @@ void Renderer::destroyExposureResources() {
     vkDestroyDescriptorPool(device, exposureDescriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(device, exposureDescriptorSetLayout, nullptr);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        vkUnmapMemory(device, exposureReadbackMemories[i]);
+        vmaUnmapMemory(allocator, exposureReadbackMemories[i]);
         vkDestroyBuffer(device, exposureReadbackBuffers[i], nullptr);
-        vkFreeMemory(device, exposureReadbackMemories[i], nullptr);
+        vmaFreeMemory(allocator, exposureReadbackMemories[i]);
     }
     vkDestroyBuffer(device, exposureBuffer, nullptr);
-    vkFreeMemory(device, exposureMemory, nullptr);
+    vmaFreeMemory(allocator, exposureMemory);
 }
 
 // Part of the "Rendering" section

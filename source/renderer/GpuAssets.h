@@ -14,6 +14,7 @@
 #define VULKANDEMO_GPUASSETS_H
 
 #include <vulkan/vulkan.h>
+#include <vma/vk_mem_alloc.h>
 #include <cstdint>
 #include <functional>
 #include <iterator>
@@ -26,7 +27,7 @@
 struct AccelerationStructure {
     VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     VkDeviceAddress address = 0;
 };
 
@@ -131,7 +132,7 @@ struct MeshGeometry {
 // A texture on the GPU. Samplers are shared between textures with the same settings.
 struct GpuTexture {
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
 };
@@ -145,14 +146,14 @@ struct GpuAssets {
     // the buffers grow when full), one BLAS per mesh, and the mesh infos that tell the shader where each mesh is.
     bool geometryUploaded = false;
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+    VmaAllocation vertexBufferMemory = VK_NULL_HANDLE;
     VkBuffer indexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+    VmaAllocation indexBufferMemory = VK_NULL_HANDLE;
     RangeAllocator vertexRanges;  // in vertices
     RangeAllocator indexRanges;   // in indices
     std::unordered_map<uint64_t, MeshGeometry> meshGeometry;  // key: AssetStore::meshIds()
     VkBuffer meshInfoBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory meshInfoBufferMemory = VK_NULL_HANDLE;
+    VmaAllocation meshInfoBufferMemory = VK_NULL_HANDLE;
     std::vector<MeshInfo> meshInfos;
     std::vector<AccelerationStructure> blases;  // one per mesh
     std::vector<uint64_t> meshIds;              // AssetStore::meshIds() of each BLAS
@@ -169,7 +170,7 @@ struct GpuAssets {
     std::map<uint32_t, VkSampler> samplers;  // key: filter and wrap modes, see getSampler; kept until shutdown
     VkDeviceSize textureMemorySize = 0;      // the sum, for the UI
     VkBuffer materialBuffer;
-    VkDeviceMemory materialBufferMemory;
+    VmaAllocation materialBufferMemory;
     bool materialBufferCreated = false;
     bool materialsDirty = false;  // edited since the last upload: copied in this frame's command buffer
 

@@ -36,17 +36,17 @@ const uint SHADOW_RAY_FLAGS = FEATURE_GLASS || FEATURE_CUTOUTS || FOG != 0 ? gl_
 layout(binding = 0) uniform accelerationStructureEXT tlas;
 // Linear HDR result: the running average over frames while accumulating, otherwise this frame (or a debug
 // view). Exposure and tone mapping happen later, in display.comp.
+// Alpha: the fog amount, the share of camera rays that scattered in fog before any reflection (through glass counts),
+// averaged like the light: on average 1 - the fog's transmittance up to the first surface. For the fog grain
+// (display.comp).
 layout(binding = 1, rgba32f) uniform image2D radianceImage;
 // DLSS inputs ("guides"), all about the first surface the camera ray hits; written only if scene.writeGuides
 layout(binding = 2, r32f) uniform writeonly image2D linearDepthImage;          // view-space depth, sky = farDistance
-layout(binding = 13, rg32f) uniform writeonly image2D motionVectorImage;       // pixels: last frame's position - this
+layout(binding = 13, rg16f) uniform writeonly image2D motionVectorImage;       // pixels: last frame's position - this
 layout(binding = 14, rgba16f) uniform writeonly image2D diffuseAlbedoImage;
 layout(binding = 15, rgba16f) uniform writeonly image2D specularAlbedoImage;
 layout(binding = 16, rgba16f) uniform writeonly image2D normalRoughnessImage;  // world-space normal, roughness in alpha
-layout(binding = 17, r32f) uniform writeonly image2D specularHitDistanceImage; // 0 = unknown
-// The share of camera rays that scattered in fog before any reflection (through glass counts), averaged like the
-// radiance: on average 1 - the fog's transmittance up to the first surface. For the fog grain (display.comp).
-layout(binding = 33, r32f) uniform image2D fogAmountImage;
+layout(binding = 17, r16f) uniform writeonly image2D specularHitDistanceImage; // 0 = unknown
 
 // Must match SceneUniforms in Renderer.h
 layout(binding = 3) uniform SceneUniforms {
@@ -284,7 +284,7 @@ struct InstanceData {
 layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
 // Per object: takes a point on it from this frame's world position to last frame's (object motion); identity for
 // objects that didn't move
-layout(binding = 34, scalar) readonly buffer Motions { mat4 motions[]; };
+layout(binding = 33, scalar) readonly buffer Motions { mat4 motions[]; };
 
 // The inverse of an instance's matrix, without the translation (what normals and directions need). Worked out here
 // rather than stored: 36 bytes less per instance (millions in big scenes).
@@ -3211,12 +3211,14 @@ vec2 projectToPixel(mat4 viewProjection, vec4 point) {
 }
 
 // Motion vector: where the point was on the image last frame minus where it is now, both without jitter.
-// A point behind last frame's camera has no sensible position: no motion then.
+// A point behind last frame's camera has no sensible position: no motion then. One just in front of it can be far
+// off the image: kept within what a half float holds (the image's format).
 vec2 motionVector(vec4 current, vec4 previous) {
     if ((scene.previousViewProjection * previous).w <= 0.0) {
         return vec2(0.0);
     }
-    return projectToPixel(scene.previousViewProjection, previous) - projectToPixel(scene.viewProjection, current);
+    vec2 motion = projectToPixel(scene.previousViewProjection, previous) - projectToPixel(scene.viewProjection, current);
+    return clamp(motion, vec2(-65504.0), vec2(65504.0));
 }
 
 // Rays that hit nothing: far away, moving only with the camera's rotation. The other guides as DLSS RR's guide
@@ -3503,7 +3505,7 @@ bool primaryHitStored(ivec2 pixel) {
 
 // ---------------------------------------------------------------------------------------------
 
-// The current path's camera ray scattered in fog (see fogAmountImage)
+// The current path's camera ray scattered in fog (see radianceImage)
 float cameraRayFog = 0.0;
 
 // Follows one path from the camera through up to maxBounces surfaces and returns the light it carries back.
@@ -3668,7 +3670,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // glass, also what its absorption took on the way (in world units here)
             uint medium = intersection.fogMedium;
             if (reflections == 0 && giState != 2) {
-                cameraRayFog = 1.0;  // the camera sees this fog (see fogAmountImage)
+                cameraRayFog = 1.0;  // the camera sees this fog (see radianceImage)
             }
             vec3 scatterPoint = origin + direction * intersection.t;
             // The new direction comes out of a frame built around this one, so its rounding error would grow with
@@ -4960,12 +4962,12 @@ void main() {
     uint seed = pixelSeed(pixel);
 
     if (scene.debugView == 12 || scene.debugView == 13) {
-        imageStore(radianceImage, pixel, vec4(scene.debugView == 12 ? restirDebugM(pixel) : restirDebugLight(pixel), 1.0));
+        imageStore(radianceImage, pixel, vec4(scene.debugView == 12 ? restirDebugM(pixel) : restirDebugLight(pixel), 0.0));
         return;
     }
     if (scene.debugView != 0) {
         vec3 color = debugColor(cameraRayDirection(vec2(pixel) + 0.5, size), seed);
-        imageStore(radianceImage, pixel, vec4(color, 1.0));
+        imageStore(radianceImage, pixel, vec4(color, 0.0));  // (alpha: no fog grain)
         return;
     }
 
@@ -4992,13 +4994,11 @@ void main() {
     fogAmount /= float(scene.samplesPerPixel);
 
     // Running average: the n-th frame gets weight 1/(n+1), so every frame counts equally.
+    vec4 result = vec4(color, fogAmount);
     if (scene.accumulate != 0 && scene.accumulatedFrames > 0) {
-        vec3 previous = imageLoad(radianceImage, pixel).rgb;
-        color = mix(previous, color, 1.0 / float(scene.accumulatedFrames + 1));
-        fogAmount = mix(imageLoad(fogAmountImage, pixel).r, fogAmount, 1.0 / float(scene.accumulatedFrames + 1));
+        result = mix(imageLoad(radianceImage, pixel), result, 1.0 / float(scene.accumulatedFrames + 1));
     }
-    imageStore(fogAmountImage, pixel, vec4(fogAmount));
     // Stays linear and unbounded. Exposure and tone mapping only affect the displayed image (display.comp),
     // so changing them does not restart accumulation.
-    imageStore(radianceImage, pixel, vec4(color, 1.0));
+    imageStore(radianceImage, pixel, result);
 }

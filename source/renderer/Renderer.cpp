@@ -23,6 +23,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createSurface();
     pickPhysicalDevice();
     createLogicalDevice();
+    createAllocator();
     createSwapChain();
     createImageViews();
     createRenderPass();
@@ -88,6 +89,14 @@ RendererStats Renderer::stats() const {
 // Summed over the device-local heaps. Cheap enough for every frame (the driver keeps the numbers).
 GpuMemory Renderer::gpuMemory() const {
     GpuMemory memory;
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(allocator, budgets);
+    const VkPhysicalDeviceMemoryProperties* heaps;
+    vmaGetMemoryProperties(allocator, &heaps);
+    for (uint32_t heap = 0; heap < heaps->memoryHeapCount; heap++) {
+        memory.memoryObjects += budgets[heap].statistics.blockCount;
+        memory.allocations += budgets[heap].statistics.allocationCount;
+    }
     if (!memoryBudgetSupported) {
         return memory;
     }
@@ -141,6 +150,7 @@ void Renderer::cleanup() {
 
     vkDestroyCommandPool(device, commandPool, nullptr);
     shutdownStreamline();
+    vmaDestroyAllocator(allocator);  // everything allocated from it must be freed by now
     vkDestroyDevice(device, nullptr);
 
     if (Configuration::enableValidationLayers) {
@@ -213,21 +223,21 @@ void Renderer::drawFrame() {
 }
 
 // Uploads `data` through a staging buffer into a new device local buffer.
-void Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+void Renderer::createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& bufferMemory) {
     VkBuffer stagingBuffer;
-    VkDeviceMemory stagingBufferMemory;
+    VmaAllocation stagingBufferMemory;
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
 
     void* mapped;
-    vkMapMemory(device, stagingBufferMemory, 0, size, 0, &mapped);
+    vmaMapMemory(allocator, stagingBufferMemory, &mapped);
     memcpy(mapped, data, (size_t) size);
-    vkUnmapMemory(device, stagingBufferMemory);
+    vmaUnmapMemory(allocator, stagingBufferMemory);
 
     createBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, bufferMemory);
     copyBuffer(stagingBuffer, buffer, size);
 
     vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    vmaFreeMemory(allocator, stagingBufferMemory);
 }
 
 VkDeviceAddress Renderer::getBufferDeviceAddress(VkBuffer buffer) {
@@ -238,7 +248,7 @@ VkDeviceAddress Renderer::getBufferDeviceAddress(VkBuffer buffer) {
 }
 
 // 2D, device local image plus a matching view of all its mip levels. Starts in VK_IMAGE_LAYOUT_UNDEFINED.
-void Renderer::createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory, VkImageView& imageView, uint32_t mipLevels) {
+void Renderer::createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VmaAllocation& imageMemory, VkImageView& imageView, uint32_t mipLevels, bool ownMemory) {
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -252,22 +262,12 @@ void Renderer::createImage(uint32_t width, uint32_t height, VkFormat format, VkI
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    allocationInfo.flags = ownMemory ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+    if (vmaCreateImage(allocator, &imageInfo, &allocationInfo, &image, &imageMemory, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("failed to create image!");
     }
-
-    VkMemoryRequirements memRequirements;
-    vkGetImageMemoryRequirements(device, image, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate image memory!");
-    }
-    vkBindImageMemory(device, image, imageMemory, 0);
 
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -282,49 +282,34 @@ void Renderer::createImage(uint32_t width, uint32_t height, VkFormat format, VkI
 }
 
 void Renderer::createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image) {
-    createImage(extent.width, extent.height, format, usage, image.image, image.memory, image.view);
+    createImage(extent.width, extent.height, format, usage, image.image, image.memory, image.view, 1, true);
 }
 
 void Renderer::destroyImage(RenderImage& image) {
     vkDestroyImageView(device, image.view, nullptr);
     vkDestroyImage(device, image.image, nullptr);
-    vkFreeMemory(device, image.memory, nullptr);
+    vmaFreeMemory(allocator, image.memory);
     image = RenderImage{};
 }
 
-void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+void Renderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VmaAllocation& bufferMemory,
+                            VmaPool pool, bool ownMemory) {
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+    // The memory type: the first that has these properties, as before VMA (with requiredFlags and no usage, VMA picks
+    // the first fitting type too). Buffers whose GPU address we query need memory with the DEVICE_ADDRESS flag: VMA
+    // allocates all its memory that way (createAllocator). A pool: memory set aside for short-lived buffers.
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.requiredFlags = properties;
+    allocationInfo.pool = pool;
+    allocationInfo.flags = ownMemory ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+    if (vmaCreateBuffer(allocator, &bufferInfo, &allocationInfo, &buffer, &bufferMemory, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("failed to create buffer!");
     }
-
-    VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
-
-    // Buffers whose GPU address we query (acceleration structure inputs, scratch, ...)
-    // need memory allocated with the DEVICE_ADDRESS flag.
-    VkMemoryAllocateFlagsInfo allocFlagsInfo{};
-    allocFlagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    allocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
-        allocInfo.pNext = &allocFlagsInfo;
-    }
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate buffer memory!");
-    }
-
-    vkBindBufferMemory(device, buffer, bufferMemory, 0);
 }
 
 void Renderer::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
@@ -362,16 +347,11 @@ void Renderer::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize s
     vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
 }
 
-uint32_t Renderer::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
-    VkPhysicalDeviceMemoryProperties memProperties;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
-    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-        if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
-        }
-    }
-
-    throw std::runtime_error("failed to find suitable memory type!");
+// The memory object an allocation lives in (shared with other allocations unless it got one of its own)
+VkDeviceMemory Renderer::deviceMemoryOf(VmaAllocation allocation) const {
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.deviceMemory;
 }
 
 

@@ -31,7 +31,7 @@ static const char* renderModeName(int mode) {
     return mode >= 0 && mode < static_cast<int>(std::size(names)) ? names[mode] : "?";
 }
 
-// Created when first needed (the reference image takes ~23 MB at 1600x900). The GPU must be idle, so this is
+// Created when first needed (the reference image takes ~6 MB at 1600x900). The GPU must be idle, so this is
 // only called from the UI and from scripted runs, never while frames are in flight.
 void Renderer::ensureNoiseResources() {
     vkp.deviceWaitIdle(device);
@@ -99,11 +99,12 @@ void Renderer::ensureNoiseResources() {
         noiseResourcesCreated = true;
     }
 
-    // Reference image at output size (the size of the displayed image in every mode)
+    // Reference image at output size (the size of the displayed image in every mode). Its luminance only: all that
+    // is compared.
     if (noiseReferenceImage.image == VK_NULL_HANDLE || noiseReferenceExtent.width != outputExtent.width ||
         noiseReferenceExtent.height != outputExtent.height) {
         destroyImage(noiseReferenceImage);
-        createImage(outputExtent, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, noiseReferenceImage);
+        createImage(outputExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, noiseReferenceImage);
         immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -124,9 +125,9 @@ void Renderer::ensureNoiseResources() {
     uint32_t groups = ((outputExtent.width + 15) / 16) * ((outputExtent.height + 15) / 16);
     if (groups > noiseGroupCapacity) {
         for (size_t i = 0; i < noiseSumBuffers.size(); i++) {
-            vkUnmapMemory(device, noiseSumMemories[i]);
+            vmaUnmapMemory(allocator, noiseSumMemories[i]);
             vkDestroyBuffer(device, noiseSumBuffers[i], nullptr);
-            vkFreeMemory(device, noiseSumMemories[i], nullptr);
+            vmaFreeMemory(allocator, noiseSumMemories[i]);
         }
         noiseSumBuffers.resize(Configuration::maxFramesInFlight);
         noiseSumMemories.resize(Configuration::maxFramesInFlight);
@@ -135,7 +136,7 @@ void Renderer::ensureNoiseResources() {
             createBuffer(2 * sizeof(glm::vec4) * groups, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          noiseSumBuffers[i], noiseSumMemories[i]);
-            vkMapMemory(device, noiseSumMemories[i], 0, VK_WHOLE_SIZE, 0, &noiseSumMapped[i]);
+            vmaMapMemory(allocator, noiseSumMemories[i], &noiseSumMapped[i]);
         }
         noiseGroupCapacity = groups;
     }
@@ -396,9 +397,9 @@ void Renderer::destroyNoiseResources() {
     vkDestroyDescriptorSetLayout(device, noiseDescriptorSetLayout, nullptr);
     destroyImage(noiseReferenceImage);
     for (size_t i = 0; i < noiseSumBuffers.size(); i++) {
-        vkUnmapMemory(device, noiseSumMemories[i]);
+        vmaUnmapMemory(allocator, noiseSumMemories[i]);
         vkDestroyBuffer(device, noiseSumBuffers[i], nullptr);
-        vkFreeMemory(device, noiseSumMemories[i], nullptr);
+        vmaFreeMemory(allocator, noiseSumMemories[i]);
     }
     noiseResourcesCreated = false;
 }

@@ -73,7 +73,9 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
   every DLSS guide image.
 - Per-pass GPU timings, and the driver's statistics for the trace shader (registers, binary size, local memory).
 - GPU memory use against the driver's budget. Buffers for ReSTIR and the DLSS guides exist only while those are on,
-  and vertices (28 bytes) and instances (56 bytes) are packed: Jungle Ruins fits in 8 GB at 4K.
+  and vertices (28 bytes) and instances (56 bytes) are packed: Jungle Ruins fits in 8 GB at 4K. Memory comes from
+  AMD's Vulkan Memory Allocator (include/vma, MIT license) in 32 MB blocks: Bistro Exterior and Interior together
+  (4445 buffers and images) take 112 memory objects, well under the 4096 Vulkan promises.
 - A noise measurement panel that compares frames against an accumulated reference.
 
 ## Built-in scenes and objects

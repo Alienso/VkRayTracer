@@ -355,19 +355,11 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
     imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateImage(device, &imageInfo, nullptr, &texture.image) != VK_SUCCESS) {
+    VmaAllocationCreateInfo allocationInfo{};
+    allocationInfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    if (vmaCreateImage(allocator, &imageInfo, &allocationInfo, &texture.image, &texture.memory, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("failed to create volume texture!");
     }
-    VkMemoryRequirements requirements;
-    vkGetImageMemoryRequirements(device, texture.image, &requirements);
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = requirements.size;
-    allocInfo.memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &texture.memory) != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate volume texture memory!");
-    }
-    vkBindImageMemory(device, texture.image, texture.memory, 0);
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = texture.image;
@@ -379,13 +371,13 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
     }
 
     VkBuffer stagingBuffer;
-    VkDeviceMemory stagingMemory;
+    VmaAllocation stagingMemory;
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
     void* mapped;
-    vkMapMemory(device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(allocator, stagingMemory, &mapped);
     std::memcpy(mapped, data, size);
-    vkUnmapMemory(device, stagingMemory);
+    vmaUnmapMemory(allocator, stagingMemory);
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -410,7 +402,7 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
     });
     vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingMemory, nullptr);
+    vmaFreeMemory(allocator, stagingMemory);
     return texture;
 }
 
@@ -441,7 +433,7 @@ void Renderer::destroyVolumeTextures() {
     auto destroy = [&](GpuTexture& texture) {
         vkDestroyImageView(device, texture.view, nullptr);
         vkDestroyImage(device, texture.image, nullptr);
-        vkFreeMemory(device, texture.memory, nullptr);
+        vmaFreeMemory(allocator, texture.memory);
     };
     destroy(gpuAssets.fogNoise);
     for (auto& entry : gpuAssets.distanceFields) {
@@ -509,7 +501,7 @@ bool Renderer::syncDistanceFields() {
     if (slotsChanged && gpuAssets.geometryUploaded) {
         // The mesh infos are small: a new buffer
         vkDestroyBuffer(device, gpuAssets.meshInfoBuffer, nullptr);
-        vkFreeMemory(device, gpuAssets.meshInfoBufferMemory, nullptr);
+        vmaFreeMemory(allocator, gpuAssets.meshInfoBufferMemory);
         createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(),
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
     }

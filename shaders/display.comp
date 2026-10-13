@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_image_load_formatted : require  // hdrImage: no format qualifier
 
 // Display pass: exposure and tone mapping. Turns the linear HDR image (path traced, or DLSS's output) into the
 // 8-bit image that gets blitted to the swapchain. Kept out of the trace shader so that whatever sits between
@@ -8,7 +9,8 @@
 // Also draws the guide debug views: the DLSS input images exactly as the trace shader wrote them.
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;
+// The radiance image (RGBA32F) or DLSS's output (RGBA16F): read without a format qualifier
+layout(binding = 0) uniform readonly image2D hdrImage;
 layout(binding = 1, rgba8) uniform writeonly image2D displayImage;
 // Automatic exposure, measured by exposure.comp from this frame's HDR image just before this pass
 // (only the multiplier is needed here; the histograms before it are skipped: 2 x 256 uints)
@@ -18,14 +20,13 @@ layout(binding = 2, scalar) readonly buffer ExposureState {
 };
 // DLSS inputs, render size (see the trace shader)
 layout(binding = 3, r32f) uniform readonly image2D linearDepthImage;
-layout(binding = 4, rg32f) uniform readonly image2D motionVectorImage;
+layout(binding = 4, rg16f) uniform readonly image2D motionVectorImage;
 layout(binding = 5, rgba16f) uniform readonly image2D diffuseAlbedoImage;
 layout(binding = 6, rgba16f) uniform readonly image2D specularAlbedoImage;
 layout(binding = 7, rgba16f) uniform readonly image2D normalRoughnessImage;
-layout(binding = 8, r32f) uniform readonly image2D specularHitDistanceImage;
+layout(binding = 8, r16f) uniform readonly image2D specularHitDistanceImage;
 layout(binding = 9, rgba16f) uniform readonly image2D historyImage;  // last frame's diffuse albedo
-layout(binding = 10, rgba32f) uniform readonly image2D radianceImage;  // the trace shader's output, render size
-layout(binding = 11, r32f) uniform readonly image2D fogAmountImage;    // how much fog the camera sees, render size
+layout(binding = 10, rgba32f) uniform readonly image2D radianceImage;  // the trace shader's output, render size; alpha: fog
 
 // Must match DisplayPushConstants in Renderer.h
 layout(push_constant) uniform DisplaySettings {
@@ -125,14 +126,14 @@ uint hash(uint x) {
     return x;
 }
 
-// How much fog the camera sees around an output pixel: the trace shader's fogAmountImage (a share of camera rays,
+// How much fog the camera sees around an output pixel: the radiance image's alpha (a share of camera rays,
 // each 0 or 1 in a frame of the DLSS modes), averaged over 5x5 render pixels so the grain fades in smoothly.
 float fogAmountAround(ivec2 renderPixel) {
-    ivec2 last = imageSize(fogAmountImage) - 1;
+    ivec2 last = imageSize(radianceImage) - 1;
     float sum = 0.0;
     for (int y = -2; y <= 2; y++) {
         for (int x = -2; x <= 2; x++) {
-            sum += imageLoad(fogAmountImage, clamp(renderPixel + ivec2(x, y), ivec2(0), last)).r;
+            sum += imageLoad(radianceImage, clamp(renderPixel + ivec2(x, y), ivec2(0), last)).a;
         }
     }
     return sum / 25.0;

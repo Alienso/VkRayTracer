@@ -179,14 +179,14 @@ VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
 
         VkDeviceSize size = texture.pixels.size();
         VkBuffer stagingBuffer;
-        VkDeviceMemory stagingMemory;
+        VmaAllocation stagingMemory;
         createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      stagingBuffer, stagingMemory);
         void* mapped;
-        vkMapMemory(device, stagingMemory, 0, size, 0, &mapped);
+        vmaMapMemory(allocator, stagingMemory, &mapped);
         std::memcpy(mapped, texture.pixels.data(), size);
-        vkUnmapMemory(device, stagingMemory);
+        vmaUnmapMemory(allocator, stagingMemory);
 
         immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
@@ -222,7 +222,7 @@ VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
         });
 
         vkDestroyBuffer(device, stagingBuffer, nullptr);
-        vkFreeMemory(device, stagingMemory, nullptr);
+        vmaFreeMemory(allocator, stagingMemory);
 
         texture.pixels.clear();
         texture.pixels.shrink_to_fit();  // the GPU has its copy now
@@ -234,7 +234,7 @@ void Renderer::destroyTextures() {
     for (GpuTexture& texture : gpuAssets.textures) {
         vkDestroyImageView(device, texture.view, nullptr);
         vkDestroyImage(device, texture.image, nullptr);
-        vkFreeMemory(device, texture.memory, nullptr);
+        vmaFreeMemory(allocator, texture.memory);
     }
     gpuAssets.textures.clear();
     gpuAssets.textureIds.clear();
@@ -316,7 +316,7 @@ void Renderer::createMaterialBuffer() {
 
 void Renderer::destroyMaterialBuffer() {
     vkDestroyBuffer(device, gpuAssets.materialBuffer, nullptr);
-    vkFreeMemory(device, gpuAssets.materialBufferMemory, nullptr);
+    vmaFreeMemory(allocator, gpuAssets.materialBufferMemory);
     gpuAssets.materialBufferCreated = false;
 }
 
@@ -434,5 +434,5 @@ void Renderer::createSpecularAlbedoTable() {
 
 void Renderer::destroySpecularAlbedoTable() {
     vkDestroyBuffer(device, specularAlbedoBuffer, nullptr);
-    vkFreeMemory(device, specularAlbedoMemory, nullptr);
+    vmaFreeMemory(allocator, specularAlbedoMemory);
 }

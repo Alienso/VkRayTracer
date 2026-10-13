@@ -18,8 +18,6 @@
 std::vector<char> readFile(const std::string& filename);
 
 static const VkFormat displayFormat = VK_FORMAT_R8G8B8A8_UNORM;
-// Same format as the radiance image, so exposure and display read either through the same descriptors
-static const VkFormat dlssOutputFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 
 // Output = the window, or a fixed number of rows (e.g. 2160 for a 4K capture) as wide as the window's shape: it is
 // shrunk to fit the window when shown, and Capture saves it at full size. Render = what the path tracer traces: the
@@ -63,12 +61,14 @@ void Renderer::recreateRenderImages() {
 }
 
 // What this frame's settings need at full size (see PerPixelBuffers): ReSTIR's buffers take 364 bytes per render
-// pixel (GI 120 of them), the guides 48, 3.4 GB at 4K. By default Accumulation needs none, the DLSS modes all but GI's.
+// pixel (GI 120 of them), the guides 34, the history 8, 3.4 GB at 4K. By default Accumulation needs none, the DLSS
+// modes ReSTIR DI's and the guides.
 Renderer::PerPixelBuffers Renderer::wantedPerPixelBuffers() {
     PerPixelBuffers wanted;
     wanted.restirGi = settings.restirGi(settings.renderMode);
     wanted.restir = settings.restirDi(settings.renderMode) || wanted.restirGi;
     wanted.guides = dlssActive() || isGuideView(settings.debugView);
+    wanted.history = settings.debugView == static_cast<int>(DebugView::GuideReprojectionError);
     return wanted;
 }
 
@@ -97,7 +97,7 @@ void Renderer::createDisplayImages() {
     // Transitioned every frame (written here, then read by the blit), so no initial layout change is needed
     createImage(outputExtent.width, outputExtent.height, displayFormat,
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                displayImage, displayImageMemory, displayImageView);
+                displayImage, displayImageMemory, displayImageView, 1, true);
 
     // DLSS modes: where DLSS writes the denoised, upscaled frame. Stays in GENERAL.
     if (dlssActive()) {
@@ -122,7 +122,7 @@ void Renderer::createDisplayImages() {
 void Renderer::destroyDisplayImages() {
     vkDestroyImageView(device, displayImageView, nullptr);
     vkDestroyImage(device, displayImage, nullptr);
-    vkFreeMemory(device, displayImageMemory, nullptr);
+    vmaFreeMemory(allocator, displayImageMemory);
     if (dlssOutputImage.image != VK_NULL_HANDLE) {
         destroyImage(dlssOutputImage);
     }
@@ -130,9 +130,9 @@ void Renderer::destroyDisplayImages() {
 
 // Descriptors: 0 = HDR image (read: DLSS output or the radiance image), 1 = display image (write),
 // 2 = exposure state (read), 3-9 = the DLSS input images and the history image (read, for the guide debug views),
-// 10 = the radiance image at render size (read, for the trace shader's debug views), 11 = the fog amount (read, for
-// the fog grain)
-static const uint32_t displayBindingCount = 12;
+// 10 = the radiance image at render size (read, for the trace shader's debug views and, in its alpha, the fog amount
+// for the fog grain)
+static const uint32_t displayBindingCount = 11;
 
 void Renderer::createDisplayResources() {
     VkDescriptorSetLayoutBinding bindings[displayBindingCount];
@@ -200,7 +200,7 @@ void Renderer::updateDisplayDescriptorSet() {
             displayedHdrView(), displayImageView, VK_NULL_HANDLE,
             linearDepthImage.view, motionVectorImage.view, diffuseAlbedoImage.view, specularAlbedoImage.view,
             normalRoughnessImage.view, specularHitDistanceImage.view, guideHistoryImage.view,
-            radianceImageView, fogAmountImage.view,
+            radianceImageView,
     };
     VkDescriptorImageInfo imageInfos[displayBindingCount]{};
     VkDescriptorBufferInfo exposureInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
@@ -262,7 +262,7 @@ void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
 
     // Reprojection error view: keep this frame's diffuse albedo for the next frame to compare against.
     // (The display pass above has read the old history; the trace shader wrote the diffuse albedo before that.)
-    if (view == DisplayView::ReprojectionError) {
+    if (view == DisplayView::ReprojectionError && perPixelBuffers.history) {
         VkMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;

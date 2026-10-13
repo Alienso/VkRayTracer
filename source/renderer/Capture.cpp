@@ -79,7 +79,7 @@ void Renderer::finishCapture() {
     size_t pixelCount = static_cast<size_t>(captureExtent.width) * captureExtent.height;
     std::vector<uint8_t> pixels(pixelCount * 4);
     void* mapped = nullptr;
-    vkMapMemory(device, captureMemory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    vmaMapMemory(allocator, captureMemory, &mapped);
     const uint8_t* source = static_cast<const uint8_t*>(mapped);
     for (size_t i = 0; i < pixelCount; i++) {
         pixels[i * 4] = toSrgb[source[i * 4]];
@@ -87,9 +87,9 @@ void Renderer::finishCapture() {
         pixels[i * 4 + 2] = toSrgb[source[i * 4 + 2]];
         pixels[i * 4 + 3] = 255;
     }
-    vkUnmapMemory(device, captureMemory);
+    vmaUnmapMemory(allocator, captureMemory);
     vkDestroyBuffer(device, captureBuffer, nullptr);
-    vkFreeMemory(device, captureMemory, nullptr);
+    vmaFreeMemory(allocator, captureMemory);
     captureBuffer = VK_NULL_HANDLE;
 
     std::string name = captureFileName();

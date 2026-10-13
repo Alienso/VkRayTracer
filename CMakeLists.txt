@@ -40,6 +40,7 @@ add_executable(vulkanDemo main.cpp
 
         include/stb_image.cpp include/stb_image.h
         include/stb_image_write.cpp include/stb_image_write.h
+        include/vma/vk_mem_alloc.cpp include/vma/vk_mem_alloc.h
         source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
         source/app/CameraController.cpp source/app/CameraController.h
         source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp

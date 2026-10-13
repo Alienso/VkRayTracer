@@ -526,23 +526,19 @@ void Renderer::recordDlss(VkCommandBuffer commandBuffer) {
     // The images. They stay in GENERAL and aren't touched again before the next frame's trace. (DLSS switches
     // them to SHADER_READ_ONLY_OPTIMAL while reading and back, hence the sampled usage.)
     const VkImageUsageFlags storage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    sl::Resource color = describeImage(radianceImage, radianceImageMemory, radianceImageView, renderExtent,
-                                       VK_FORMAT_R32G32B32A32_SFLOAT, storage);
-    sl::Resource output = describeImage(dlssOutputImage.image, dlssOutputImage.memory, dlssOutputImage.view,
-                                        outputExtent, VK_FORMAT_R32G32B32A32_SFLOAT, storage);
-    sl::Resource depth = describeImage(linearDepthImage.image, linearDepthImage.memory, linearDepthImage.view,
-                                       renderExtent, VK_FORMAT_R32_SFLOAT, storage);
-    sl::Resource motion = describeImage(motionVectorImage.image, motionVectorImage.memory, motionVectorImage.view,
-                                        renderExtent, VK_FORMAT_R32G32_SFLOAT, storage);
-    sl::Resource diffuse = describeImage(diffuseAlbedoImage.image, diffuseAlbedoImage.memory, diffuseAlbedoImage.view,
-                                         renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                         storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    sl::Resource specular = describeImage(specularAlbedoImage.image, specularAlbedoImage.memory,
-                                          specularAlbedoImage.view, renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT, storage);
-    sl::Resource normals = describeImage(normalRoughnessImage.image, normalRoughnessImage.memory,
-                                         normalRoughnessImage.view, renderExtent, VK_FORMAT_R16G16B16A16_SFLOAT, storage);
-    sl::Resource hitDistance = describeImage(specularHitDistanceImage.image, specularHitDistanceImage.memory,
-                                             specularHitDistanceImage.view, renderExtent, VK_FORMAT_R32_SFLOAT, storage);
+    auto describe = [&](const RenderImage& image, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage) {
+        return describeImage(image.image, deviceMemoryOf(image.memory), image.view, extent, format, usage);
+    };
+    sl::Resource color = describeImage(radianceImage, deviceMemoryOf(radianceImageMemory), radianceImageView,
+                                       renderExtent, radianceFormat, storage);
+    sl::Resource output = describe(dlssOutputImage, outputExtent, dlssOutputFormat, storage);
+    sl::Resource depth = describe(linearDepthImage, renderExtent, linearDepthFormat, storage);
+    sl::Resource motion = describe(motionVectorImage, renderExtent, motionVectorFormat, storage);
+    sl::Resource diffuse = describe(diffuseAlbedoImage, renderExtent, guideColorFormat,
+                                    storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    sl::Resource specular = describe(specularAlbedoImage, renderExtent, guideColorFormat, storage);
+    sl::Resource normals = describe(normalRoughnessImage, renderExtent, guideColorFormat, storage);
+    sl::Resource hitDistance = describe(specularHitDistanceImage, renderExtent, hitDistanceFormat, storage);
     sl::Extent renderArea{0, 0, renderExtent.width, renderExtent.height};
     sl::Extent outputArea{0, 0, outputExtent.width, outputExtent.height};
     const sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eValidUntilPresent;

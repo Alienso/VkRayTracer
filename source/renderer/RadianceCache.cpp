@@ -21,11 +21,14 @@ std::vector<char> readFile(const std::string& filename);
 
 void Renderer::createRadianceCache() {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheKeyBuffer, cacheKeyMemory);
+    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheKeyBuffer, cacheKeyMemory,
+                 VK_NULL_HANDLE, true);
     createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 cacheAccumulatorBuffer, cacheAccumulatorMemory);
-    createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheValueBuffer, cacheValueMemory);
-    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheAgeBuffer, cacheAgeMemory);
+                 cacheAccumulatorBuffer, cacheAccumulatorMemory, VK_NULL_HANDLE, true);
+    createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheValueBuffer, cacheValueMemory,
+                 VK_NULL_HANDLE, true);
+    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheAgeBuffer, cacheAgeMemory,
+                 VK_NULL_HANDLE, true);
     createBuffer(sizeof(uint32_t), usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  cacheStatsBuffer, cacheStatsMemory);
     cacheClearPending = true;  // emptied by the first frame
@@ -38,7 +41,7 @@ void Renderer::createRadianceCache() {
         createBuffer(sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      cacheStatsReadbackBuffers[i], cacheStatsReadbackMemories[i]);
-        vkMapMemory(device, cacheStatsReadbackMemories[i], 0, sizeof(uint32_t), 0, &cacheStatsReadbackMapped[i]);
+        vmaMapMemory(allocator, cacheStatsReadbackMemories[i], &cacheStatsReadbackMapped[i]);
         std::memset(cacheStatsReadbackMapped[i], 0, sizeof(uint32_t));
     }
 
@@ -184,15 +187,15 @@ void Renderer::destroyRadianceCache() {
     vkDestroyDescriptorPool(device, cacheDescriptorPool, nullptr);
     vkDestroyDescriptorSetLayout(device, cacheDescriptorSetLayout, nullptr);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        vkUnmapMemory(device, cacheStatsReadbackMemories[i]);
+        vmaUnmapMemory(allocator, cacheStatsReadbackMemories[i]);
         vkDestroyBuffer(device, cacheStatsReadbackBuffers[i], nullptr);
-        vkFreeMemory(device, cacheStatsReadbackMemories[i], nullptr);
+        vmaFreeMemory(allocator, cacheStatsReadbackMemories[i]);
     }
     VkBuffer buffers[] = {cacheKeyBuffer, cacheAccumulatorBuffer, cacheValueBuffer, cacheAgeBuffer, cacheStatsBuffer};
-    VkDeviceMemory memories[] = {cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory};
+    VmaAllocation memories[] = {cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory};
     for (int i = 0; i < 5; i++) {
         vkDestroyBuffer(device, buffers[i], nullptr);
-        vkFreeMemory(device, memories[i], nullptr);
+        vmaFreeMemory(allocator, memories[i]);
     }
 }
 

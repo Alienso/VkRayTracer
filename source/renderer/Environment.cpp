@@ -92,13 +92,13 @@ void Renderer::uploadEnvironmentImage(uint32_t width, uint32_t height, const flo
                 environmentTexture.image, environmentTexture.memory, environmentTexture.view);
     VkDeviceSize size = static_cast<VkDeviceSize>(width) * height * 4 * sizeof(float);
     VkBuffer stagingBuffer;
-    VkDeviceMemory stagingMemory;
+    VmaAllocation stagingMemory;
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
     void* mapped;
-    vkMapMemory(device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(allocator, stagingMemory, &mapped);
     std::memcpy(mapped, rgba, size);
-    vkUnmapMemory(device, stagingMemory);
+    vmaUnmapMemory(allocator, stagingMemory);
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -123,13 +123,13 @@ void Renderer::uploadEnvironmentImage(uint32_t width, uint32_t height, const flo
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
     });
     vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vkFreeMemory(device, stagingMemory, nullptr);
+    vmaFreeMemory(allocator, stagingMemory);
 }
 
 void Renderer::destroyEnvironmentImage() {
     vkDestroyImageView(device, environmentTexture.view, nullptr);
     vkDestroyImage(device, environmentTexture.image, nullptr);
-    vkFreeMemory(device, environmentTexture.memory, nullptr);
+    vmaFreeMemory(allocator, environmentTexture.memory);
     environmentTexture = {};
 }
 

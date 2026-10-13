@@ -19,13 +19,6 @@
 
 std::vector<char> readFile(const std::string& filename);
 
-static const VkFormat radianceFormat = VK_FORMAT_R32G32B32A32_SFLOAT;  // float, so tiny 1/n contributions don't round away
-// DLSS inputs. 32-bit where there are only 1-2 channels (exact depth and motion), 16-bit for the colors and normals.
-static const VkFormat linearDepthFormat = VK_FORMAT_R32_SFLOAT;
-static const VkFormat motionVectorFormat = VK_FORMAT_R32G32_SFLOAT;
-static const VkFormat guideColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;  // albedos, normal + roughness
-static const VkFormat hitDistanceFormat = VK_FORMAT_R32_SFLOAT;
-
 // Sub-pixel camera offsets for DLSS: the Halton sequence (bases 2 and 3) covers the pixel evenly over any run of
 // frames. Returns 0..1.
 static float halton(uint32_t index, uint32_t base) {
@@ -45,11 +38,12 @@ void Renderer::createUniformBuffer() {
 }
 
 // An empty acceleration structure of the given size, living inside a buffer we own. Filled by a build or a copy.
-AccelerationStructure Renderer::createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size) {
+AccelerationStructure Renderer::createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size,
+                                                            VmaPool pool, bool ownMemory) {
     AccelerationStructure as;
     createBuffer(size,
                  VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, as.buffer, as.memory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, as.buffer, as.memory, pool, ownMemory);
 
     VkAccelerationStructureCreateInfoKHR createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
@@ -68,7 +62,8 @@ AccelerationStructure Renderer::createAccelerationStructure(VkAccelerationStruct
 }
 
 // Scratch memory is only used during a build. Returns its (aligned) device address.
-VkDeviceAddress Renderer::createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory) {
+VkDeviceAddress Renderer::createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VmaAllocation& memory, VmaPool pool,
+                                              bool ownMemory) {
     VkPhysicalDeviceAccelerationStructurePropertiesKHR asProperties{};
     asProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
     VkPhysicalDeviceProperties2 properties2{};
@@ -79,7 +74,7 @@ VkDeviceAddress Renderer::createScratchBuffer(VkDeviceSize size, VkBuffer& buffe
 
     createBuffer(size + alignment,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory, pool, ownMemory);
     VkDeviceAddress address = getBufferDeviceAddress(buffer);
     return (address + alignment - 1) / alignment * alignment;
 }
@@ -87,7 +82,7 @@ VkDeviceAddress Renderer::createScratchBuffer(VkDeviceSize size, VkBuffer& buffe
 void Renderer::destroyAccelerationStructure(AccelerationStructure& as) {
     vkext::vkDestroyAccelerationStructureKHR(device, as.handle, nullptr);
     vkDestroyBuffer(device, as.buffer, nullptr);
-    vkFreeMemory(device, as.memory, nullptr);
+    vmaFreeMemory(allocator, as.memory);
     as = {};
 }
 
@@ -151,22 +146,27 @@ void Renderer::destroyBottomLevelAccelerationStructures() {
     gpuAssets.blasSizes.clear();
 }
 
-// Builds the BLASes of these meshes (indices into meshInfos), into gpuAssets.blases at the same indices
+// Builds the BLASes of these meshes (indices into meshInfos), into gpuAssets.blases at the same indices.
+//
+// In batches of at most blasBatchBytes of uncompacted structures: each batch is built, compacted and its uncompacted
+// structures freed before the next one starts. All at once, a big load would need every uncompacted structure next to
+// its compacted copy (Jungle Ruins: 729 MB next to 269 MB). Each batch waits for the GPU twice, so a load with many
+// batches takes a little longer.
 void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_t>& meshes) {
     size_t count = meshes.size();
     if (count == 0) {
         return;
     }
+    const VkDeviceSize blasBatchBytes = 256ull << 20;
     VkDeviceAddress vertexAddress = getBufferDeviceAddress(gpuAssets.vertexBuffer);
     VkDeviceAddress indexAddress = getBufferDeviceAddress(gpuAssets.indexBuffer);
 
     std::vector<VkAccelerationStructureGeometryKHR> geometries(count);
     std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos(count);
     std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges(count);
-    std::vector<AccelerationStructure> uncompacted(count);
     VkDeviceSize maxScratchSize = 0;
 
-    // 1: describe every mesh, ask for sizes, create the (oversized) structures
+    // 1: describe every mesh, ask for sizes
     for (size_t i = 0; i < count; i++) {
         const MeshInfo& mesh = gpuAssets.meshInfos[meshes[i]];
 
@@ -198,17 +198,31 @@ void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_
         sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
         vkext::vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                                        &buildInfos[i], &ranges[i].primitiveCount, &sizeInfo);
-
-        uncompacted[i] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, sizeInfo.accelerationStructureSize);
-        buildInfos[i].dstAccelerationStructure = uncompacted[i].handle;
         maxScratchSize = std::max(maxScratchSize, sizeInfo.buildScratchSize);
         gpuAssets.blasBuildSizes[meshes[i]] = sizeInfo.accelerationStructureSize;
     }
 
+    // The build's short-lived memory (the uncompacted structures and the scratch buffer) comes from a pool of its own,
+    // destroyed at the end. Taken from the shared blocks, it would leave holes between the compacted structures and
+    // the textures once freed (Jungle Ruins: ~130 MB).
+    VkBufferCreateInfo typicalBuffer{};
+    typicalBuffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    typicalBuffer.size = 65536;
+    typicalBuffer.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    VmaAllocationCreateInfo typicalAllocation{};
+    typicalAllocation.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    VmaPoolCreateInfo poolInfo{};  // block size 0: VMA's (64 MB, see createAllocator), big ones get their own memory
+    VmaPool buildPool;
+    if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &typicalBuffer, &typicalAllocation, &poolInfo.memoryTypeIndex) !=
+        VK_SUCCESS || vmaCreatePool(allocator, &poolInfo, &buildPool) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create the BLAS build memory pool!");
+    }
+
     // The builds run one after another, so they can all share one scratch buffer.
     VkBuffer scratchBuffer;
-    VkDeviceMemory scratchMemory;
-    VkDeviceAddress scratchAddress = createScratchBuffer(maxScratchSize, scratchBuffer, scratchMemory);
+    VmaAllocation scratchMemory;
+    VkDeviceAddress scratchAddress = createScratchBuffer(maxScratchSize, scratchBuffer, scratchMemory, buildPool);
 
     VkQueryPoolCreateInfo queryPoolInfo{};
     queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -219,60 +233,79 @@ void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_
         throw std::runtime_error("failed to create acceleration structure query pool!");
     }
 
-    // 2: build all, then ask for their compacted sizes
-    std::vector<VkAccelerationStructureKHR> handles(count);
-    for (size_t i = 0; i < count; i++) {
-        handles[i] = uncompacted[i].handle;
-    }
-    immediateSubmit([&](VkCommandBuffer cmd) {
-        vkCmdResetQueryPool(cmd, queryPool, 0, static_cast<uint32_t>(count));
-
-        // Between builds: the next build reuses the scratch memory, so the previous one must be done with it.
-        // After the last one this also makes the results visible to the size query.
-        VkMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-
-        for (size_t i = 0; i < count; i++) {
-            buildInfos[i].scratchData.deviceAddress = scratchAddress;
-            const VkAccelerationStructureBuildRangeInfoKHR* pRange = &ranges[i];
-            vkext::vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfos[i], &pRange);
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                 VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    for (size_t first = 0; first < count;) {
+        // This batch: [first, end), at least one mesh (a bigger one gets a batch of its own)
+        size_t end = first;
+        VkDeviceSize batchBytes = 0;
+        while (end < count && (end == first || batchBytes + gpuAssets.blasBuildSizes[meshes[end]] <= blasBatchBytes)) {
+            batchBytes += gpuAssets.blasBuildSizes[meshes[end]];
+            end++;
         }
-        vkext::vkCmdWriteAccelerationStructuresPropertiesKHR(cmd, static_cast<uint32_t>(count), handles.data(),
-                                                             VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
-                                                             queryPool, 0);
-    });
+        uint32_t batchCount = static_cast<uint32_t>(end - first);
 
-    std::vector<VkDeviceSize> compactedSizes(count);
-    vkGetQueryPoolResults(device, queryPool, 0, static_cast<uint32_t>(count), sizeof(VkDeviceSize) * count,
-                          compactedSizes.data(), sizeof(VkDeviceSize), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        // 2: create the (oversized) structures, build them, then ask for their compacted sizes
+        std::vector<AccelerationStructure> uncompacted(batchCount);
+        std::vector<VkAccelerationStructureKHR> handles(batchCount);
+        for (uint32_t b = 0; b < batchCount; b++) {
+            uncompacted[b] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+                                                         gpuAssets.blasBuildSizes[meshes[first + b]], buildPool);
+            handles[b] = uncompacted[b].handle;
+            buildInfos[first + b].dstAccelerationStructure = uncompacted[b].handle;
+        }
+        immediateSubmit([&](VkCommandBuffer cmd) {
+            vkCmdResetQueryPool(cmd, queryPool, static_cast<uint32_t>(first), batchCount);
+
+            // Between builds: the next build reuses the scratch memory, so the previous one must be done with it.
+            // After the last one this also makes the results visible to the size query.
+            VkMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+
+            for (size_t i = first; i < end; i++) {
+                buildInfos[i].scratchData.deviceAddress = scratchAddress;
+                const VkAccelerationStructureBuildRangeInfoKHR* pRange = &ranges[i];
+                vkext::vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfos[i], &pRange);
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                     0, 1, &barrier, 0, nullptr, 0, nullptr);
+            }
+            vkext::vkCmdWriteAccelerationStructuresPropertiesKHR(cmd, batchCount, handles.data(),
+                                                                 VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                                                                 queryPool, static_cast<uint32_t>(first));
+        });
+
+        std::vector<VkDeviceSize> compactedSizes(batchCount);
+        vkGetQueryPoolResults(device, queryPool, static_cast<uint32_t>(first), batchCount,
+                              sizeof(VkDeviceSize) * batchCount, compactedSizes.data(), sizeof(VkDeviceSize),
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+        // 3: copy into right-sized structures, free the oversized ones
+        for (uint32_t b = 0; b < batchCount; b++) {
+            gpuAssets.blases[meshes[first + b]] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+                                                                              compactedSizes[b]);
+            gpuAssets.blasSizes[meshes[first + b]] = compactedSizes[b];
+        }
+        immediateSubmit([&](VkCommandBuffer cmd) {
+            for (uint32_t b = 0; b < batchCount; b++) {
+                VkCopyAccelerationStructureInfoKHR copyInfo{};
+                copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+                copyInfo.src = uncompacted[b].handle;
+                copyInfo.dst = gpuAssets.blases[meshes[first + b]].handle;
+                copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+                vkext::vkCmdCopyAccelerationStructureKHR(cmd, &copyInfo);
+            }
+        });
+        for (AccelerationStructure& as : uncompacted) {
+            destroyAccelerationStructure(as);
+        }
+        first = end;
+    }
+
     vkDestroyQueryPool(device, queryPool, nullptr);
     vkDestroyBuffer(device, scratchBuffer, nullptr);
-    vkFreeMemory(device, scratchMemory, nullptr);
-
-    // 3: copy into right-sized structures
-    for (size_t i = 0; i < count; i++) {
-        gpuAssets.blases[meshes[i]] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, compactedSizes[i]);
-        gpuAssets.blasSizes[meshes[i]] = compactedSizes[i];
-    }
-    immediateSubmit([&](VkCommandBuffer cmd) {
-        for (size_t i = 0; i < count; i++) {
-            VkCopyAccelerationStructureInfoKHR copyInfo{};
-            copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
-            copyInfo.src = uncompacted[i].handle;
-            copyInfo.dst = gpuAssets.blases[meshes[i]].handle;
-            copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
-            vkext::vkCmdCopyAccelerationStructureKHR(cmd, &copyInfo);
-        }
-    });
-
-    for (AccelerationStructure& as : uncompacted) {
-        destroyAccelerationStructure(as);
-    }
+    vmaFreeMemory(allocator, scratchMemory);
+    vmaDestroyPool(allocator, buildPool);  // empty by now
 }
 
 // Top level: placed copies (instances) of bottom level structures, each with a transform.
@@ -312,8 +345,8 @@ void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
         createBuffer(instanceBufferSize,
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     instanceBuffers[i], instanceBufferMemories[i]);
-        vkMapMemory(device, instanceBufferMemories[i], 0, instanceBufferSize, 0, &instanceBuffersMapped[i]);
+                     instanceBuffers[i], instanceBufferMemories[i], VK_NULL_HANDLE, true);
+        vmaMapMemory(allocator, instanceBufferMemories[i], &instanceBuffersMapped[i]);
     }
 
     // Sizes for the worst case (full capacity). Builds with fewer instances fit as well.
@@ -325,8 +358,10 @@ void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
     vkext::vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                                    &buildInfo, &capacity, &sizeInfo);
 
-    tlas = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizeInfo.accelerationStructureSize);
-    tlasScratchAddress = createScratchBuffer(sizeInfo.buildScratchSize, tlasScratchBuffer, tlasScratchMemory);
+    tlas = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizeInfo.accelerationStructureSize,
+                                       VK_NULL_HANDLE, true);
+    tlasScratchAddress = createScratchBuffer(sizeInfo.buildScratchSize, tlasScratchBuffer, tlasScratchMemory,
+                                             VK_NULL_HANDLE, true);
     tlasDirty = true;  // nothing built yet
 }
 
@@ -334,11 +369,11 @@ void Renderer::destroyTopLevelAccelerationStructure() {
     destroyAccelerationStructure(tlas);
     destroyStreamedBuffer(instanceData);
     vkDestroyBuffer(device, tlasScratchBuffer, nullptr);
-    vkFreeMemory(device, tlasScratchMemory, nullptr);
+    vmaFreeMemory(allocator, tlasScratchMemory);
     for (size_t i = 0; i < instanceBuffers.size(); i++) {
-        vkUnmapMemory(device, instanceBufferMemories[i]);
+        vmaUnmapMemory(allocator, instanceBufferMemories[i]);
         vkDestroyBuffer(device, instanceBuffers[i], nullptr);
-        vkFreeMemory(device, instanceBufferMemories[i], nullptr);
+        vmaFreeMemory(allocator, instanceBufferMemories[i]);
     }
     instanceBuffers.clear();
     instanceBufferMemories.clear();
@@ -393,6 +428,7 @@ void Renderer::createRayTracingImages() {
     // Full size only for the features that are on (PerPixelBuffers), the rest 1 x 1
     perPixelBuffers = wantedPerPixelBuffers();
     VkExtent2D guideExtent = perPixelBuffers.guides ? renderExtent : VkExtent2D{1, 1};
+    VkExtent2D historyExtent = perPixelBuffers.history ? renderExtent : VkExtent2D{1, 1};
     VkDeviceSize pixels = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
     VkDeviceSize restirPixels = perPixelBuffers.restir ? pixels : 1;
     VkDeviceSize restirGiPixels = perPixelBuffers.restirGi ? pixels : 1;
@@ -400,7 +436,7 @@ void Renderer::createRayTracingImages() {
     // Everything DLSS reads is also "sampled": DLSS switches the images to SHADER_READ_ONLY_OPTIMAL while reading.
     const VkImageUsageFlags dlssInput = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     createImage(renderExtent.width, renderExtent.height, radianceFormat, dlssInput,
-                radianceImage, radianceImageMemory, radianceImageView);
+                radianceImage, radianceImageMemory, radianceImageView, 1, true);
     // The DLSS inputs. The diffuse albedo is copied into the history image for the reprojection error view.
     createImage(guideExtent, linearDepthFormat, dlssInput, linearDepthImage);
     createImage(guideExtent, motionVectorFormat, dlssInput, motionVectorImage);
@@ -408,22 +444,21 @@ void Renderer::createRayTracingImages() {
     createImage(guideExtent, guideColorFormat, dlssInput, specularAlbedoImage);
     createImage(guideExtent, guideColorFormat, dlssInput, normalRoughnessImage);
     createImage(guideExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
-    createImage(guideExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    createImage(historyExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                 guideHistoryImage);
-    createImage(renderExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, fogAmountImage);
     // Written before it is read in every frame that uses it, so it needs no clearing
     createBuffer(sizeof(GpuPrimaryHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory, VK_NULL_HANDLE, true);
     createBuffer(sizeof(GpuBounceHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bounceHitBuffer, bounceHitMemory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bounceHitBuffer, bounceHitMemory, VK_NULL_HANDLE, true);
     // this frame's, last frame's, and the ReSTIR pass's result for the spatial pass
     createBuffer(sizeof(GpuReservoir) * 3 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory, VK_NULL_HANDLE, true);
     createBuffer(sizeof(GpuRestirSurface) * 2 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory, VK_NULL_HANDLE, true);
     // ReSTIR GI: this frame's, last frame's, and the image pass's fresh samples
     createBuffer(sizeof(GpuGiReservoir) * 3 * restirGiPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, giReservoirBuffer, giReservoirMemory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, giReservoirBuffer, giReservoirMemory, VK_NULL_HANDLE, true);
     restirHistoryAvailable = false;  // new buffers: nothing to reuse yet
     restirGiHistoryAvailable = false;
 
@@ -431,7 +466,7 @@ void Renderer::createRayTracingImages() {
     immediateSubmit([&](VkCommandBuffer cmd) {
         VkImage images[] = {radianceImage, linearDepthImage.image, motionVectorImage.image, diffuseAlbedoImage.image,
                             specularAlbedoImage.image, normalRoughnessImage.image, specularHitDistanceImage.image,
-                            guideHistoryImage.image, fogAmountImage.image};
+                            guideHistoryImage.image};
         constexpr uint32_t imageCount = static_cast<uint32_t>(std::size(images));
         VkImageMemoryBarrier barriers[imageCount]{};
         for (uint32_t i = 0; i < imageCount; i++) {
@@ -466,23 +501,22 @@ void Renderer::createRayTracingImages() {
 
 void Renderer::destroyRayTracingImages() {
     for (RenderImage* image : {&linearDepthImage, &motionVectorImage, &diffuseAlbedoImage, &specularAlbedoImage,
-                               &normalRoughnessImage, &specularHitDistanceImage, &guideHistoryImage,
-                               &fogAmountImage}) {
+                               &normalRoughnessImage, &specularHitDistanceImage, &guideHistoryImage}) {
         destroyImage(*image);
     }
     vkDestroyImageView(device, radianceImageView, nullptr);
     vkDestroyImage(device, radianceImage, nullptr);
-    vkFreeMemory(device, radianceImageMemory, nullptr);
+    vmaFreeMemory(allocator, radianceImageMemory);
     vkDestroyBuffer(device, primaryHitBuffer, nullptr);
-    vkFreeMemory(device, primaryHitMemory, nullptr);
+    vmaFreeMemory(allocator, primaryHitMemory);
     vkDestroyBuffer(device, bounceHitBuffer, nullptr);
-    vkFreeMemory(device, bounceHitMemory, nullptr);
+    vmaFreeMemory(allocator, bounceHitMemory);
     vkDestroyBuffer(device, reservoirBuffer, nullptr);
-    vkFreeMemory(device, reservoirMemory, nullptr);
+    vmaFreeMemory(allocator, reservoirMemory);
     vkDestroyBuffer(device, restirSurfaceBuffer, nullptr);
-    vkFreeMemory(device, restirSurfaceMemory, nullptr);
+    vmaFreeMemory(allocator, restirSurfaceMemory);
     vkDestroyBuffer(device, giReservoirBuffer, nullptr);
-    vkFreeMemory(device, giReservoirMemory, nullptr);
+    vmaFreeMemory(allocator, giReservoirMemory);
 }
 
 void Renderer::createRayTracingDescriptors() {
@@ -493,8 +527,8 @@ void Renderer::createRayTracingDescriptors() {
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
     // 29: ReSTIR GI reservoirs, 30: blue noise, 31: portals, 32: 3D textures (the fog's, Volumes.cpp),
-    // 33: fog amount (for the fog grain), 34: per-object motion
-    std::vector<VkDescriptorSetLayoutBinding> bindings(35);
+    // 33: per-object motion
+    std::vector<VkDescriptorSetLayoutBinding> bindings(34);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -526,8 +560,7 @@ void Renderer::createRayTracingDescriptors() {
     bindings[30] = {30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[34] = {34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -550,7 +583,7 @@ void Renderer::createRayTracingDescriptors() {
 
     VkDescriptorPoolSize poolSizes[] = {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + maxVolumeTextures}
@@ -627,9 +660,8 @@ void Renderer::updateRayTracingDescriptorSet() {
         volumeInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    VkDescriptorImageInfo fogAmountInfo{VK_NULL_HANDLE, fogAmountImage.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo motionInfo{motionData.buffer, 0, VK_WHOLE_SIZE};
-    std::vector<VkWriteDescriptorSet> writes(35);
+    std::vector<VkWriteDescriptorSet> writes(34);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -696,10 +728,8 @@ void Renderer::updateRayTracingDescriptorSet() {
     writes[32].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[32].descriptorCount = static_cast<uint32_t>(volumeInfos.size());  // (the noise is always there)
     writes[32].pImageInfo = volumeInfos.data();
-    writes[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[33].pImageInfo = &fogAmountInfo;
-    writes[34].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[34].pBufferInfo = &motionInfo;
+    writes[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[33].pBufferInfo = &motionInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -1327,5 +1357,5 @@ void Renderer::cleanupRayTracing() {
     destroyEnvironment();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);
-    vkFreeMemory(device, uniformBufferMemory, nullptr);
+    vmaFreeMemory(allocator, uniformBufferMemory);
 }

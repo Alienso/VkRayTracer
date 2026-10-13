@@ -11,10 +11,11 @@
 // The result stays on the GPU: display.comp reads it right afterwards, in the same frame (binding 2 there).
 //
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_image_load_formatted : require  // hdrImage: no format qualifier
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba32f) uniform readonly image2D hdrImage;  // the image display.comp shows
+layout(binding = 0) uniform readonly image2D hdrImage;  // the image display.comp shows (RGBA32F or RGBA16F)
 
 const uint BIN_COUNT = 256;  // bin 0: black (ignored), bins 1..255: log2(luminance) from minLog2 to minLog2 + log2Range
 

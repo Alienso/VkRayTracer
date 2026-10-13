@@ -209,8 +209,11 @@ void Renderer::createLogicalDevice(){
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &vulkan13Features;
-    // Storage images with 1 or 2 channels (rg32f motion vectors for DLSS) count as "extended formats"
+    // Storage images with 1 or 2 channels (rg16f motion vectors for DLSS) count as "extended formats"
     features2.features.shaderStorageImageExtendedFormats = VK_TRUE;
+    // Reading a storage image without a format qualifier: display.comp and exposure.comp read the radiance image
+    // (RGBA32F) or DLSS's output (RGBA16F) through the same descriptor
+    features2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // Block-compressed textures (BC1-7, from .dds files): a quarter of the memory or less, every desktop GPU has them
     features2.features.textureCompressionBC = VK_TRUE;
     // Anisotropic filtering: sharp textures on surfaces seen at a slant (floors, streets), see getSampler
@@ -237,6 +240,31 @@ void Renderer::createLogicalDevice(){
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
 
     vkext::load(device);
+}
+
+// VMA takes memory blocks per memory type and places buffers and images in them; big ones (half a block or more), and
+// those the driver wants alone, get memory of their own. It calls Vulkan through the loader (vulkan-1), as the code
+// before it did.
+void Renderer::createAllocator() {
+    VmaAllocatorCreateInfo createInfo{};
+    createInfo.vulkanApiVersion = VK_API_VERSION_1_3;
+    createInfo.instance = instance;
+    createInfo.physicalDevice = physicalDevice;
+    createInfo.device = device;
+    // 32 MB blocks instead of VMA's 256: what blocks hold but don't use (the last one per memory type is partly empty,
+    // and VMA keeps one empty block) cost up to 250 MB with 256 MB blocks. 16 MB packs 2048x2048 textures badly (two
+    // per block, 2.7 MB left: 56 MB in the two Bistros); 32 MB holds six. Measured: 2-17 MB unused in our scenes,
+    // Bistro Exterior + Interior in 112 memory objects (4445 resources).
+    createInfo.preferredLargeHeapBlockSize = 32ull << 20;
+    // All memory with the DEVICE_ADDRESS flag: acceleration structure inputs, scratch and instances are found by their
+    // GPU address
+    createInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (memoryBudgetSupported) {
+        createInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
+    if (vmaCreateAllocator(&createInfo, &allocator) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create the memory allocator!");
+    }
 }
 
 void Renderer::createSwapChain() {
@@ -658,6 +686,7 @@ bool checkDeviceFeatureSupport(VkPhysicalDevice device) {
     vkGetPhysicalDeviceFeatures2(device, &features2);
 
     return features2.features.shaderStorageImageExtendedFormats &&
+           features2.features.shaderStorageImageReadWithoutFormat &&
            features2.features.textureCompressionBC &&
            features2.features.samplerAnisotropy &&
            vulkan12Features.bufferDeviceAddress &&

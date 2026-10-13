@@ -284,9 +284,22 @@ struct PresentationFunctions {
 // An image with its memory and view (the DLSS input images)
 struct RenderImage {
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
 };
+
+// Formats of the images the trace shader writes (and DLSS reads); the shaders' format qualifiers must match.
+// Float radiance, so tiny 1/n contributions to the running average don't round away. The DLSS inputs: exact depth;
+// 16-bit motion (DLSS's usual format; steps of 1/32 pixel or finer below 64 pixels per frame), colors, normals and
+// hit distances (the sky's is the largest half float, as DLSS RR asks).
+inline constexpr VkFormat radianceFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+inline constexpr VkFormat linearDepthFormat = VK_FORMAT_R32_SFLOAT;
+inline constexpr VkFormat motionVectorFormat = VK_FORMAT_R16G16_SFLOAT;
+inline constexpr VkFormat guideColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;  // albedos, normal + roughness
+inline constexpr VkFormat hitDistanceFormat = VK_FORMAT_R16_SFLOAT;
+// DLSS's output at output size: one frame, already denoised, so half floats do (display.comp reads it without a
+// format qualifier, as it reads the radiance image through the same descriptor in Accumulation)
+inline constexpr VkFormat dlssOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
 // Must match Material in shaders/raytrace.comp (scalar layout). Material (ModelLoader.h) packed for the GPU:
 // emission premultiplied by its strength, disabled textures set to -1.
@@ -426,9 +439,9 @@ struct GpuPortal {
 // current frame in flight (the other frame may still be copying from its own), then the GPU copies it over.
 struct StreamedBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     std::vector<VkBuffer> staging;
-    std::vector<VkDeviceMemory> stagingMemory;
+    std::vector<VmaAllocation> stagingMemory;
     std::vector<void*> stagingMapped;
     VkDeviceSize capacity = 0;
 };
@@ -550,6 +563,10 @@ struct GpuMemory {
     VkDeviceSize used = 0;    // by this program
     VkDeviceSize budget = 0;  // what it can have without slowing down (the driver's estimate, less what other programs
                               // use); 0: unknown (no VK_EXT_memory_budget)
+    // All heaps: the memory objects VMA got from the driver (its blocks and the resources with memory of their own;
+    // Vulkan only promises 4096) and the buffers and images placed in them
+    uint32_t memoryObjects = 0;
+    uint32_t allocations = 0;
 };
 
 // What the renderer reports for the UI (Renderer::stats)
@@ -625,6 +642,9 @@ private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties physicalDeviceProperties;
     VkDevice device;
+    // Where every buffer's and image's memory comes from (Vulkan Memory Allocator): a few large blocks per memory type,
+    // shared by many resources, instead of one vkAllocateMemory each (Vulkan only promises 4096 of those)
+    VmaAllocator allocator = VK_NULL_HANDLE;
     VkQueue graphicsQueue;
     VkQueue presentQueue;
     VkSwapchainKHR swapChain;
@@ -655,21 +675,21 @@ private:
     // How much light the GGX reflection reflects in total, per view angle and roughness (see Materials.cpp)
     static constexpr uint32_t specularAlbedoSize = 32;
     VkBuffer specularAlbedoBuffer;
-    VkDeviceMemory specularAlbedoMemory;
+    VmaAllocation specularAlbedoMemory;
     // 64 x 64 blue-noise texels, 4 channels of 16 bits (BlueNoise.cpp), binding 30
     VkBuffer blueNoiseBuffer;
-    VkDeviceMemory blueNoiseMemory;
+    VmaAllocation blueNoiseMemory;
 
     // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
     // It has room for tlasCapacity instances and is only recreated when more are needed.
     AccelerationStructure tlas;
     uint32_t tlasCapacity = 0;
     VkBuffer tlasScratchBuffer;
-    VkDeviceMemory tlasScratchMemory;
+    VmaAllocation tlasScratchMemory;
     VkDeviceAddress tlasScratchAddress = 0;
     // The CPU writes instances while the previous frame may still be building from its buffer, hence one per frame in flight.
     std::vector<VkBuffer> instanceBuffers;
-    std::vector<VkDeviceMemory> instanceBufferMemories;
+    std::vector<VmaAllocation> instanceBufferMemories;
     std::vector<void*> instanceBuffersMapped;
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, renderList's one to one
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
@@ -723,38 +743,41 @@ private:
     int activeOutputSize = 0;  // the RenderSettings::outputSize the images are built for
 
     // Ray tracing output at render size, recreated with the swapchain
-    VkImage radianceImage;  // linear HDR: running average while accumulating, else this frame (or a debug view)
-    VkDeviceMemory radianceImageMemory;
+    // Linear HDR: running average while accumulating, else this frame (or a debug view). RGB the light, alpha how much
+    // fog the camera sees (averaged the same way; for the fog grain, display.comp).
+    VkImage radianceImage;
+    VmaAllocation radianceImageMemory;
     VkImageView radianceImageView;
     // DLSS inputs ("guides"), all describing the first surface the camera ray hits. Written only when
-    // SceneUniforms::writeGuides is set (DLSS mode, guide debug views).
+    // SceneUniforms::writeGuides is set (DLSS mode, guide debug views). Formats: radianceFormat and the others.
     RenderImage linearDepthImage;         // R32F: view-space depth (distance along the camera's forward axis)
-    RenderImage motionVectorImage;        // RG32F: pixels to where this point was in the last frame
+    RenderImage motionVectorImage;        // RG16F: pixels to where this point was in the last frame
     RenderImage diffuseAlbedoImage;       // RGBA16F
     RenderImage specularAlbedoImage;      // RGBA16F
     RenderImage normalRoughnessImage;     // RGBA16F: world-space shading normal, roughness in alpha
-    RenderImage specularHitDistanceImage; // R32F: first hit -> next hit along a reflection/refraction, 0 = unknown
+    RenderImage specularHitDistanceImage; // R16F: first hit -> next hit along a reflection/refraction, 0 = unknown
     RenderImage guideHistoryImage;        // RGBA16F: last frame's diffuse albedo, for the reprojection error view
-    RenderImage fogAmountImage;           // R32F: how much fog the camera sees (for the fog grain, display.comp)
     VkBuffer primaryHitBuffer = VK_NULL_HANDLE;  // GpuPrimaryHit per render pixel (ReSTIR: camera rays traced first)
-    VkDeviceMemory primaryHitMemory = VK_NULL_HANDLE;
+    VmaAllocation primaryHitMemory = VK_NULL_HANDLE;
     VkBuffer bounceHitBuffer = VK_NULL_HANDLE;   // GpuBounceHit per render pixel (ReSTIR: first bounce traced early)
-    VkDeviceMemory bounceHitMemory = VK_NULL_HANDLE;
+    VmaAllocation bounceHitMemory = VK_NULL_HANDLE;
     VkBuffer reservoirBuffer = VK_NULL_HANDLE;   // GpuReservoir per render pixel, three parts (see GpuReservoir)
-    VkDeviceMemory reservoirMemory = VK_NULL_HANDLE;
+    VmaAllocation reservoirMemory = VK_NULL_HANDLE;
     VkBuffer restirSurfaceBuffer = VK_NULL_HANDLE;  // GpuRestirSurface per render pixel, this frame's and last frame's
-    VkDeviceMemory restirSurfaceMemory = VK_NULL_HANDLE;
+    VmaAllocation restirSurfaceMemory = VK_NULL_HANDLE;
     VkBuffer giReservoirBuffer = VK_NULL_HANDLE;  // GpuGiReservoir per render pixel, three parts
-    VkDeviceMemory giReservoirMemory = VK_NULL_HANDLE;
+    VmaAllocation giReservoirMemory = VK_NULL_HANDLE;
     // Which of the above have a pixel's worth for every render pixel. The others are 1 x 1 placeholders (the
     // descriptors need something), never touched by the shader: their features are off (buildSceneUniforms).
     // Remade when a feature is switched on or off (applyPerPixelBuffers).
     struct PerPixelBuffers {
         bool restir = false;    // primary hits, first bounces, DI reservoirs and surfaces: ReSTIR DI or GI on
         bool restirGi = false;  // GI reservoirs: ReSTIR GI on
-        bool guides = false;    // the DLSS input images and the history: writeGuides (DLSS modes, guide views)
+        bool guides = false;    // the DLSS input images: writeGuides (DLSS modes, guide views)
+        bool history = false;   // the guide history: the reprojection error view
         bool operator==(const PerPixelBuffers& other) const {
-            return restir == other.restir && restirGi == other.restirGi && guides == other.guides;
+            return restir == other.restir && restirGi == other.restirGi && guides == other.guides &&
+                   history == other.history;
         }
     };
     PerPixelBuffers perPixelBuffers;
@@ -806,9 +829,9 @@ private:
     static constexpr float cacheMaxWeight = 256.0f;
     static constexpr uint32_t cacheMaxAge = 128;
     VkBuffer cacheKeyBuffer, cacheAccumulatorBuffer, cacheValueBuffer, cacheAgeBuffer, cacheStatsBuffer;
-    VkDeviceMemory cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory;
+    VmaAllocation cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory;
     std::vector<VkBuffer> cacheStatsReadbackBuffers;
-    std::vector<VkDeviceMemory> cacheStatsReadbackMemories;
+    std::vector<VmaAllocation> cacheStatsReadbackMemories;
     std::vector<void*> cacheStatsReadbackMapped;
     uint32_t cacheUsedEntries = 0;      // for the UI, a few frames late
     bool cacheClearPending = true;      // empty the cache before the next update (new scene, lighting changed)
@@ -830,7 +853,7 @@ private:
     std::string dlssStatus = "not checked";
     int activeRenderMode = static_cast<int>(RenderMode::Accumulation);  // what the images are currently built for
     int activeDlssModel = static_cast<int>(DlssModel::TransformerF);    // what DLSS's resources were made for
-    RenderImage dlssOutputImage;       // RGBA32F at output size: the denoised, upscaled HDR image (DLSS modes only)
+    RenderImage dlssOutputImage;       // RGBA16F at output size: the denoised, upscaled HDR image (DLSS modes only)
     bool dlssResourcesInUse = false;   // DLSS created its own resources (on the first evaluate); free them on changes
     bool dlssReset = true;             // the next frame has no usable history (mode/size/scene changed)
     uint32_t dlssFrameIndex = 0;
@@ -841,9 +864,9 @@ private:
 
     // Automatic exposure (Exposure.cpp): histogram + adapted exposure on the GPU, read back for the UI
     VkBuffer exposureBuffer;
-    VkDeviceMemory exposureMemory;
+    VmaAllocation exposureMemory;
     std::vector<VkBuffer> exposureReadbackBuffers;  // one per frame in flight
-    std::vector<VkDeviceMemory> exposureReadbackMemories;
+    std::vector<VmaAllocation> exposureReadbackMemories;
     std::vector<void*> exposureReadbackMapped;
     ExposureState exposureInfo{};  // latest copy for the UI
     bool exposureInfoValid = false;
@@ -860,13 +883,13 @@ private:
     // Noise measurement (Noise.cpp): a converged reference of the current view, then the error of the displayed
     // image against it, frame by frame. Resources are created on first use.
     bool noiseResourcesCreated = false;
-    RenderImage noiseReferenceImage;          // RGBA32F at output size
+    RenderImage noiseReferenceImage;          // R32F (luminance) at output size
     VkExtent2D noiseReferenceExtent{};
     bool noiseReferenceValid = false;
     float noiseReferenceLuminance = 0.0f;     // average over the reference image
     uint32_t noiseGroupCapacity = 0;          // workgroup sums the buffers below have room for
     std::vector<VkBuffer> noiseSumBuffers;    // one per frame in flight, host visible: the GPU writes, the CPU reads
-    std::vector<VkDeviceMemory> noiseSumMemories;
+    std::vector<VmaAllocation> noiseSumMemories;
     std::vector<void*> noiseSumMapped;
     struct NoisePending { uint32_t pass = 0; uint32_t frame = 0; uint32_t groups = 0; bool active = false; };
     std::vector<NoisePending> noisePending;   // what each frame slot's buffer holds once its fence has passed
@@ -894,7 +917,7 @@ private:
 
     // Display pass (Display.cpp): exposure + tone mapping into an 8-bit image at output size, blitted to the swapchain
     VkImage displayImage;
-    VkDeviceMemory displayImageMemory;
+    VmaAllocation displayImageMemory;
     VkImageView displayImageView;
     VkDescriptorSetLayout displayDescriptorSetLayout;
     VkDescriptorPool displayDescriptorPool;
@@ -912,14 +935,14 @@ private:
 
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
-    VkDeviceMemory uniformBufferMemory;
+    VmaAllocation uniformBufferMemory;
     uint64_t primitiveCount = 0;  // triangles over all instances (billions with vegetation)
 
     // Frame capture (Capture.cpp): the button sets captureRequested, the frame copies the display image into
     // captureBuffer, the next loop iteration writes it as a PNG
     bool captureRequested = false;
     VkBuffer captureBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory captureMemory = VK_NULL_HANDLE;
+    VmaAllocation captureMemory = VK_NULL_HANDLE;
     VkExtent2D captureExtent{};
     uint32_t captureFrame = 0;   // frame in flight that recorded the copy
     std::string captureMessage;  // shown next to the button
@@ -946,6 +969,7 @@ private:
     void createSurface();
     void pickPhysicalDevice();
     void createLogicalDevice();
+    void createAllocator();
     void createSwapChain();
     void createImageViews();
     void createRenderPass();
@@ -960,19 +984,27 @@ private:
     void recreateSwapChain();
     void cleanupSwapChain();
 
-    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
+    // ownMemory: a memory object of its own instead of a place in VMA's shared blocks, for what is remade whenever
+    // the render size, the mode or a feature changes (render images, per-pixel buffers) or replaced by a bigger one
+    // when it fills up (streamed buffers, the shared geometry buffers, the TLAS). Freed, the whole object goes back
+    // to the driver; in the shared blocks it would leave holes (up to ~110 MB at 4K) or a kept empty block. Only a
+    // few dozen resources, so the count of memory objects stays small.
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VmaAllocation& bufferMemory,
+                      VmaPool pool = VK_NULL_HANDLE, bool ownMemory = false);
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
-    void createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& bufferMemory);
+    void createDeviceLocalBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& bufferMemory);
     VkDeviceAddress getBufferDeviceAddress(VkBuffer buffer);
-    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties);
-    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& imageMemory, VkImageView& imageView, uint32_t mipLevels = 1);
-    void createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image);
+    VkDeviceMemory deviceMemoryOf(VmaAllocation allocation) const;
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage, VkImage& image, VmaAllocation& imageMemory, VkImageView& imageView, uint32_t mipLevels = 1, bool ownMemory = false);
+    void createImage(VkExtent2D extent, VkFormat format, VkImageUsageFlags usage, RenderImage& image);  // own memory
     void destroyImage(RenderImage& image);
 
     // RayTracer.cpp
     void createUniformBuffer();
-    AccelerationStructure createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size);
-    VkDeviceAddress createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory);
+    AccelerationStructure createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size,
+                                                      VmaPool pool = VK_NULL_HANDLE, bool ownMemory = false);
+    VkDeviceAddress createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VmaAllocation& memory, VmaPool pool = VK_NULL_HANDLE,
+                                        bool ownMemory = false);
     void destroyAccelerationStructure(AccelerationStructure& as);
     void syncBottomLevelAccelerationStructures();
     void createBottomLevelAccelerationStructures(const std::vector<uint32_t>& meshes);
@@ -984,7 +1016,7 @@ private:
     // SceneGpu.cpp
     void updateScene();
     void syncSceneGeometry();
-    void growGeometryBuffer(VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize oldSize, VkDeviceSize newSize);
+    void growGeometryBuffer(VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize oldSize, VkDeviceSize newSize);
     void destroySceneGeometry();
     // A mesh's BLAS / a texture whose model was unloaded: destroyed through deferredDeletion
     void releaseBlas(const AccelerationStructure& blas);

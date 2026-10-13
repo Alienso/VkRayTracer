@@ -22,7 +22,7 @@
 void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity) {
     streamed.capacity = capacity;
     createBuffer(capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, streamed.buffer, streamed.memory);
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
 
     streamed.staging.resize(Configuration::maxFramesInFlight);
     streamed.stagingMemory.resize(Configuration::maxFramesInFlight);
@@ -30,19 +30,19 @@ void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capac
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
         createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     streamed.staging[i], streamed.stagingMemory[i]);
-        vkMapMemory(device, streamed.stagingMemory[i], 0, capacity, 0, &streamed.stagingMapped[i]);
+                     streamed.staging[i], streamed.stagingMemory[i], VK_NULL_HANDLE, true);
+        vmaMapMemory(allocator, streamed.stagingMemory[i], &streamed.stagingMapped[i]);
     }
 }
 
 void Renderer::destroyStreamedBuffer(StreamedBuffer& streamed) {
     for (size_t i = 0; i < streamed.staging.size(); i++) {
-        vkUnmapMemory(device, streamed.stagingMemory[i]);
+        vmaUnmapMemory(allocator, streamed.stagingMemory[i]);
         vkDestroyBuffer(device, streamed.staging[i], nullptr);
-        vkFreeMemory(device, streamed.stagingMemory[i], nullptr);
+        vmaFreeMemory(allocator, streamed.stagingMemory[i]);
     }
     vkDestroyBuffer(device, streamed.buffer, nullptr);
-    vkFreeMemory(device, streamed.memory, nullptr);
+    vmaFreeMemory(allocator, streamed.memory);
     streamed = {};
 }
 
