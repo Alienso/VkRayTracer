@@ -158,6 +158,15 @@ void Editor::buildSceneUi() {
     buildPortalUi();
 
     ImGui::Text("%zu models, %zu meshes, %zu instances", assets.modelCount(), stats.meshes, stats.instances);
+    if (size_t unused = assets.unusedModelCount(); unused > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu unused, %.0f MB)", unused, assets.unusedMemory() / (1024.0 * 1024.0));
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Models no object shows any more stay loaded, so adding them again is instant.\n"
+                              "Beyond %.0f MB together, the ones removed longest ago are unloaded.",
+                              AssetStore::defaultUnusedBudget / (1024.0 * 1024.0));
+        }
+    }
     ImGui::Text("%zu materials, %zu textures (%.1f MB)", assets.materials().size(), stats.textures,
                 stats.textureMemory / (1024.0 * 1024.0));
     ImGui::Text("%zu emissive triangles (%zu bright enough to sample)", stats.emissiveTriangles,

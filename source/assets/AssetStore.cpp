@@ -98,11 +98,23 @@ ModelHandle AssetStore::findOrLoad(const std::string& fileName) {
 // Appends the model's meshes, materials and textures to the shared lists. The model's indices are relative to its
 // own lists; they are shifted to where its data lands.
 ModelHandle AssetStore::add(SceneModel sceneModel, Model& contents) {
+    // Unused models make room first (unloading moves the lists, so before the ranges below are taken)
+    while (textureList.size() + contents.textures.size() > textureLimit && unloadOldestUnused()) {
+    }
+    if (textureList.size() + contents.textures.size() > textureLimit) {
+        throw std::runtime_error("too many textures (limit " + std::to_string(textureLimit) + ")");
+    }
     uint32_t firstMesh = static_cast<uint32_t>(meshList.size());
     uint32_t firstMaterial = static_cast<uint32_t>(materialList.size());
     int firstTexture = static_cast<int>(textureList.size());
-    if (textureList.size() + contents.textures.size() > textureLimit) {
-        throw std::runtime_error("too many textures (limit " + std::to_string(textureLimit) + ")");
+
+    // What it will take on the GPU: the packed vertices and indices, the textures (a third more for the mip levels
+    // the renderer makes for those that come without)
+    for (const Mesh& mesh : contents.meshes) {
+        sceneModel.memorySize += mesh.vertices.size() * sizeof(SceneVertex) + mesh.indices.size() * sizeof(uint32_t);
+    }
+    for (const TextureData& texture : contents.textures) {
+        sceneModel.memorySize += texture.pixels.size() + (texture.mipLevels == 1 ? texture.pixels.size() / 3 : 0);
     }
 
     for (Mesh& mesh : contents.meshes) {
@@ -167,7 +179,46 @@ void AssetStore::release(ModelHandle handle) {
         model.references--;
     }
     if (model.references == 0 && !model.pinned) {
-        unload(handle.index);
+        model.lastUsed = ++useClock;  // kept, unless the unused ones now take too much
+        trimUnused(unusedBudget);
+    }
+}
+
+void AssetStore::setUnusedBudget(uint64_t bytes) {
+    unusedBudget = bytes;
+    trimUnused(unusedBudget);
+}
+
+size_t AssetStore::unusedModelCount() const {
+    size_t count = 0;
+    forEachModel([&](const SceneModel& model) { count += model.references == 0 && !model.pinned ? 1 : 0; });
+    return count;
+}
+
+uint64_t AssetStore::unusedMemory() const {
+    uint64_t bytes = 0;
+    forEachModel([&](const SceneModel& model) { bytes += model.references == 0 && !model.pinned ? model.memorySize : 0; });
+    return bytes;
+}
+
+bool AssetStore::unloadOldestUnused() {
+    int oldest = -1;
+    for (size_t i = 0; i < slots.size(); i++) {
+        const SceneModel& model = slots[i].model;
+        if (slots[i].loaded && model.references == 0 && !model.pinned &&
+            (oldest < 0 || model.lastUsed < slots[oldest].model.lastUsed)) {
+            oldest = static_cast<int>(i);
+        }
+    }
+    if (oldest < 0) {
+        return false;
+    }
+    unload(static_cast<uint32_t>(oldest));
+    return true;
+}
+
+void AssetStore::trimUnused(uint64_t budget) {
+    while (unusedMemory() > budget && unloadOldestUnused()) {
     }
 }
 

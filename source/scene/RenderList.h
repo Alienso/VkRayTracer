@@ -67,15 +67,17 @@ private:
     uint64_t revision = 0;
     bool hasMotion = false;  // some motion isn't identity: remake next frame, when it is out of date
 
-    // What the instances were made from: compared every frame, so only actual changes remake them
+    // What the instances were made from: compared every frame, so only actual changes remake them. Also last frame's
+    // objects, for the motion of the next remake (Scene::buildRenderList).
     struct BuiltObject {
+        uint64_t id;  // SceneObject::id
         ModelHandle model;
         bool visible;
         bool originalSize;
         glm::mat4 transform;
         std::vector<bool> hiddenParts;
         bool operator==(const BuiltObject& o) const {
-            return model == o.model && visible == o.visible && originalSize == o.originalSize &&
+            return id == o.id && model == o.model && visible == o.visible && originalSize == o.originalSize &&
                    transform == o.transform && hiddenParts == o.hiddenParts;
         }
     };

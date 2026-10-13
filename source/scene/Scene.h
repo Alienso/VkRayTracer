@@ -1,9 +1,10 @@
 //
-// The scene: objects placing loaded models in the world, the camera, and the environment (sun, sky). No Vulkan: the renderer turns the objects into TLAS
-// instances (SceneGpu.cpp), the editor UI changes them (SceneUi.cpp).
+// The scene: objects placing loaded models in the world, the camera, and the environment (sun, sky). No Vulkan: it
+// describes each frame in a RenderList, which the renderer turns into TLAS instances (SceneGpu.cpp); the editor UI
+// changes it (EditorScene.cpp).
 //
 // An object holds a reference to its model in the AssetStore (acquired when the object is made, released when it is
-// removed); the store unloads a model once no object shows it.
+// removed); a model no object shows is kept for a while, then unloaded (see AssetStore.h).
 //
 
 #ifndef VULKANDEMO_SCENE_H
@@ -32,8 +33,8 @@ struct SceneObject {
     std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
 
     [[nodiscard]] glm::mat4 transform() const;           // translate * rotate * scale
-    glm::mat4 previousTransform = glm::mat4(1.0f);  // last frame's transform, for motion vectors
-    bool hasPreviousTransform = false;              // false in the object's first frame (no motion then)
+    // Unique in the scene, never reused (set by the Scene): the render list finds the object's last frame by it
+    uint64_t id = 0;
 };
 
 class Scene {
@@ -51,20 +52,20 @@ public:
     int addObject(const std::string& fileName, bool originalSize);
     // A copy next to it (same model: nothing loaded). Returns the copy's index.
     int duplicateObject(int index);
-    // Releases its model (AssetStore::release): the last object of a model unloads it.
+    // Releases its model (AssetStore::release): after the last object of a model it stays loaded, unused.
     void removeObject(int index);
 
     // A new portal pair in front of the camera: its two ends side by side, facing the camera. Returns its index.
-    // Each pair holds a reference to the rim model (AssetStore::acquire), so the last one removed unloads it.
+    // Each pair holds a reference to the rim model (AssetStore::acquire), so after the last one it is unused.
     int addPortalPair();
     void removePortalPair(int index);
     [[nodiscard]] ModelHandle portalRimModel() const { return rimModel; }  // valid while there are pairs
     std::vector<PortalPair>& portals() { return portalList; }
     [[nodiscard]] const std::vector<PortalPair>& portals() const { return portalList; }
 
-    // This frame's instances, lights, portals, camera and environment, into list. Call once per frame: it also tracks each object's last-frame
-    // transform (motion vectors). The instances are only remade when an object changed or something moved last
-    // frame (see RenderList.h); the lights every time.
+    // This frame's instances, lights, portals, camera and environment, into list. Call once per frame, with the same
+    // list: it holds last frame's objects (motion vectors). The instances are only remade when an object changed or
+    // something moved last frame (see RenderList.h); the lights every time.
     void buildRenderList(RenderList& list);
 
     std::vector<SceneObject>& objects() { return objectList; }
@@ -84,6 +85,7 @@ private:
     std::vector<SceneObject> objectList;
     std::vector<PortalPair> portalList;
     int portalPairsMade = 0;  // for their names
+    uint64_t objectsMade = 0;  // for their ids
     ModelHandle rimModel;     // the built-in portal rim, while there are pairs
 
     // The bars of the enabled pairs' rims: (mesh, world matrix) for each

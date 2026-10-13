@@ -958,7 +958,8 @@ private:
 
     // SceneGpu.cpp
     void updateScene();
-    void uploadSceneGeometry();
+    void syncSceneGeometry();
+    void growGeometryBuffer(VkBuffer& buffer, VkDeviceMemory& memory, VkDeviceSize oldSize, VkDeviceSize newSize);
     void destroySceneGeometry();
     // A mesh's BLAS / a texture whose model was unloaded: destroyed through deferredDeletion
     void releaseBlas(const AccelerationStructure& blas);

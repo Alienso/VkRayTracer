@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <unordered_map>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include "assets/BuiltInModels.h"
@@ -36,6 +37,7 @@ void Scene::createDefault() {
 
     SceneObject floorObject;
     floorObject.name = "Floor";
+    floorObject.id = ++objectsMade;
     floorObject.model = assets.addFloor();
     assets.acquire(floorObject.model);
     objectList.push_back(floorObject);
@@ -69,6 +71,7 @@ int Scene::addObject(const std::string& fileName, bool originalSize) {
         object.position.x = slot * objectSpacing;
     }
 
+    object.id = ++objectsMade;
     assets.acquire(object.model);
     objectList.push_back(object);
     return static_cast<int>(objectList.size() - 1);
@@ -77,6 +80,7 @@ int Scene::addObject(const std::string& fileName, bool originalSize) {
 int Scene::duplicateObject(int index) {
     SceneObject copy = objectList[index];  // same model: no loading, just one more set of TLAS instances
     copy.position.x += objectSpacing;
+    copy.id = ++objectsMade;  // a new object: no motion from the original's place
     assets.acquire(copy.model);
     objectList.push_back(copy);
     return static_cast<int>(objectList.size() - 1);
@@ -85,7 +89,7 @@ int Scene::duplicateObject(int index) {
 void Scene::removeObject(int index) {
     ModelHandle model = objectList[index].model;
     objectList.erase(objectList.begin() + index);
-    assets.release(model);  // the last object showing it: the model is unloaded
+    assets.release(model);  // the last object showing it: the model is kept unused (see AssetStore.h)
 }
 
 int Scene::addPortalPair() {
@@ -111,7 +115,7 @@ int Scene::addPortalPair() {
 
 void Scene::removePortalPair(int index) {
     portalList.erase(portalList.begin() + index);
-    assets.release(rimModel);  // the last pair: the rim model is unloaded
+    assets.release(rimModel);  // the last pair: the rim model is kept unused
 }
 
 // A bar of a rim: the unit cube stretched to length x width x depth, its length along `along` (in the opening's
@@ -170,7 +174,8 @@ void Scene::buildRenderList(RenderList& list) {
     std::vector<RenderList::BuiltObject> current;
     current.reserve(objectList.size());
     for (const SceneObject& object : objectList) {
-        current.push_back({object.model, object.visible, object.originalSize, object.transform(), object.hiddenParts});
+        current.push_back({object.id, object.model, object.visible, object.originalSize, object.transform(),
+                           object.hiddenParts});
     }
     std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims();
     list.camera = sceneCamera;
@@ -193,17 +198,19 @@ void Scene::buildRenderList(RenderList& list) {
         }
     }
 
+    // Motion vectors need where each point was last frame. The objects the instances were last made from are last
+    // frame's: had any of them changed since, the instances would have been remade then. Found by id (objects come
+    // and go); a new object has no motion.
+    std::unordered_map<uint64_t, glm::mat4> previous;
+    if (rebuild) {
+        for (const RenderList::BuiltObject& built : list.builtObjects) {
+            previous.emplace(built.id, built.transform);
+        }
+    }
+
     for (size_t o = 0; o < objectList.size(); o++) {
-        SceneObject& object = objectList[o];
+        const SceneObject& object = objectList[o];
         const glm::mat4& objectTransform = current[o].transform;
-        // Motion vectors need where each point was last frame:
-        // last frame's position = previous object transform * inverse(current) * this frame's position.
-        // Exactly identity when it didn't move (the product can be off by rounding, which would count as motion).
-        glm::mat4 motion = object.hasPreviousTransform && object.previousTransform != objectTransform
-                                   ? object.previousTransform * glm::inverse(objectTransform)
-                                   : glm::mat4(1.0f);
-        object.previousTransform = objectTransform;
-        object.hasPreviousTransform = true;
         if (!object.visible) {
             continue;
         }
@@ -211,6 +218,12 @@ void Scene::buildRenderList(RenderList& list) {
         const SceneModel& model = assets.model(object.model);
         glm::mat4 placed = objectTransform * (object.originalSize ? glm::mat4(1.0f) : model.fit);
         if (rebuild) {
+            // last frame's position = previous object transform * inverse(current) * this frame's position. Exactly
+            // identity when it didn't move (the product can be off by rounding, which would count as motion).
+            auto last = previous.find(object.id);
+            glm::mat4 motion = last != previous.end() && last->second != objectTransform
+                                       ? last->second * glm::inverse(objectTransform)
+                                       : glm::mat4(1.0f);
             if (motion != glm::mat4(1.0f)) {
                 list.hasMotion = true;
             }

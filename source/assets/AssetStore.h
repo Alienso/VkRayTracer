@@ -7,10 +7,12 @@
 // own start (its parts' mesh indices, firstMaterial, texture indices in its materials are into these lists). The
 // renderer mirrors the lists one to one (mesh i = MeshInfo i = BLAS i, material i = GPU material i, ...).
 //
-// Lifetime: objects hold references to their model (acquire / release). A model nobody references any more is
-// unloaded right away: its meshes, materials and textures leave the lists, and the ones after them move down (the
-// other models' indices are adjusted). The renderer notices by revision() and matches its GPU copies to the lists
-// by meshIds() / textureIds(), so it frees exactly what went and keeps the rest. The floor is pinned: never unloaded.
+// Lifetime: objects hold references to their model (acquire / release). A model nobody references any more stays
+// loaded ("unused"), so showing it again is instant (no file read, no GPU upload), until the unused models together
+// take more than a memory budget: then the least recently used ones are unloaded. Unloading takes its meshes,
+// materials and textures out of the lists, and the ones after them move down (the other models' indices are
+// adjusted). The renderer notices by revision() and matches its GPU copies to the lists by meshIds() / textureIds(),
+// so it frees exactly what went and keeps the rest. The floor is pinned: never unloaded.
 //
 
 #ifndef VULKANDEMO_ASSETSTORE_H
@@ -51,6 +53,8 @@ struct SceneModel {
     uint32_t textureCount = 0;
     uint32_t references = 0;  // objects showing it (AssetStore::acquire / release)
     bool pinned = false;      // never unloaded (the floor)
+    uint64_t memorySize = 0;  // about what its meshes and textures take on the GPU, in bytes (the unused budget)
+    uint64_t lastUsed = 0;    // when its last object went (AssetStore's clock): unused models go oldest first
 };
 
 // An HDR environment map (equirectangular), from the environments directory
@@ -81,10 +85,18 @@ public:
     // Takes no reference: the caller acquires it (a model never acquired stays loaded).
     ModelHandle findOrLoad(const std::string& fileName);
 
-    // One more / one less object showing the model. The last release unloads it (unless pinned); its handle is
-    // invalid from then on (isLoaded says false, even once the slot holds another model).
+    // One more / one less object showing the model. After the last release it stays loaded but unused, until the
+    // unused budget or the texture limit needs its room; once unloaded its handle is invalid (isLoaded says false,
+    // even once the slot holds another model).
     void acquire(ModelHandle model);
     void release(ModelHandle model);
+
+    // Unused models are kept while they take at most this much GPU memory together (SceneModel::memorySize)
+    static constexpr uint64_t defaultUnusedBudget = 1ull << 30;  // 1 GiB
+    void setUnusedBudget(uint64_t bytes);
+    // How many loaded models no object shows, and their memory
+    [[nodiscard]] size_t unusedModelCount() const;
+    [[nodiscard]] uint64_t unusedMemory() const;
     [[nodiscard]] bool isLoaded(ModelHandle handle) const {
         return handle.index < slots.size() && slots[handle.index].loaded &&
                slots[handle.index].generation == handle.generation;
@@ -172,9 +184,15 @@ private:
     uint64_t contentRevision = 0;
     uint64_t materialRevisionCounter = 0;
     uint32_t textureLimit = ~0u;
+    uint64_t unusedBudget = defaultUnusedBudget;
+    uint64_t useClock = 0;  // counts releases, for SceneModel::lastUsed
 
     ModelHandle add(SceneModel model, Model& contents);
     void unload(uint32_t slot);
+    // Unloads the unused model released longest ago; false if there is none
+    bool unloadOldestUnused();
+    // Unloads unused models, oldest first, until they take at most `budget` bytes
+    void trimUnused(uint64_t budget);
 };
 
 #endif //VULKANDEMO_ASSETSTORE_H
