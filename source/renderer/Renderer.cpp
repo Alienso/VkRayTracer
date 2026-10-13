@@ -36,6 +36,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createBlueNoiseTexture();
     createVolumeTextures();
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
+    createStreamedBuffer(motionData, sizeof(glm::mat4) * 16);  // and this with the objects (updateScene)
     createLightBuffers();
     createPortalBuffer();
     createEnvironment();
@@ -63,6 +64,7 @@ void Renderer::beginFrame(float deltaTime) {
 RendererStats Renderer::stats() const {
     RendererStats stats;
     stats.deviceName = physicalDeviceProperties.deviceName;
+    stats.gpuMemory = gpuMemory();
     for (int i = 0; i < 6; i++) {
         stats.gpuPassMs[i] = gpuPassTimes[i];
     }
@@ -83,12 +85,34 @@ RendererStats Renderer::stats() const {
     return stats;
 }
 
+// Summed over the device-local heaps. Cheap enough for every frame (the driver keeps the numbers).
+GpuMemory Renderer::gpuMemory() const {
+    GpuMemory memory;
+    if (!memoryBudgetSupported) {
+        return memory;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    properties.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(physicalDevice, &properties);
+    for (uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount; heap++) {
+        if (properties.memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            memory.used += budget.heapUsage[heap];
+            memory.budget += budget.heapBudget[heap];
+        }
+    }
+    return memory;
+}
+
 void Renderer::render(const RenderList& list) {
     renderList = &list;
     updateScene();  // the render list's changes on the GPU (new models, instances, lights)
     updateEnvironment();  // a new HDR map, or new sky colors to sample by
     applyRenderMode();  // accumulation <-> DLSS modes: new render size
     applyOutputSize();  // window size <-> e.g. 4K: new images
+    applyPerPixelBuffers();  // ReSTIR or the guides switched on or off: new images
 
     drawFrame();
 }

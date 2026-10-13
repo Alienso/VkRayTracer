@@ -46,6 +46,19 @@ void Application::createDefaultScene() {
     editor.init(defaultModel, error);
 }
 
+// Unused models are only a cache (adding one again is instant): they may keep what GPU memory is free beyond a reserve
+// for the frame and for loading (render images, staging, BLAS builds), up to their default budget, and give memory
+// back once the rest of the program needs it. Without the driver's numbers: the default budget.
+static uint64_t unusedModelBudget(const GpuMemory& memory, uint64_t unusedMemory) {
+    if (memory.budget == 0) {
+        return AssetStore::defaultUnusedBudget;
+    }
+    int64_t reserve = static_cast<int64_t>(memory.budget / 8);
+    int64_t spare = static_cast<int64_t>(memory.budget) - static_cast<int64_t>(memory.used) - reserve;  // < 0: short
+    int64_t allowed = static_cast<int64_t>(unusedMemory) + spare;
+    return static_cast<uint64_t>(std::clamp<int64_t>(allowed, 0, static_cast<int64_t>(AssetStore::defaultUnusedBudget)));
+}
+
 void Application::mainLoop() {
     double lastTime = glfwGetTime();
     while (!window.shouldClose()) {
@@ -61,6 +74,7 @@ void Application::mainLoop() {
         lastTime = now;
 
         renderer.beginFrame(deltaTime);
+        assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         editor.build();  // may change the scene

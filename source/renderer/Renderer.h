@@ -107,12 +107,13 @@ struct SceneUniforms {
     float fogTime;                   // seconds of fog drift (Material::fogDrift); 0 while no fog drifts
 };
 
-// Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout).
+// Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
+// Ruins has 2.9 million instances (the inverse matrix is the shader's to work out, the motion its object's).
 struct GpuInstance {
-    glm::mat4 motion;           // this frame's world position -> last frame's (motion vectors)
-    glm::mat4x3 objectToWorld;  // the shader reads these instead of the ray query's, so hits stored by the ReSTIR
-    glm::mat3 worldToObject;    // camera-ray pass can be rebuilt the same way. Without the translation (normals)
+    glm::mat4x3 objectToWorld;  // the shader reads this instead of the ray query's, so hits stored by the ReSTIR
+                                // camera-ray pass can be rebuilt the same way
     uint32_t meshIndex;         // as the TLAS instance's custom index (fog volumes are known by their instance)
+    uint32_t motion;            // index into the motions, binding 34 (RenderList::motions: one per object)
 };
 
 // One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
@@ -544,9 +545,17 @@ struct RenderSettings {
     int dlssModel = static_cast<int>(DlssModel::TransformerF);     // DlssModel
 };
 
+// Device-local memory (Renderer::gpuMemory)
+struct GpuMemory {
+    VkDeviceSize used = 0;    // by this program
+    VkDeviceSize budget = 0;  // what it can have without slowing down (the driver's estimate, less what other programs
+                              // use); 0: unknown (no VK_EXT_memory_budget)
+};
+
 // What the renderer reports for the UI (Renderer::stats)
 struct RendererStats {
     std::string deviceName;
+    GpuMemory gpuMemory;
     float gpuPassMs[6] = {};  // GPU time per pass: cache, ReSTIR, trace, DLSS, exposure, display (smoothed)
     uint64_t triangles = 0;   // over all instances
     size_t instances = 0;
@@ -587,6 +596,7 @@ public:
     void shutdown();
 
     RendererStats stats() const;
+    GpuMemory gpuMemory() const;
     void requestCapture() { captureRequested = true; }  // the next frame's image, without the UI, as a PNG
 
     // The renderer's settings panels, for the editor's window (ImGuiInit.cpp, Environment.cpp, Lights.cpp)
@@ -663,9 +673,11 @@ private:
     std::vector<void*> instanceBuffersMapped;
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, renderList's one to one
     std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
-    std::vector<GpuInstance> frameGpuInstances;      // per instance: motion and matrices for the shader
+    std::vector<GpuInstance> frameGpuInstances;      // per instance: its matrix and motion for the shader
     StreamedBuffer instanceData;                     // frameGpuInstances on the GPU, room for tlasCapacity
-    bool instanceUploadPending = false;              // frameGpuInstances changed since the last upload
+    std::vector<glm::mat4> frameMotions;             // the render list's motions (one per object)
+    StreamedBuffer motionData;                       // frameMotions on the GPU, binding 34
+    bool instanceUploadPending = false;              // frameGpuInstances (and frameMotions) changed since the last upload
     bool tlasDirty = true;
     uint64_t builtRenderListRevision = 0;  // renderList.instanceRevision() the frame* lists above were made from
 
@@ -734,14 +746,26 @@ private:
     VkDeviceMemory restirSurfaceMemory = VK_NULL_HANDLE;
     VkBuffer giReservoirBuffer = VK_NULL_HANDLE;  // GpuGiReservoir per render pixel, three parts
     VkDeviceMemory giReservoirMemory = VK_NULL_HANDLE;
+    // Which of the above have a pixel's worth for every render pixel. The others are 1 x 1 placeholders (the
+    // descriptors need something), never touched by the shader: their features are off (buildSceneUniforms).
+    // Remade when a feature is switched on or off (applyPerPixelBuffers).
+    struct PerPixelBuffers {
+        bool restir = false;    // primary hits, first bounces, DI reservoirs and surfaces: ReSTIR DI or GI on
+        bool restirGi = false;  // GI reservoirs: ReSTIR GI on
+        bool guides = false;    // the DLSS input images and the history: writeGuides (DLSS modes, guide views)
+        bool operator==(const PerPixelBuffers& other) const {
+            return restir == other.restir && restirGi == other.restirGi && guides == other.guides;
+        }
+    };
+    PerPixelBuffers perPixelBuffers;
     // Last frame's reservoirs can be reused: ReSTIR ran, at this size, with the same lights
     bool restirHistoryAvailable = false;
     bool restirLightsChanged = false;  // this frame uploads new lights (their indices may have changed)
     uint32_t restirCurrentHalf = 0;
     bool restirGiHistoryAvailable = false;  // ReSTIR GI ran last frame, at this size
 
-    // Motion: last frame's unjittered view-projection, and per TLAS instance a matrix that takes a point on it
-    // from this frame's position to last frame's (object motion). Binding 12, uploaded when the instances change.
+    // Motion: last frame's unjittered view-projection, and per object a matrix that takes a point on it from this
+    // frame's position to last frame's (object motion). Binding 34, uploaded when the instances change.
     glm::mat4 previousViewProjection = glm::mat4(1.0f);
     bool hasPreviousViewProjection = false;
     uint32_t jitterIndex = 0;
@@ -775,6 +799,7 @@ private:
     // has it): registers per thread etc., for the Debug tab. Empty if not available.
     bool pipelineStatisticsSupported = false;
     std::string rtPipelineStatistics;
+    bool memoryBudgetSupported = false;  // VK_EXT_memory_budget (gpuMemory)
 
     // Radiance cache (RadianceCache.cpp): hash table of surface cells, on the GPU only
     static constexpr uint32_t cacheCapacity = 1u << 20;  // entries (40 MB in all)
@@ -1061,6 +1086,8 @@ private:
     // RenderSettings::outputSize -> rows of the output image (0: the window's); names in buildRenderModeUi
     static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
     void recreateRenderImages();
+    PerPixelBuffers wantedPerPixelBuffers();
+    void applyPerPixelBuffers();
     VkImageView displayedHdrView() const;  // what exposure and display read: DLSS output or the radiance image
     void createDisplayImages();
     void destroyDisplayImages();

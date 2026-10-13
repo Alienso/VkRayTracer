@@ -163,8 +163,8 @@ void Editor::buildSceneUi() {
         ImGui::TextDisabled("(%zu unused, %.0f MB)", unused, assets.unusedMemory() / (1024.0 * 1024.0));
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Models no object shows any more stay loaded, so adding them again is instant.\n"
-                              "Beyond %.0f MB together, the ones removed longest ago are unloaded.",
-                              AssetStore::defaultUnusedBudget / (1024.0 * 1024.0));
+                              "Beyond %.0f MB together, or when GPU memory runs short, the ones removed longest\n"
+                              "ago are unloaded.", AssetStore::defaultUnusedBudget / (1024.0 * 1024.0));
         }
     }
     ImGui::Text("%zu materials, %zu textures (%.1f MB)", assets.materials().size(), stats.textures,

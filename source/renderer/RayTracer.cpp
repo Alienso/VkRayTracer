@@ -173,8 +173,8 @@ void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_
         VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
         triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
         triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        triangles.vertexData.deviceAddress = vertexAddress + mesh.vertexOffset * sizeof(SceneVertex);  // this mesh's part
-        triangles.vertexStride = sizeof(SceneVertex);  // position is the first member, the rest is skipped
+        triangles.vertexData.deviceAddress = vertexAddress + mesh.vertexOffset * sizeof(GpuVertex);  // this mesh's part
+        triangles.vertexStride = sizeof(GpuVertex);  // position is the first member, the rest is skipped
         triangles.maxVertex = mesh.vertexCount - 1;    // highest vertex index used
         triangles.indexType = VK_INDEX_TYPE_UINT32;
         triangles.indexData.deviceAddress = indexAddress + mesh.indexOffset * sizeof(uint32_t);
@@ -299,7 +299,7 @@ static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructu
 void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
     tlasCapacity = capacity;
 
-    // Per instance: last frame's position from this frame's (motion vectors) and its matrices, uploaded when they change
+    // Per instance: its matrix and the index of its motion for the shader, uploaded when they change
     createStreamedBuffer(instanceData, sizeof(GpuInstance) * capacity);
     instanceUploadPending = true;  // the new buffer is empty
 
@@ -390,33 +390,39 @@ void Renderer::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
 
 // The images the trace shader writes, at render size (the display image is in Display.cpp)
 void Renderer::createRayTracingImages() {
+    // Full size only for the features that are on (PerPixelBuffers), the rest 1 x 1
+    perPixelBuffers = wantedPerPixelBuffers();
+    VkExtent2D guideExtent = perPixelBuffers.guides ? renderExtent : VkExtent2D{1, 1};
+    VkDeviceSize pixels = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
+    VkDeviceSize restirPixels = perPixelBuffers.restir ? pixels : 1;
+    VkDeviceSize restirGiPixels = perPixelBuffers.restirGi ? pixels : 1;
+
     // Everything DLSS reads is also "sampled": DLSS switches the images to SHADER_READ_ONLY_OPTIMAL while reading.
     const VkImageUsageFlags dlssInput = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     createImage(renderExtent.width, renderExtent.height, radianceFormat, dlssInput,
                 radianceImage, radianceImageMemory, radianceImageView);
     // The DLSS inputs. The diffuse albedo is copied into the history image for the reprojection error view.
-    createImage(renderExtent, linearDepthFormat, dlssInput, linearDepthImage);
-    createImage(renderExtent, motionVectorFormat, dlssInput, motionVectorImage);
-    createImage(renderExtent, guideColorFormat, dlssInput | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, diffuseAlbedoImage);
-    createImage(renderExtent, guideColorFormat, dlssInput, specularAlbedoImage);
-    createImage(renderExtent, guideColorFormat, dlssInput, normalRoughnessImage);
-    createImage(renderExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
-    createImage(renderExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    createImage(guideExtent, linearDepthFormat, dlssInput, linearDepthImage);
+    createImage(guideExtent, motionVectorFormat, dlssInput, motionVectorImage);
+    createImage(guideExtent, guideColorFormat, dlssInput | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, diffuseAlbedoImage);
+    createImage(guideExtent, guideColorFormat, dlssInput, specularAlbedoImage);
+    createImage(guideExtent, guideColorFormat, dlssInput, normalRoughnessImage);
+    createImage(guideExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
+    createImage(guideExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                 guideHistoryImage);
     createImage(renderExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, fogAmountImage);
     // Written before it is read in every frame that uses it, so it needs no clearing
-    createBuffer(sizeof(GpuPrimaryHit) * renderExtent.width * renderExtent.height, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    createBuffer(sizeof(GpuPrimaryHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory);
-    VkDeviceSize pixels = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
-    createBuffer(sizeof(GpuBounceHit) * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 bounceHitBuffer, bounceHitMemory);
+    createBuffer(sizeof(GpuBounceHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bounceHitBuffer, bounceHitMemory);
     // this frame's, last frame's, and the ReSTIR pass's result for the spatial pass
-    createBuffer(sizeof(GpuReservoir) * 3 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    createBuffer(sizeof(GpuReservoir) * 3 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory);
-    createBuffer(sizeof(GpuRestirSurface) * 2 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    createBuffer(sizeof(GpuRestirSurface) * 2 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory);
     // ReSTIR GI: this frame's, last frame's, and the image pass's fresh samples
-    createBuffer(sizeof(GpuGiReservoir) * 3 * pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    createBuffer(sizeof(GpuGiReservoir) * 3 * restirGiPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, giReservoirBuffer, giReservoirMemory);
     restirHistoryAvailable = false;  // new buffers: nothing to reuse yet
     restirGiHistoryAvailable = false;
@@ -482,13 +488,13 @@ void Renderer::destroyRayTracingImages() {
 void Renderer::createRayTracingDescriptors() {
     // 0: TLAS, 1: radiance (HDR output), 2: linear depth, 3: scene uniforms, 4: vertices, 5: indices,
     // 6: mesh infos, 7: all textures, 8: materials, 9: emissive triangles, 10: first light per instance,
-    // 11: specular albedo table, 12: per-instance motion and matrices, 13-17: motion vectors, diffuse albedo,
+    // 11: specular albedo table, 12: per-instance matrices and motion index, 13-17: motion vectors, diffuse albedo,
     // specular albedo, normal + roughness, specular hit distance, 18-20: radiance cache keys, accumulators, averages,
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
     // 29: ReSTIR GI reservoirs, 30: blue noise, 31: portals, 32: 3D textures (the fog's, Volumes.cpp),
-    // 33: fog amount (for the fog grain)
-    std::vector<VkDescriptorSetLayoutBinding> bindings(34);
+    // 33: fog amount (for the fog grain), 34: per-object motion
+    std::vector<VkDescriptorSetLayoutBinding> bindings(35);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -521,6 +527,7 @@ void Renderer::createRayTracingDescriptors() {
     bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[34] = {34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -545,7 +552,7 @@ void Renderer::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + maxVolumeTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -621,7 +628,8 @@ void Renderer::updateRayTracingDescriptorSet() {
     }
 
     VkDescriptorImageInfo fogAmountInfo{VK_NULL_HANDLE, fogAmountImage.view, VK_IMAGE_LAYOUT_GENERAL};
-    std::vector<VkWriteDescriptorSet> writes(34);
+    VkDescriptorBufferInfo motionInfo{motionData.buffer, 0, VK_WHOLE_SIZE};
+    std::vector<VkWriteDescriptorSet> writes(35);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -690,6 +698,8 @@ void Renderer::updateRayTracingDescriptorSet() {
     writes[32].pImageInfo = volumeInfos.data();
     writes[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[33].pImageInfo = &fogAmountInfo;
+    writes[34].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[34].pBufferInfo = &motionInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
@@ -929,7 +939,10 @@ SceneUniforms Renderer::buildSceneUniforms() {
     // showing ReSTIR's reservoirs).
     bool restirView = uniforms.debugView == static_cast<uint32_t>(DebugView::RestirM) ||
                       uniforms.debugView == static_cast<uint32_t>(DebugView::RestirLight);
-    uniforms.restirDi = settings.restirDi(settings.renderMode) && (uniforms.debugView == 0 || restirView) ? 1 : 0;
+    // (ReSTIR and the guides only with their buffers at full size, see PerPixelBuffers: always, once
+    // applyPerPixelBuffers has seen these settings)
+    uniforms.restirDi = settings.restirDi(settings.renderMode) && perPixelBuffers.restir &&
+                        (uniforms.debugView == 0 || restirView) ? 1 : 0;
     bool sampleTriangles = !emissiveTriangles.empty() && settings.emissiveSampling != static_cast<int>(EmissiveSampling::BouncesOnly);
     uint32_t lightCandidates = static_cast<uint32_t>(std::max(settings.restirLightCandidates, 1));
     uniforms.restirTriangleCandidates = sampleTriangles ? lightCandidates : 0;
@@ -948,7 +961,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.restirSpatialVisibility = settings.restirSpatialVisibility ? 1 : 0;
     uniforms.restirDisocclusionNeighbors = spatial ? static_cast<uint32_t>(std::max(settings.restirDisocclusionNeighbors, 0)) : 0;
     // ReSTIR GI: independent of DI; the ReSTIR pass runs for either (its camera rays and surfaces)
-    uniforms.restirGi = settings.restirGi(settings.renderMode) && uniforms.debugView == 0 ? 1 : 0;
+    uniforms.restirGi = settings.restirGi(settings.renderMode) && perPixelBuffers.restirGi && uniforms.debugView == 0 ? 1 : 0;
     uniforms.restirGiMinRoughness = settings.restirGiMinRoughness;
     uniforms.restirGiTemporal = settings.restirGiTemporal ? 1 : 0;
     uniforms.restirGiMaxHistory = settings.restirGiMaxHistory;
@@ -971,7 +984,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     // DLSS mode: every frame on its own (DLSS does the averaging over time), plus the guides it needs
     uniforms.accumulate = settings.accumulate && !dlssActive() ? 1 : 0;
     uniforms.farDistance = Configuration::cameraFar;
-    uniforms.writeGuides = dlssActive() || isGuideView(settings.debugView) ? 1 : 0;
+    uniforms.writeGuides = (dlssActive() || isGuideView(settings.debugView)) && perPixelBuffers.guides ? 1 : 0;
     uniforms.cacheQuery = settings.radianceCache && !cacheQueriesSuspended ? 1 : 0;
     uniforms.cacheCapacity = cacheCapacity;
     // A cell about cacheCellPixels render pixels wide at distance 1, growing with the distance. Pixels as rendered
@@ -1276,13 +1289,15 @@ void Renderer::writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index) {
                         currentFrame * timestampsPerFrame + index);
 }
 
-// frameGpuInstances -> instanceData, when updateScene remade them (after the previous frame's shader is done reading)
+// frameGpuInstances -> instanceData and frameMotions -> motionData, when updateScene remade them (after the previous
+// frame's shader is done reading)
 void Renderer::recordInstanceUpload(VkCommandBuffer commandBuffer) {
     if (!instanceUploadPending || frameGpuInstances.empty()) {
         return;
     }
     recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(),
                          sizeof(GpuInstance) * frameGpuInstances.size());
+    recordStreamedUpload(commandBuffer, motionData, frameMotions.data(), sizeof(glm::mat4) * frameMotions.size());
     instanceUploadPending = false;
 }
 
@@ -1308,6 +1323,7 @@ void Renderer::cleanupRayTracing() {
     destroyTextures();
     destroyLightBuffers();
     destroyPortalBuffer();
+    destroyStreamedBuffer(motionData);
     destroyEnvironment();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);

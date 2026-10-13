@@ -91,7 +91,8 @@ public:
     void acquire(ModelHandle model);
     void release(ModelHandle model);
 
-    // Unused models are kept while they take at most this much GPU memory together (SceneModel::memorySize)
+    // Unused models are kept while they take at most this much GPU memory together (SceneModel::memorySize); the
+    // program lowers it while GPU memory is short (unusedModelBudget in Application.cpp)
     static constexpr uint64_t defaultUnusedBudget = 1ull << 30;  // 1 GiB
     void setUnusedBudget(uint64_t bytes);
     // How many loaded models no object shows, and their memory

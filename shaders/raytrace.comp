@@ -141,12 +141,12 @@ uint punctualLightCount() {
     return FEATURE_LAMPS ? scene.punctualLightCount : 0u;
 }
 
-// Must match SceneVertex in ModelLoader.h. Scalar layout = tightly packed like in C++.
+// Must match GpuVertex in GpuAssets.h (a SceneVertex, packed). Scalar layout = tightly packed like in C++.
 struct Vertex {
     vec3 position;
-    vec3 normal;
+    uint normal;    // decodeDirection
+    uint tangent;   // decodeTangent: xyz the direction in which U grows, w: +-1 bitangent sign
     vec2 uv;
-    vec4 tangent;   // xyz: direction in which U grows, w: +-1 bitangent sign
 };
 
 // Must match MeshInfo in GpuAssets.h. All meshes share the vertex and index buffers;
@@ -168,6 +168,38 @@ struct MeshInfo {
 layout(binding = 4, scalar) readonly buffer Vertices { Vertex vertices[]; };
 layout(binding = 5, scalar) readonly buffer Indices { uint indices[]; };
 layout(binding = 6, scalar) readonly buffer MeshInfos { MeshInfo meshInfos[]; };
+
+// Unit vectors in 32 bits: the octahedron folded flat (Cigolle et al. 2014)
+uint encodeDirection(vec3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(e);
+}
+
+vec3 decodeOctahedral(vec2 e) {
+    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    float t = max(-n.z, 0.0);
+    n.xy += vec2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+    return normalize(n);
+}
+
+vec3 decodeDirection(uint packed) {
+    return decodeOctahedral(unpackSnorm2x16(packed));
+}
+
+// A vertex's tangent (packVertex in SceneGpu.cpp): 16 bits for x, 15 for y (sign-extended), the sign of w on top
+vec4 decodeTangent(uint packed) {
+    vec2 e = vec2(float(int(packed << 16u) >> 16), float(int(packed << 1u) >> 17)) / vec2(32767.0, 16383.0);
+    return vec4(decodeOctahedral(max(e, vec2(-1.0))), (packed & 0x80000000u) != 0u ? -1.0 : 1.0);
+}
+
+vec3 vertexNormal(uint vertex) {
+    return decodeDirection(vertices[vertex].normal);
+}
+
+vec4 vertexTangent(uint vertex) {
+    return decodeTangent(vertices[vertex].tangent);
+}
 
 // Must match GpuMaterial in Renderer.h. Each value is a constant, multiplied by its texture if the index is >= 0.
 struct Material {
@@ -244,13 +276,25 @@ layout(binding = 11, scalar) readonly buffer SpecularAlbedo { vec2 specularAlbed
 
 // Per TLAS instance. Must match GpuInstance in Renderer.h.
 struct InstanceData {
-    mat4 motion;         // takes a point on it from this frame's world position to last frame's (object motion);
-                         // identity for objects that didn't move
     mat4x3 objectToWorld;  // used instead of the ray query's matrices, so a stored hit (see "Primary hits") is
-    mat3 worldToObject;    // rebuilt the same way. Without the translation (what normals need)
+                           // rebuilt the same way
     uint meshIndex;        // as its custom index in the TLAS (fog volumes are known by their instance, see "Fog")
+    uint motion;           // its object's entry in motions
 };
 layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[]; };
+// Per object: takes a point on it from this frame's world position to last frame's (object motion); identity for
+// objects that didn't move
+layout(binding = 34, scalar) readonly buffer Motions { mat4 motions[]; };
+
+// The inverse of an instance's matrix, without the translation (what normals and directions need). Worked out here
+// rather than stored: 36 bytes less per instance (millions in big scenes).
+mat3 instanceWorldToObject(uint instance) {
+    return inverse(mat3(instances[instance].objectToWorld));
+}
+
+mat4 instanceMotion(uint instance) {
+    return motions[instances[instance].motion];
+}
 
 // The camera rays' hits (RESTIR_PASS), one per render pixel, row by row. Must match GpuPrimaryHit in Renderer.h.
 struct PrimaryHit {
@@ -849,7 +893,7 @@ float fogDensityAt(uint instance, vec3 p) {
     if (!fogVaries(material)) {
         return density;
     }
-    vec3 local = instances[instance].worldToObject * (p - instances[instance].objectToWorld[3]);
+    vec3 local = instanceWorldToObject(instance) * (p - instances[instance].objectToWorld[3]);
     if (materials[material].fogNoise != 0) {
         // Drifting fog: the noise is read further back along the drift the longer it has drifted (wrapped: the
         // texture repeats every 1, and the product stays small enough for float precision)
@@ -933,8 +977,8 @@ bool entersMesh(MeshInfo mesh, uvec3 corner, vec3 weights, mat3 worldToObject, v
     vec3 p0 = vertices[corner.x].position;
     vec3 outward = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0) * worldToObject;
     if (mesh.hasNormals != 0) {
-        vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
-                            + vertices[corner.z].normal * weights.z;
+        vec3 smoothNormal = vertexNormal(corner.x) * weights.x + vertexNormal(corner.y) * weights.y
+                            + vertexNormal(corner.z) * weights.z;
         if (dot(outward, smoothNormal * worldToObject) < 0.0) {
             outward = -outward;
         }
@@ -965,7 +1009,7 @@ bool nextFogSurface(vec3 origin, vec3 direction, float tMin, float tMax, uint ma
     uint firstIndex = mesh.indexOffset + uint(primitive) * 3;
     uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-    entering = entersMesh(mesh, corner, vec3(1.0 - bary.x - bary.y, bary.x, bary.y), instances[instance].worldToObject,
+    entering = entersMesh(mesh, corner, vec3(1.0 - bary.x - bary.y, bary.x, bary.y), instanceWorldToObject(instance),
                           direction);
     return true;
 }
@@ -1048,8 +1092,9 @@ void addLampSpan(inout Intersection hit, float a, float b, uvec2 media, float ma
 vec2 boxSpan(uint instance, vec3 origin, vec3 direction, float end) {
     uint mesh = instances[instance].meshIndex;
     // In the mesh's space: the same t along the ray (the direction isn't normalized there)
-    vec3 o = instances[instance].worldToObject * (origin - instances[instance].objectToWorld[3]);
-    vec3 d = instances[instance].worldToObject * direction;
+    mat3 worldToObject = instanceWorldToObject(instance);
+    vec3 o = worldToObject * (origin - instances[instance].objectToWorld[3]);
+    vec3 d = worldToObject * direction;
     vec3 inverse = 1.0 / mix(d, vec3(1e-30), equal(d, vec3(0.0)));
     vec3 a = (meshInfos[mesh].boundsMin - o) * inverse;
     vec3 b = (meshInfos[mesh].boundsMax - o) * inverse;
@@ -1221,7 +1266,7 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
                 uint firstIndex = mesh.indexOffset + uint(hit.primitive) * 3;
                 uvec3 corner = mesh.vertexOffset + uvec3(indices[firstIndex + 0], indices[firstIndex + 1], indices[firstIndex + 2]);
                 vec3 weights = vec3(1.0 - hit.barycentrics.x - hit.barycentrics.y, hit.barycentrics.x, hit.barycentrics.y);
-                bool entering = entersMesh(mesh, corner, weights, instances[hit.instanceIndex].worldToObject, direction);
+                bool entering = entersMesh(mesh, corner, weights, instanceWorldToObject(hit.instanceIndex), direction);
                 if (!entering && boundaryDensity > 0.0 && !inMedium(media, hit.instanceIndex)) {
                     // Out of fog it didn't know it was in: the stretch before was inside it too (see "Fog"). The others
                     // let the ray through up to here, so only this one's steps decide.
@@ -1321,8 +1366,8 @@ Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWid
 
     // Normals are transformed with the inverse transpose of the object's matrix;
     // n * M == transpose(M) * n, and M (world -> object) is already the inverse.
-    // The matrices are read from the instance buffer where they are used: kept in registers from the start, they
-    // would take 18 of them across the texture reads below.
+    // The matrices are read from the instance buffer (and inverted) where they are used: kept in registers from the
+    // start, they would take 18 of them across the texture reads below.
 
     // The position from the triangle: as exact as floats allow (offsetRay counts on it), unlike origin + t *
     // direction. Flat normal from the triangle's edges.
@@ -1330,7 +1375,7 @@ Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWid
     vec3 edge1 = vertices[corner.y].position - p0;
     vec3 edge2 = vertices[corner.z].position - p0;
     hit.position = instances[hit.instanceIndex].objectToWorld * vec4(p0 + edge1 * bary.x + edge2 * bary.y, 1.0);
-    hit.geometricNormal = normalize(cross(edge1, edge2) * instances[hit.instanceIndex].worldToObject);
+    hit.geometricNormal = normalize(cross(edge1, edge2) * instanceWorldToObject(hit.instanceIndex));
 
     float footprintWidth = scene.textureMipmaps != 0 ? coneWidth + coneSpread * hit.t : 0.0;
     mat3 objectToWorld = mat3(instances[hit.instanceIndex].objectToWorld);
@@ -1342,17 +1387,17 @@ Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWid
     // mesh look round. Without them, fall back to the flat one.
     hit.tangent = vec3(0.0);
     if (mesh.hasNormals != 0) {
-        vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
-                            + vertices[corner.z].normal * weights.z;
-        hit.normal = normalize(smoothNormal * instances[hit.instanceIndex].worldToObject);
+        vec3 smoothNormal = vertexNormal(corner.x) * weights.x + vertexNormal(corner.y) * weights.y
+                            + vertexNormal(corner.z) * weights.z;
+        hit.normal = normalize(smoothNormal * instanceWorldToObject(hit.instanceIndex));
 
         // Normal map: a texture of small surface directions (bumps, scratches, seams) that don't exist in the
         // geometry. They are stored relative to the surface: X along the tangent, Y along the bitangent, Z along
         // the normal. Tangents are directions ON the surface, so they transform like positions, not like normals.
         Material material = materials[mesh.materialIndex];
         if (mesh.hasTangents != 0) {
-            vec4 tangent = vertices[corner.x].tangent * weights.x + vertices[corner.y].tangent * weights.y
-                           + vertices[corner.z].tangent * weights.z;
+            vec4 tangent = vertexTangent(corner.x) * weights.x + vertexTangent(corner.y) * weights.y
+                           + vertexTangent(corner.z) * weights.z;
             mat3 objectToWorld = mat3(instances[hit.instanceIndex].objectToWorld);
             vec3 t = objectToWorld * tangent.xyz;
             t -= hit.normal * dot(hit.normal, t);  // interpolation bends it slightly off the surface
@@ -1412,7 +1457,7 @@ Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWid
 
     // The normals still point outwards here: tells whether the ray enters or leaves a solid.
     hit.frontFace = dot(hit.geometricNormal, direction) < 0.0;
-    hit.objectScale = length(instances[hit.instanceIndex].worldToObject * direction) * mesh.unitScale;
+    hit.objectScale = length(instanceWorldToObject(hit.instanceIndex) * direction) * mesh.unitScale;
 
     // Triangles are double-sided: if we hit the back, flip both normals towards the ray.
     if (!hit.frontFace) {
@@ -1969,8 +2014,8 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
             vec3 p0 = vertices[corner.x].position;
             vec3 outward = cross(vertices[corner.y].position - p0, vertices[corner.z].position - p0) * worldToObject;
             if (mesh.hasNormals != 0) {
-                vec3 smoothNormal = vertices[corner.x].normal * weights.x + vertices[corner.y].normal * weights.y
-                                    + vertices[corner.z].normal * weights.z;
+                vec3 smoothNormal = vertexNormal(corner.x) * weights.x + vertexNormal(corner.y) * weights.y
+                                    + vertexNormal(corner.z) * weights.z;
                 if (dot(outward, smoothNormal * worldToObject) < 0.0) {
                     outward = -outward;  // as in hitFromIntersection: the vertex normals define the outside
                 }
@@ -2647,21 +2692,6 @@ uint restirTemporalIndex(ivec2 pixel) {
     return 2u * restirPixelCount() + uint(pixel.y) * uint(imageSize(radianceImage).x) + uint(pixel.x);
 }
 
-// Unit vectors in 32 bits: the octahedron folded flat (Cigolle et al. 2014)
-uint encodeDirection(vec3 n) {
-    n /= abs(n.x) + abs(n.y) + abs(n.z);
-    vec2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
-    return packSnorm2x16(e);
-}
-
-vec3 decodeDirection(uint packed) {
-    vec2 e = unpackSnorm2x16(packed);
-    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
-    float t = max(-n.z, 0.0);
-    n.xy += vec2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
-    return normalize(n);
-}
-
 // seenAt: where the camera sees it, v: towards the viewer
 RestirSurface packRestirSurface(Hit hit, vec3 seenAt, vec3 v) {
     RestirSurface surface;
@@ -2709,7 +2739,7 @@ float restirSurfaceDepth(RestirSurface surface) {
 // or its image in mirrors, which stands still with the mirrors (moving mirrors aren't followed)
 vec4 restirPreviousPoint(RestirSurface surface, uint instanceIndex) {
     return surface.seenAt != surface.position ? vec4(surface.seenAt, 1.0)
-                                              : instances[instanceIndex].motion * vec4(surface.position, 1.0);
+                                              : instanceMotion(instanceIndex) * vec4(surface.position, 1.0);
 }
 
 // Surfaces that use ReSTIR: rough enough that a picked light sample finds the light they reflect. A near-mirror
@@ -3211,7 +3241,7 @@ void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirecti
                         float distance, mat3 toCamera, vec3 tint) {
     // A point on an object that moved is reprojected with the object's own motion as well
     vec4 position = vec4(virtualPosition ? scene.cameraPosition.xyz + cameraDirection * distance : hit.position, 1.0);
-    vec4 previousPosition = virtualPosition ? position : instances[hit.instanceIndex].motion * position;
+    vec4 previousPosition = virtualPosition ? position : instanceMotion(hit.instanceIndex) * position;
     imageStore(linearDepthImage, pixel, vec4(distance * dot(cameraDirection, scene.cameraForward.xyz)));
     imageStore(motionVectorImage, pixel, vec4(motionVector(position, previousPosition), 0.0, 0.0));
     ReflectionEnergy energy = reflectionEnergy(hit, dot(hit.normal, -direction));
@@ -4282,7 +4312,7 @@ void restirPass(ivec2 pixel, ivec2 size) {
         // where that was last frame (as restirPreviousPoint).
         vec3 seenAt = travelled > 0.0 ? scene.cameraPosition.xyz + cameraDirection * (travelled + hit.t) : hit.position;
         vec4 previousPoint = travelled > 0.0 ? vec4(seenAt, 1.0)
-                                             : instances[hit.instanceIndex].motion * vec4(hit.position, 1.0);
+                                             : instanceMotion(hit.instanceIndex) * vec4(hit.position, 1.0);
         if (restirSurface(hit) && scene.restirDi != 0) {
             // Random numbers of their own: the image pass goes on with the pixel's (its bounce directions must
             // not depend on which light was picked)

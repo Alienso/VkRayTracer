@@ -19,6 +19,14 @@ void Editor::build() {
     ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     // Always visible, whichever tab is open
     ImGui::Text("GPU: %s", stats.deviceName.c_str());
+    if (stats.gpuMemory.budget > 0) {
+        ImGui::Text("GPU memory: %.2f of %.2f GB", stats.gpuMemory.used / 1073741824.0,
+                    stats.gpuMemory.budget / 1073741824.0);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Video memory this program uses, and how much it can have without slowing down\n"
+                              "(the driver's estimate, less what other programs use)");
+        }
+    }
     ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
     ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
                 stats.gpuPassMs[0], stats.gpuPassMs[1], stats.gpuPassMs[2], stats.gpuPassMs[3], stats.gpuPassMs[4],

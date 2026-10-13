@@ -22,6 +22,38 @@ static bool needsHitTest(const Material& material) {
            material.invisibleSurface;
 }
 
+// A unit vector folded onto the octahedron, then flat: as encodeDirection in the shader. (0, 0) for a zero vector
+// (decodes to +Z; meshes without normals or tangents have those).
+static glm::vec2 octahedral(glm::vec3 n) {
+    float sum = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+    if (!(sum > 0.0f)) {
+        return glm::vec2(0.0f);
+    }
+    n /= sum;
+    if (n.z >= 0.0f) {
+        return glm::vec2(n.x, n.y);
+    }
+    return (1.0f - glm::abs(glm::vec2(n.y, n.x))) * glm::vec2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+}
+
+// -1..1 as a signed integer of `bits` bits, in the low bits of the result
+static uint32_t snorm(float value, int bits) {
+    float scale = static_cast<float>((1 << (bits - 1)) - 1);
+    int32_t quantized = static_cast<int32_t>(std::lround(std::clamp(value, -1.0f, 1.0f) * scale));
+    return static_cast<uint32_t>(quantized) & ((1u << bits) - 1u);
+}
+
+static GpuVertex packVertex(const SceneVertex& vertex) {
+    glm::vec2 normal = octahedral(vertex.normal);
+    glm::vec2 tangent = octahedral(glm::vec3(vertex.tangent));
+    GpuVertex packed{};
+    packed.position = vertex.position;
+    packed.normal = snorm(normal.x, 16) | snorm(normal.y, 16) << 16;
+    packed.tangent = snorm(tangent.x, 16) | snorm(tangent.y, 15) << 16 | (vertex.tangent.w < 0.0f ? 1u << 31 : 0u);
+    packed.uv = vertex.uv;
+    return packed;
+}
+
 static VkTransformMatrixKHR toVkTransform(const glm::mat4& m) {
     // Vulkan wants a 3x4 row-major matrix (the last row of an affine matrix is always 0 0 0 1).
     // glm is column-major: m[column][row].
@@ -79,6 +111,7 @@ void Renderer::updateScene() {
         builtRenderListRevision = renderList->instanceRevision();
         frameInstances.clear();
         frameGpuInstances.clear();
+        frameMotions = renderList->motions;
         primitiveCount = 0;
         instanceUploadPending = true;
         frameInstances.reserve(renderList->instances.size());
@@ -102,8 +135,7 @@ void Renderer::updateScene() {
                                                      : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
             instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;
             frameInstances.push_back(instance);
-            frameGpuInstances.push_back({renderList->motions[renderInstance.motion], glm::mat4x3(world),
-                                         glm::inverse(glm::mat3(world)), renderInstance.mesh});
+            frameGpuInstances.push_back({glm::mat4x3(world), renderInstance.mesh, renderInstance.motion});
             primitiveCount += gpuAssets.meshInfos[renderInstance.mesh].indexCount / 3;
         }
     }
@@ -116,6 +148,15 @@ void Renderer::updateScene() {
         destroyTopLevelAccelerationStructure();
         createTopLevelAccelerationStructure(newCapacity);
         builtInstances.clear();
+        if (rtDescriptorSet != VK_NULL_HANDLE) {
+            updateRayTracingDescriptorSet();
+        }
+    }
+
+    // 3b: the same for the motions (one per object)
+    if (sizeof(glm::mat4) * frameMotions.size() > motionData.capacity) {
+        vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+        ensureStreamedCapacity(motionData, sizeof(glm::mat4) * frameMotions.size());
         if (rtDescriptorSet != VK_NULL_HANDLE) {
             updateRayTracingDescriptorSet();
         }
@@ -185,7 +226,7 @@ void Renderer::updateScene() {
     }
 }
 
-// The buffers the shader reads the vertices and indices from, and the BLAS builds their triangles
+// The buffers the shader reads the vertices (GpuVertex) and indices from, and the BLAS builds their triangles
 static constexpr VkBufferUsageFlags geometryUsage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -250,7 +291,7 @@ void Renderer::syncSceneGeometry() {
         MeshGeometry geometry;
         geometry.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
         geometry.indexCount = static_cast<uint32_t>(mesh.indices.size());
-        place(gpuAssets.vertexRanges, gpuAssets.vertexBuffer, gpuAssets.vertexBufferMemory, sizeof(SceneVertex),
+        place(gpuAssets.vertexRanges, gpuAssets.vertexBuffer, gpuAssets.vertexBufferMemory, sizeof(GpuVertex),
               geometry.vertexCount, verticesNeeded, geometry.vertexOffset);
         place(gpuAssets.indexRanges, gpuAssets.indexBuffer, gpuAssets.indexBufferMemory, sizeof(uint32_t),
               geometry.indexCount, indicesNeeded, geometry.indexOffset);
@@ -266,7 +307,7 @@ void Renderer::syncSceneGeometry() {
     }
     // Before the first model (or with empty meshes only): the descriptors still need buffers
     if (gpuAssets.vertexBuffer == VK_NULL_HANDLE) {
-        growGeometryBuffer(gpuAssets.vertexBuffer, gpuAssets.vertexBufferMemory, 0, minGeometryCapacity * sizeof(SceneVertex));
+        growGeometryBuffer(gpuAssets.vertexBuffer, gpuAssets.vertexBufferMemory, 0, minGeometryCapacity * sizeof(GpuVertex));
         gpuAssets.vertexRanges.grow(minGeometryCapacity);
     }
     if (gpuAssets.indexBuffer == VK_NULL_HANDLE) {
@@ -278,7 +319,7 @@ void Renderer::syncSceneGeometry() {
     VkDeviceSize vertexBytes = 0;
     VkDeviceSize indexBytes = 0;
     for (size_t m : added) {
-        vertexBytes += meshes[m].vertices.size() * sizeof(SceneVertex);
+        vertexBytes += meshes[m].vertices.size() * sizeof(GpuVertex);
         indexBytes += meshes[m].indices.size() * sizeof(uint32_t);
     }
     if (vertexBytes + indexBytes > 0) {
@@ -295,10 +336,13 @@ void Renderer::syncSceneGeometry() {
         for (size_t m : added) {
             const Mesh& mesh = meshes[m];
             const MeshGeometry& geometry = gpuAssets.meshGeometry[ids[m]];
-            VkDeviceSize size = mesh.vertices.size() * sizeof(SceneVertex);
+            VkDeviceSize size = mesh.vertices.size() * sizeof(GpuVertex);
             if (size > 0) {
-                std::memcpy(mapped + vertexAt, mesh.vertices.data(), size);
-                vertexCopies.push_back({vertexAt, geometry.vertexOffset * sizeof(SceneVertex), size});
+                GpuVertex* packed = reinterpret_cast<GpuVertex*>(mapped + vertexAt);
+                for (size_t v = 0; v < mesh.vertices.size(); v++) {
+                    packed[v] = packVertex(mesh.vertices[v]);
+                }
+                vertexCopies.push_back({vertexAt, geometry.vertexOffset * sizeof(GpuVertex), size});
                 vertexAt += size;
             }
             size = mesh.indices.size() * sizeof(uint32_t);

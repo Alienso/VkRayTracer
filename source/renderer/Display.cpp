@@ -62,6 +62,26 @@ void Renderer::recreateRenderImages() {
     dlssReset = true;
 }
 
+// What this frame's settings need at full size (see PerPixelBuffers): ReSTIR's buffers take 364 bytes per render
+// pixel (GI 120 of them), the guides 48, 3.4 GB at 4K. By default Accumulation needs none, the DLSS modes all but GI's.
+Renderer::PerPixelBuffers Renderer::wantedPerPixelBuffers() {
+    PerPixelBuffers wanted;
+    wanted.restirGi = settings.restirGi(settings.renderMode);
+    wanted.restir = settings.restirDi(settings.renderMode) || wanted.restirGi;
+    wanted.guides = dlssActive() || isGuideView(settings.debugView);
+    return wanted;
+}
+
+// A feature that needs one of them was switched on (or the last one using it off): new images. Called once per frame
+// before drawing.
+void Renderer::applyPerPixelBuffers() {
+    if (wantedPerPixelBuffers() == perPixelBuffers) {
+        return;
+    }
+    vkp.deviceWaitIdle(device);
+    recreateRenderImages();
+}
+
 VkImageView Renderer::displayedHdrView() const {
     return dlssActive() ? dlssOutputImage.view : radianceImageView;
 }

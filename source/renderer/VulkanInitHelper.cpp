@@ -199,6 +199,11 @@ void Renderer::createLogicalDevice(){
             atomicFloatFeatures.pNext = &executableFeatures;
             pipelineStatisticsSupported = true;
         }
+        // Optional: how much memory the program uses and may use (gpuMemory)
+        if (std::string(extension.extensionName) == VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) {
+            extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+            memoryBudgetSupported = true;
+        }
     }
 
     VkPhysicalDeviceFeatures2 features2{};
