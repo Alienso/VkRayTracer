@@ -231,5 +231,16 @@ void Editor::buildRenderingPanel() {
 void Editor::buildDebugPanel() {
     renderer.buildDebugUi();
     ImGui::Separator();
+    ImGui::Checkbox("Check scene updates", &scene.checkUpdates);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Slow: every frame something moves, the whole render list is also made from scratch and\n"
+                          "compared with the one that only changed what moved. A difference means a change was\n"
+                          "missed (printed to the console).");
+    }
+    if (scene.updateCheckFailures() > 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%llu frames differed",
+                           static_cast<unsigned long long>(scene.updateCheckFailures()));
+    }
     ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
 }

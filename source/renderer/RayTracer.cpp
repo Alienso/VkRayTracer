@@ -308,7 +308,8 @@ void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_
     vmaDestroyPool(allocator, buildPool);  // empty by now
 }
 
-// Top level: placed copies (instances) of bottom level structures, each with a transform.
+// Top level: placed copies (instances) of bottom level structures, each with a transform. It can be updated in place
+// (refit) while only the instances' transforms change (recordTopLevelBuild).
 // Both describing calls (size query and build) must use the same geometry type and flags.
 static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructureGeometryKHR& geometry,
                              VkAccelerationStructureBuildGeometryInfoKHR& buildInfo) {
@@ -322,7 +323,8 @@ static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructu
     buildInfo = {};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                      VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &geometry;
@@ -334,20 +336,13 @@ void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
 
     // Per instance: its matrix and the index of its motion for the shader, uploaded when they change
     createStreamedBuffer(instanceData, sizeof(GpuInstance) * capacity);
-    instanceUploadPending = true;  // the new buffer is empty
-
-    // Instance buffers stay mapped: the CPU writes the instances right before the build is recorded.
-    instanceBuffers.resize(Configuration::maxFramesInFlight);
-    instanceBufferMemories.resize(Configuration::maxFramesInFlight);
-    instanceBuffersMapped.resize(Configuration::maxFramesInFlight);
-    VkDeviceSize instanceBufferSize = sizeof(VkAccelerationStructureInstanceKHR) * capacity;
-    for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        createBuffer(instanceBufferSize,
-                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     instanceBuffers[i], instanceBufferMemories[i], VK_NULL_HANDLE, true);
-        vmaMapMemory(allocator, instanceBufferMemories[i], &instanceBuffersMapped[i]);
-    }
+    // The instances the TLAS is built from
+    createStreamedBuffer(tlasInstanceData, sizeof(VkAccelerationStructureInstanceKHR) * capacity,
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+    instanceDataPending.addAll();  // the new buffers are empty
+    tlasInstancePending.addAll();
 
     // Sizes for the worst case (full capacity). Builds with fewer instances fit as well.
     VkAccelerationStructureGeometryKHR geometry;
@@ -360,40 +355,52 @@ void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
 
     tlas = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizeInfo.accelerationStructureSize,
                                        VK_NULL_HANDLE, true);
-    tlasScratchAddress = createScratchBuffer(sizeInfo.buildScratchSize, tlasScratchBuffer, tlasScratchMemory,
-                                             VK_NULL_HANDLE, true);
+    tlasScratchAddress = createScratchBuffer(std::max(sizeInfo.buildScratchSize, sizeInfo.updateScratchSize),
+                                             tlasScratchBuffer, tlasScratchMemory, VK_NULL_HANDLE, true);
     tlasDirty = true;  // nothing built yet
+    tlasRebuildNeeded = true;
 }
 
 void Renderer::destroyTopLevelAccelerationStructure() {
     destroyAccelerationStructure(tlas);
     destroyStreamedBuffer(instanceData);
+    destroyStreamedBuffer(tlasInstanceData);
     vkDestroyBuffer(device, tlasScratchBuffer, nullptr);
     vmaFreeMemory(allocator, tlasScratchMemory);
-    for (size_t i = 0; i < instanceBuffers.size(); i++) {
-        vmaUnmapMemory(allocator, instanceBufferMemories[i]);
-        vkDestroyBuffer(device, instanceBuffers[i], nullptr);
-        vmaFreeMemory(allocator, instanceBufferMemories[i]);
-    }
-    instanceBuffers.clear();
-    instanceBufferMemories.clear();
-    instanceBuffersMapped.clear();
     tlasCapacity = 0;
 }
 
-// Rebuilds the TLAS from frameInstances, on the GPU, before this frame's ray tracing.
-// Rebuilding from scratch every time something moves is fine: a TLAS over a few hundred instances
-// builds in microseconds. (Big scenes would use an "update" (refit) instead.)
+// Builds the TLAS from frameInstances, on the GPU, before this frame's ray tracing (the instances that changed are
+// copied first).
+//
+// While only transforms change (things move), the TLAS is updated in place instead of built anew: its tree stays,
+// only the boxes are refit around the instances' new places. In Jungle Ruins (2.9 million instances) with one object
+// moving, the GPU work before tracing took ~15 ms per frame with builds, ~5 ms with updates. The tree gets worse the
+// further things move from where it was built, so it is built again once nothing moves (updateScene), or after
+// maxTlasUpdates updates in a row.
 void Renderer::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
     uint32_t instanceCount = static_cast<uint32_t>(frameInstances.size());
-    std::memcpy(instanceBuffersMapped[currentFrame], frameInstances.data(),
-                sizeof(VkAccelerationStructureInstanceKHR) * instanceCount);
+    if (tlasInstancePending.all) {
+        recordStreamedUpload(commandBuffer, tlasInstanceData, frameInstances.data(),
+                             sizeof(VkAccelerationStructureInstanceKHR) * instanceCount);
+    } else {
+        recordStreamedUpload(commandBuffer, tlasInstanceData, frameInstances.data(),
+                             sizeof(VkAccelerationStructureInstanceKHR), tlasInstancePending.ranges);
+    }
+    tlasInstancePending.clear();
 
     VkAccelerationStructureGeometryKHR geometry;
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
-    describeTopLevel(getBufferDeviceAddress(instanceBuffers[currentFrame]), geometry, buildInfo);
+    describeTopLevel(getBufferDeviceAddress(tlasInstanceData.buffer), geometry, buildInfo);
     buildInfo.dstAccelerationStructure = tlas.handle;
     buildInfo.scratchData.deviceAddress = tlasScratchAddress;
+    if (!tlasRebuildNeeded && tlasUpdates < maxTlasUpdates) {
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        buildInfo.srcAccelerationStructure = tlas.handle;  // in place
+        tlasUpdates++;
+    } else {
+        tlasUpdates = 0;
+    }
 
     // The previous frame may still be tracing rays through the TLAS (compute shader) or building it
     // (scratch memory). Both must finish before we overwrite them.
@@ -418,9 +425,12 @@ void Renderer::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    builtInstances = frameInstances;
     tlasDirty = false;
-    resetAccumulation = true;  // the scene changed, the accumulated image is outdated
+    tlasRebuildNeeded = false;
+    if (!tlasTidyOnly) {
+        resetAccumulation = true;  // the scene changed, the accumulated image is outdated
+    }
+    tlasTidyOnly = false;
 }
 
 // The images the trace shader writes, at render size (the display image is in Display.cpp)
@@ -1325,16 +1335,21 @@ void Renderer::writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index) {
                         currentFrame * timestampsPerFrame + index);
 }
 
-// frameGpuInstances -> instanceData and frameMotions -> motionData, when updateScene remade them (after the previous
+// What updateScene changed of frameGpuInstances -> instanceData, and frameMotions -> motionData (after the previous
 // frame's shader is done reading)
 void Renderer::recordInstanceUpload(VkCommandBuffer commandBuffer) {
-    if (!instanceUploadPending || frameGpuInstances.empty()) {
-        return;
+    if (instanceDataPending.all) {
+        recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(),
+                             sizeof(GpuInstance) * frameGpuInstances.size());
+    } else {
+        recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(), sizeof(GpuInstance),
+                             instanceDataPending.ranges);
     }
-    recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(),
-                         sizeof(GpuInstance) * frameGpuInstances.size());
-    recordStreamedUpload(commandBuffer, motionData, frameMotions.data(), sizeof(glm::mat4) * frameMotions.size());
-    instanceUploadPending = false;
+    instanceDataPending.clear();
+    if (motionUploadPending) {
+        recordStreamedUpload(commandBuffer, motionData, frameMotions.data(), sizeof(glm::mat4) * frameMotions.size());
+        motionUploadPending = false;
+    }
 }
 
 void Renderer::cleanupRayTracing() {

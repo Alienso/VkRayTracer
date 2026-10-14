@@ -4,7 +4,8 @@
 // AssetStore.h).
 //
 // Models are loaded once (meshes + one BLAS per mesh). Objects only add a transform, so moving, adding or
-// removing objects just rebuilds the small TLAS. Loading a model uploads only its own meshes; unloading frees theirs.
+// removing objects just rebuilds the TLAS. Loading a model uploads only its own meshes; unloading frees theirs. When
+// objects move, only their instances are rewritten and copied (big scenes have millions of instances).
 //
 
 #include <vulkan/vulkan.h>
@@ -66,6 +67,26 @@ static VkTransformMatrixKHR toVkTransform(const glm::mat4& m) {
     return transform;
 }
 
+VkAccelerationStructureInstanceKHR Renderer::makeTlasInstance(const RenderInstance& renderInstance) const {
+    VkAccelerationStructureInstanceKHR instance{};
+    instance.transform = toVkTransform(renderInstance.world);
+    instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
+    const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
+    // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt looks at alone:
+    // 0x02 even fog, 0x04 varying (see "Fog" there). The rest: 0x01.
+    instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : 0x01;
+    instance.instanceShaderBindingTableRecordOffset = 0;
+    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    // Materials a ray can pass through (needsHitTest) are "not opaque": rays ask the shader whether a hit on
+    // them counts (except in the basic shader without fog, whose rays treat everything as opaque). Everything
+    // else stays on the fast path where the hardware decides alone. Switching a material's alpha mode in the UI
+    // changes the flags, which rebuilds the TLAS.
+    instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                                             : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;
+    return instance;
+}
+
 // Called every frame before drawFrame: applies UI changes to the GPU-side scene.
 void Renderer::updateScene() {
     // 1: a model was loaded or unloaded (the asset store's revision moved on) -> the new meshes' geometry and BLASes,
@@ -89,8 +110,6 @@ void Renderer::updateScene() {
         gpuAssets.geometryUploaded = true;
         gpuAssets.uploadedRevision = assets.revision();
         // The TLAS points at the old BLASes (some now released): it must be rebuilt, even when there are no instances
-        // now (the comparison in step 4 would find nothing changed then: empty before, empty now)
-        builtInstances.clear();
         tlasDirty = true;
         geometryReuploaded = true;  // and the instances remade (new mesh infos), below
         dlssReset = true;        // a different scene: DLSS's history is useless
@@ -104,39 +123,89 @@ void Renderer::updateScene() {
         updateRayTracingDescriptorSet();
     }
 
-    // 2: the scene's render list -> TLAS instances, one per list instance. Only remade when the list was (an object
-    //    changed or moved), a material changed (the opaque flags), or the geometry was re-uploaded (BLAS addresses).
-    bool rebuild = renderList->instanceRevision() != builtRenderListRevision || gpuAssets.materialsDirty || geometryReuploaded;
-    if (rebuild) {
+    // 2: the scene's render list -> TLAS instances, one per list instance. All of them when the list was remade (or
+    //    a build of it was missed: its changes are only the last build's) or the geometry was re-uploaded (BLAS
+    //    addresses); else only the ranges the list rewrote (moved entities), and the flags when a material changed.
+    bool consecutive = renderList->build() == seenRenderListBuild + 1;
+    seenRenderListBuild = renderList->build();
+    bool instancesRemade = renderList->instanceRevision() != builtRenderListRevision || !consecutive ||
+                           geometryReuploaded;
+    bool emissiveMoved = false;  // a glowing instance moved: the light list follows (step 6)
+    auto allInstancesChanged = [&]() {
+        tlasInstancePending.addAll();
+        instanceDataPending.addAll();
+        tlasDirty = true;
+        tlasRebuildNeeded = true;
+        tlasTidyOnly = false;
+    };
+    if (instancesRemade) {
         builtRenderListRevision = renderList->instanceRevision();
-        frameInstances.clear();
-        frameGpuInstances.clear();
-        frameMotions = renderList->motions;
+        size_t count = renderList->instances.size();
+        std::vector<VkAccelerationStructureInstanceKHR> remade(count);  // zeroed, so memcmp compares only real data
+        frameGpuInstances.resize(count);
         primitiveCount = 0;
-        instanceUploadPending = true;
-        frameInstances.reserve(renderList->instances.size());
-        frameGpuInstances.reserve(renderList->instances.size());
-        for (const RenderInstance& renderInstance : renderList->instances) {
-            const glm::mat4& world = renderInstance.world;
-            VkAccelerationStructureInstanceKHR instance{};  // zeroed, so memcmp below compares only real data
-            instance.transform = toVkTransform(world);
-            instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
-            const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
-            // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt looks at alone:
-            // 0x02 even fog, 0x04 varying (see "Fog" there). The rest: 0x01.
-            instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : 0x01;
-            instance.instanceShaderBindingTableRecordOffset = 0;
-            instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-            // Materials a ray can pass through (needsHitTest) are "not opaque": rays ask the shader whether a hit on
-            // them counts (except in the basic shader without fog, whose rays treat everything as opaque). Everything
-            // else stays on the fast path where the hardware decides alone. A material change remakes the instances,
-            // so switching a material's alpha mode in the UI rebuilds the TLAS (the instances differ).
-            instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
-                                                     : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
-            instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;
-            frameInstances.push_back(instance);
-            frameGpuInstances.push_back({glm::mat4x3(world), renderInstance.mesh, renderInstance.motion});
+        for (size_t i = 0; i < count; i++) {
+            const RenderInstance& renderInstance = renderList->instances[i];
+            remade[i] = makeTlasInstance(renderInstance);
+            frameGpuInstances[i] = {glm::mat4x3(renderInstance.world), renderInstance.mesh, renderInstance.motion};
             primitiveCount += gpuAssets.meshInfos[renderInstance.mesh].indexCount / 3;
+        }
+        // The same instances as before (e.g. a group added, or an entity re-parented where it stands): the TLAS
+        // stays, and so does the accumulated image. The motion indices may still have moved.
+        bool same = !geometryReuploaded && remade.size() == frameInstances.size() &&
+                    std::memcmp(remade.data(), frameInstances.data(),
+                                remade.size() * sizeof(VkAccelerationStructureInstanceKHR)) == 0;
+        frameInstances = std::move(remade);
+        frameMotions = renderList->motions;
+        motionUploadPending = true;
+        if (same) {
+            instanceDataPending.addAll();
+        } else {
+            allInstancesChanged();
+        }
+    } else {
+        // A material can change which rays may pass through an instance (the flags) and which group it is in (the
+        // mask). Only when one did is the TLAS rebuilt.
+        if (gpuAssets.materialsDirty) {
+            bool flagsChanged = false;
+            for (size_t i = 0; i < frameInstances.size(); i++) {
+                VkAccelerationStructureInstanceKHR instance = makeTlasInstance(renderList->instances[i]);
+                if (instance.mask != frameInstances[i].mask || instance.flags != frameInstances[i].flags) {
+                    frameInstances[i].mask = instance.mask;
+                    frameInstances[i].flags = instance.flags;
+                    flagsChanged = true;
+                }
+            }
+            if (flagsChanged) {
+                tlasInstancePending.addAll();
+                tlasDirty = true;
+                tlasRebuildNeeded = true;
+                tlasTidyOnly = false;
+            }
+        }
+        for (const InstanceRange& range : renderList->changedInstances()) {
+            for (uint32_t i = range.first; i < range.first + range.count; i++) {
+                const glm::mat4& world = renderList->instances[i].world;
+                frameInstances[i].transform = toVkTransform(world);
+                frameGpuInstances[i].objectToWorld = glm::mat4x3(world);
+            }
+            tlasInstancePending.add(range);
+            instanceDataPending.add(range);
+            tlasDirty = true;
+            tlasTidyOnly = false;
+            auto glowing = std::lower_bound(emissiveInstances.begin(), emissiveInstances.end(), range.first);
+            emissiveMoved |= glowing != emissiveInstances.end() && *glowing < range.first + range.count;
+        }
+        if (renderList->motionsChanged()) {
+            frameMotions = renderList->motions;
+            motionUploadPending = true;
+        }
+        // Nothing moved after a time of updates: the TLAS's tree is built anew for the instances' new places (rays
+        // find the same hits through either: the image stays)
+        if (!tlasDirty && tlasUpdates > 0) {
+            tlasDirty = true;
+            tlasRebuildNeeded = true;
+            tlasTidyOnly = true;
         }
     }
 
@@ -147,7 +216,6 @@ void Renderer::updateScene() {
         uint32_t newCapacity = std::max(static_cast<uint32_t>(frameInstances.size()), tlasCapacity * 2);
         destroyTopLevelAccelerationStructure();
         createTopLevelAccelerationStructure(newCapacity);
-        builtInstances.clear();
         if (rtDescriptorSet != VK_NULL_HANDLE) {
             updateRayTracingDescriptorSet();
         }
@@ -157,16 +225,10 @@ void Renderer::updateScene() {
     if (sizeof(glm::mat4) * frameMotions.size() > motionData.capacity) {
         vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
         ensureStreamedCapacity(motionData, sizeof(glm::mat4) * frameMotions.size());
+        motionUploadPending = true;
         if (rtDescriptorSet != VK_NULL_HANDLE) {
             updateRayTracingDescriptorSet();
         }
-    }
-
-    // 4: anything moved (or appeared/disappeared)? Then the TLAS gets rebuilt in this frame's command buffer.
-    if (rebuild && (frameInstances.size() != builtInstances.size() ||
-        std::memcmp(frameInstances.data(), builtInstances.data(),
-                    frameInstances.size() * sizeof(VkAccelerationStructureInstanceKHR)) != 0)) {
-        tlasDirty = true;
     }
 
     // 5: punctual lights, every frame (a handful). Uploaded in this frame's command buffer when they changed; the
@@ -209,8 +271,9 @@ void Renderer::updateScene() {
 
     // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list. Also when light
     // picking changes: the tree is built only for picking with it.
-    if (tlasDirty || gpuAssets.materialsDirty || settings.lightPicking != lightListPicking) {
-        buildLightList();  // uploaded in this frame's command buffer
+    bool lightsChanged = instancesRemade || gpuAssets.materialsDirty;
+    if (lightsChanged || emissiveMoved || settings.lightPicking != lightListPicking) {
+        buildLightList(lightsChanged);  // uploaded in this frame's command buffer
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
         VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();
         VkDeviceSize treeSize = sizeof(LightTreeNode) * lightTree.size();
@@ -218,7 +281,9 @@ void Renderer::updateScene() {
             treeSize > lightTreeBuffer.capacity) {
             vkp.deviceWaitIdle(device);  // the buffers are replaced, no frame may use them
             ensureStreamedCapacity(emissiveTriangleBuffer, trianglesSize);
-            ensureStreamedCapacity(instanceLightBuffer, offsetsSize);
+            if (ensureStreamedCapacity(instanceLightBuffer, offsetsSize)) {
+                instanceLightsUploadPending = true;  // a new, empty buffer
+            }
             ensureStreamedCapacity(lightTreeBuffer, treeSize);
             if (rtDescriptorSet != VK_NULL_HANDLE) {
                 updateRayTracingDescriptorSet();

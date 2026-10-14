@@ -51,6 +51,7 @@ struct Entity {
     std::string name;
     EntityId parent = 0;              // 0: a root
     std::vector<EntityId> children;   // in the order the editor lists them
+    // These two can be changed directly (the editor, game logic): the render list finds the change in the next frame
     Transform local;                  // relative to the parent
     bool visible = true;              // hidden hides the children too
     bool uniformScale = true;         // UI only: edit all three scale axes together
@@ -60,7 +61,9 @@ struct Entity {
 struct ModelComponent {
     ModelHandle model;              // invalid when the model couldn't be loaded (missingFile)
     bool originalSize = false;      // skip the model's fit: keep the file's own size and position (glTF: meters)
-    std::vector<bool> hiddenParts;  // per part of the model; missing entries count as visible
+    // Per part of the model; missing entries count as visible. Changed through Scene::setPartHidden (models have up
+    // to millions of parts: the render list doesn't compare them every frame).
+    std::vector<bool> hiddenParts;
     // A scene file named a model that couldn't be loaded: its name, why, and the file's entry, saved back as it was
     // (so saving doesn't lose it). Nothing is shown for it.
     std::string missingFile;
@@ -128,14 +131,20 @@ public:
     [[nodiscard]] const ModelComponent* model(EntityId id) const;
     PortalComponent* portal(EntityId id);
     [[nodiscard]] const PortalComponent* portal(EntityId id) const;
+    // Shows or hides one part of a model entity
+    void setPartHidden(EntityId id, size_t part, bool hidden);
     // After editing a portal end's shape, size or rim: the same for its other end
     void syncPortal(EntityId end);
     [[nodiscard]] ModelHandle portalRimModel() const { return rimModel; }  // valid while there are pairs
 
     // This frame's instances, lights, portals, camera and environment, into list. Call once per frame, with the same
-    // list: it holds last frame's objects (motion vectors). The instances are only remade when an object changed or
-    // something moved last frame (see RenderList.h); the lights every time.
+    // list: it holds last frame's entities (motion vectors, what changed). Only what changed is redone (see
+    // RenderList.h); the lights and portals every time.
     void buildRenderList(RenderList& list);
+    // A check for the above (slow: Debug panel): after each build that only rewrote what changed, the whole list is
+    // also made from scratch and compared. A difference (a change the build missed) is counted, and printed.
+    bool checkUpdates = false;
+    [[nodiscard]] uint64_t updateCheckFailures() const { return checkFailures; }
 
     Camera& camera() { return sceneCamera; }
     [[nodiscard]] const Camera& camera() const { return sceneCamera; }
@@ -158,6 +167,10 @@ private:
     ModelHandle rimModel;       // the built-in portal rim, while there are pairs
     Camera sceneCamera;
     SceneEnvironment sceneEnvironment;
+    // Goes up when the render list's layout changes in ways it doesn't find by comparing entities: entities added,
+    // removed or re-parented (the tree order), parts shown or hidden
+    uint64_t layoutRevision = 1;
+    uint64_t checkFailures = 0;
 
     Entity& create(const std::string& name, EntityId parent);
     // With an id from a file (entitiesMade is set after loading)
@@ -192,6 +205,22 @@ private:
     // The bars of the pairs' rims: (mesh, world matrix) for each
     [[nodiscard]] std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims(
             const std::vector<PlacedPair>& pairs) const;
+    // A model entity as this frame has it (buildRenderList)
+    struct PlacedModel {
+        EntityId id;
+        const ModelComponent* component;
+        bool visible;
+        glm::mat4 world;
+    };
+    // The render list's instances and motions made from scratch / only the moved entities' ranges rewritten (false
+    // when the layout turned out different: then nothing useful was done)
+    void remakeInstances(RenderList& list, const std::vector<PlacedModel>& models,
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims) const;
+    bool updateInstances(RenderList& list, const std::vector<PlacedModel>& models,
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims) const;
+    // An entity's parts in world space (entity * fit * part), the hidden ones left out, in order
+    template <typename Visit>
+    void forEachVisiblePart(const PlacedModel& model, Visit&& visit) const;
 };
 
 #endif //VULKANDEMO_SCENE_H

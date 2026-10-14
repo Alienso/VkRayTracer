@@ -445,6 +445,8 @@ struct StreamedBuffer {
     std::vector<VmaAllocation> stagingMemory;
     std::vector<void*> stagingMapped;
     VkDeviceSize capacity = 0;
+    VkBufferUsageFlags usage = 0;      // what the buffer is used as (besides a copy's destination)
+    VkPipelineStageFlags readers = 0;  // the stages that read it
 };
 
 // The renderer's settings. What is lit and how (sun, sky, map) is the scene's: SceneEnvironment.
@@ -683,31 +685,56 @@ private:
     VkBuffer blueNoiseBuffer;
     VmaAllocation blueNoiseMemory;
 
-    // TLAS: rebuilt on the GPU, inside the frame's command buffer, whenever an object moves.
+    // TLAS: built (or updated) on the GPU, inside the frame's command buffer, whenever an object moves.
     // It has room for tlasCapacity instances and is only recreated when more are needed.
     AccelerationStructure tlas;
     uint32_t tlasCapacity = 0;
     VkBuffer tlasScratchBuffer;
     VmaAllocation tlasScratchMemory;
     VkDeviceAddress tlasScratchAddress = 0;
-    // The CPU writes instances while the previous frame may still be building from its buffer, hence one per frame in flight.
-    std::vector<VkBuffer> instanceBuffers;
-    std::vector<VmaAllocation> instanceBufferMemories;
-    std::vector<void*> instanceBuffersMapped;
     std::vector<VkAccelerationStructureInstanceKHR> frameInstances;  // this frame's instances, renderList's one to one
-    std::vector<VkAccelerationStructureInstanceKHR> builtInstances;  // what the TLAS currently contains
+    // frameInstances on the GPU, what the TLAS is built from. In device memory: the build reads all of it (from
+    // system memory over the bus, 2.9 million instances took ~100 ms of a build).
+    StreamedBuffer tlasInstanceData;
     std::vector<GpuInstance> frameGpuInstances;      // per instance: its matrix and motion for the shader
     StreamedBuffer instanceData;                     // frameGpuInstances on the GPU, room for tlasCapacity
     std::vector<glm::mat4> frameMotions;             // the render list's motions (one per object)
     StreamedBuffer motionData;                       // frameMotions on the GPU, binding 34
-    bool instanceUploadPending = false;              // frameGpuInstances (and frameMotions) changed since the last upload
+    // The instances that changed since a buffer was last written: all of them, or these ranges. Only the changes
+    // are copied: big scenes have millions of instances, and usually only a few of them move.
+    struct PendingInstances {
+        bool all = true;
+        std::vector<InstanceRange> ranges;
+        void add(const InstanceRange& range) {
+            if (!all) {
+                ranges.push_back(range);
+                all = ranges.size() > 4096;  // many small moves: copying everything is simpler
+            }
+        }
+        void addAll() { all = true; ranges.clear(); }
+        void clear() { all = false; ranges.clear(); }
+    };
+    PendingInstances tlasInstancePending;  // frameInstances -> tlasInstanceData
+    PendingInstances instanceDataPending;  // frameGpuInstances -> instanceData
+    bool motionUploadPending = false;                     // frameMotions -> motionData
     bool tlasDirty = true;
+    // The TLAS is updated in place while only transforms change (recordTopLevelBuild), built anew when instances are
+    // added, removed or changed otherwise (tlasRebuildNeeded), once nothing moves any more after updates (then only
+    // to tidy the tree: tlasTidyOnly, the image stays), or after this many updates in a row
+    static constexpr uint32_t maxTlasUpdates = 1000;
+    bool tlasRebuildNeeded = true;
+    bool tlasTidyOnly = false;
+    uint32_t tlasUpdates = 0;  // since it was last built
     uint64_t builtRenderListRevision = 0;  // renderList.instanceRevision() the frame* lists above were made from
+    uint64_t seenRenderListBuild = 0;      // renderList.build() whose changes are in them
 
-    // Light list for sampling emissive surfaces. Rebuilt on the CPU when instances or materials change.
+    // Light list for sampling emissive surfaces. Rebuilt on the CPU when instances or materials change, or glowing
+    // instances move.
     std::vector<EmissiveTriangle> emissiveTriangles;
     size_t sampledEmissiveTriangles = 0;      // of those, how many light sampling can pick (probability > 0)
     std::vector<int32_t> instanceFirstLight;  // per TLAS instance: index of its first triangle in the list, or -1
+    std::vector<uint32_t> emissiveInstances;  // the instances with a glowing material, in order
+    bool instanceLightsUploadPending = false;  // instanceFirstLight changed (it only does when instances or materials do)
     StreamedBuffer emissiveTriangleBuffer;
     StreamedBuffer instanceLightBuffer;
     std::vector<LightTreeNode> lightTree;
@@ -1022,6 +1049,8 @@ private:
 
     // SceneGpu.cpp
     void updateScene();
+    // The TLAS instance for a render list instance (its mesh's BLAS, flags and mask from its material)
+    VkAccelerationStructureInstanceKHR makeTlasInstance(const RenderInstance& renderInstance) const;
     void syncSceneGeometry();
     void growGeometryBuffer(VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize oldSize, VkDeviceSize newSize);
     void destroySceneGeometry();
@@ -1030,13 +1059,22 @@ private:
     void releaseTexture(const GpuTexture& texture);
 
     // Lights.cpp
-    void createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity);
+    void createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity,
+                              VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              VkPipelineStageFlags readers = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     void destroyStreamedBuffer(StreamedBuffer& streamed);
     bool ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize size);
     void recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size);
+    void recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
+                              const std::vector<VkBufferCopy>& copies);
+    // Only these ranges of an array of elementSize-byte elements (the rest of the buffer stays as it is)
+    void recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
+                              VkDeviceSize elementSize, const std::vector<InstanceRange>& ranges);
     void createLightBuffers();
     void destroyLightBuffers();
-    void buildLightList();
+    // instancesChanged: other instances or materials (which instances glow is looked up again); else only glowing
+    // instances moved
+    void buildLightList(bool instancesChanged);
     void buildLightTree();
     void recordLightUpload(VkCommandBuffer commandBuffer);
     void buildPunctualLightList();

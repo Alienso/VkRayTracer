@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <iostream>
 #include <unordered_set>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -84,6 +85,7 @@ void Scene::clear() {
     sceneCamera = Camera();
     sceneEnvironment = SceneEnvironment();
     assets.resetEdits();
+    layoutRevision++;
     createDefault();
 }
 
@@ -114,6 +116,7 @@ void Scene::takeFrom(Scene& other) {
     rimModel = other.rimModel;
     sceneCamera = other.sceneCamera;
     sceneEnvironment = other.sceneEnvironment;
+    layoutRevision++;  // (its own counter: the render list compares with this scene's)
     other.entityList.clear();
     other.entityIndex.clear();
     other.rootList.clear();
@@ -147,6 +150,7 @@ Entity& Scene::createWithId(EntityId id, const std::string& name, EntityId paren
     entity.name = name;
     entity.parent = parent;
     siblings(parent).push_back(entity.id);  // (before the list grows: siblings may point into it)
+    layoutRevision++;
     entityIndex[entity.id] = entityList.size();
     entityList.push_back(std::move(entity));
     return entityList.back();
@@ -318,6 +322,7 @@ void Scene::remove(EntityId id) {
                                     [&](const Entity& entity) { return removed.count(entity.id) > 0; }),
                      entityList.end());
     reindex();
+    layoutRevision++;
 }
 
 bool Scene::setParent(EntityId id, EntityId parent, bool keepWorld) {
@@ -330,6 +335,7 @@ bool Scene::setParent(EntityId id, EntityId parent, bool keepWorld) {
     from.erase(std::find(from.begin(), from.end(), id));
     entity->parent = parent;
     siblings(parent).push_back(id);
+    layoutRevision++;  // the tree order changed
     if (keepWorld) {
         entity->local = toTransform(parent == 0 ? world : glm::inverse(worldTransform(parent)) * world);
     }
@@ -391,6 +397,20 @@ PortalComponent* Scene::portal(EntityId id) {
 const PortalComponent* Scene::portal(EntityId id) const {
     auto it = portalTable.find(id);
     return it == portalTable.end() ? nullptr : &it->second;
+}
+
+void Scene::setPartHidden(EntityId id, size_t part, bool hidden) {
+    ModelComponent* component = model(id);
+    if (component == nullptr) {
+        return;
+    }
+    if (component->hiddenParts.size() <= part) {
+        component->hiddenParts.resize(part + 1, false);
+    }
+    if (component->hiddenParts[part] != hidden) {
+        component->hiddenParts[part] = hidden;
+        layoutRevision++;  // the entity's range of the render list changes size
+    }
 }
 
 void Scene::syncPortal(EntityId end) {
@@ -476,11 +496,136 @@ std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims(const std::ve
     return bars;
 }
 
+template <typename Visit>
+void Scene::forEachVisiblePart(const PlacedModel& placed, Visit&& visit) const {
+    const ModelComponent& component = *placed.component;
+    const SceneModel& model = assets.model(component.model);
+    glm::mat4 placedModel = placed.world * (component.originalSize ? glm::mat4(1.0f) : model.fit);
+    for (size_t p = 0; p < model.parts.size(); p++) {
+        if (p < component.hiddenParts.size() && component.hiddenParts[p]) {
+            continue;
+        }
+        const MeshInstance& part = model.parts[p];
+        visit(part.meshIndex, placedModel * part.transform);
+    }
+}
+
+// Where each point was last frame, for the motion vectors: last frame's world transform * inverse(this frame's) *
+// this frame's position. Exactly identity when it didn't move (the product can be off by rounding, which would count
+// as motion).
+static glm::mat4 motionFrom(const glm::mat4* last, const glm::mat4& world) {
+    return last != nullptr && *last != world ? *last * glm::inverse(world) : glm::mat4(1.0f);
+}
+
+void Scene::remakeInstances(RenderList& list, const std::vector<PlacedModel>& models,
+                            std::vector<std::pair<uint32_t, glm::mat4>>& rims) const {
+    // Last frame's entities, found by id (entities come and go; a new one has no motion). A child that moves with its
+    // parent has its own world transform here, so it gets its motion too.
+    std::unordered_map<EntityId, glm::mat4> previous;
+    for (const RenderList::BuiltEntity& built : list.builtEntities) {
+        previous.emplace(built.id, built.world);
+    }
+    list.instances.clear();
+    list.motions.clear();
+    list.builtEntities.clear();
+    list.revision++;
+    list.motionChanged = true;
+    for (const PlacedModel& placed : models) {
+        RenderList::BuiltEntity built{placed.id, placed.component->model, placed.visible,
+                                      placed.component->originalSize, placed.world,
+                                      {static_cast<uint32_t>(list.instances.size()), 0}, 0};
+        if (placed.visible) {
+            auto last = previous.find(placed.id);
+            built.motion = static_cast<uint32_t>(list.motions.size());
+            list.motions.push_back(motionFrom(last != previous.end() ? &last->second : nullptr, placed.world));
+            forEachVisiblePart(placed, [&](uint32_t mesh, const glm::mat4& world) {
+                list.instances.push_back({mesh, built.motion, world});
+            });
+            built.range.count = static_cast<uint32_t>(list.instances.size()) - built.range.first;
+        }
+        list.builtEntities.push_back(built);
+    }
+    // The portal rims: still (no motion), one shared identity motion
+    list.firstRim = static_cast<uint32_t>(list.instances.size());
+    if (!rims.empty()) {
+        uint32_t motionIndex = static_cast<uint32_t>(list.motions.size());
+        list.motions.push_back(glm::mat4(1.0f));
+        for (const auto& [mesh, world] : rims) {
+            list.instances.push_back({mesh, motionIndex, world});
+        }
+    }
+    list.builtRims = std::move(rims);
+    list.builtLayout = layoutRevision;
+    list.builtAssets = assets.revision();
+}
+
+bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& models,
+                            std::vector<std::pair<uint32_t, glm::mat4>>& rims) const {
+    if (layoutRevision != list.builtLayout || assets.revision() != list.builtAssets ||
+        models.size() != list.builtEntities.size() || rims.size() != list.builtRims.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < models.size(); i++) {
+        const RenderList::BuiltEntity& built = list.builtEntities[i];
+        if (built.id != models[i].id || built.model != models[i].component->model ||
+            built.visible != models[i].visible) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < rims.size(); i++) {
+        if (rims[i].first != list.builtRims[i].first) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < models.size(); i++) {
+        const PlacedModel& placed = models[i];
+        RenderList::BuiltEntity& built = list.builtEntities[i];
+        bool moved = placed.world != built.world;
+        if (built.visible) {
+            glm::mat4 motion = motionFrom(&built.world, placed.world);
+            if (list.motions[built.motion] != motion) {
+                list.motions[built.motion] = motion;
+                list.motionChanged = true;
+            }
+            if (moved || placed.component->originalSize != built.originalSize) {
+                uint32_t next = built.range.first;
+                uint32_t end = built.range.first + built.range.count;
+                forEachVisiblePart(placed, [&](uint32_t, const glm::mat4& world) {
+                    if (next < end) {
+                        list.instances[next].world = world;
+                    }
+                    next++;
+                });
+                if (next != end) {  // its parts were shown or hidden without setPartHidden: remade instead
+                    return false;
+                }
+                if (built.range.count > 0) {
+                    list.changed.push_back(built.range);
+                }
+            }
+        }
+    }
+    // (Only now: a remake instead would still need last frame's)
+    for (size_t i = 0; i < models.size(); i++) {
+        list.builtEntities[i].world = models[i].world;
+        list.builtEntities[i].originalSize = models[i].component->originalSize;
+    }
+    if (rims != list.builtRims) {
+        for (size_t i = 0; i < rims.size(); i++) {
+            list.instances[list.firstRim + i].world = rims[i].second;
+        }
+        list.changed.push_back({list.firstRim, static_cast<uint32_t>(rims.size())});
+        list.builtRims = std::move(rims);
+    }
+    return true;
+}
+
 void Scene::buildRenderList(RenderList& list) {
     std::vector<Placed> placed = placeAll();
 
     // The model entities, in tree order (also the instances' order)
-    std::vector<RenderList::BuiltObject> current;
+    std::vector<PlacedModel> models;
     // The enabled portal pairs (both ends visible), in the order of their A ends
     std::vector<PlacedPair> pairs;
     std::unordered_map<EntityId, size_t> placedIndex;
@@ -491,8 +636,7 @@ void Scene::buildRenderList(RenderList& list) {
     for (const Placed& p : placed) {
         EntityId id = p.entity->id;
         if (const ModelComponent* component = model(id); component != nullptr && component->model.valid()) {
-            current.push_back({id, component->model, p.visible, component->originalSize, p.world,
-                               component->hiddenParts});
+            models.push_back({id, component, p.visible, p.world});
         }
         const PortalComponent* portal = this->portal(id);
         if (portal != nullptr && portal->endA && p.visible) {
@@ -506,13 +650,37 @@ void Scene::buildRenderList(RenderList& list) {
     list.camera = sceneCamera;
     list.environment = sceneEnvironment;
 
-    bool rebuild = list.hasMotion || !(current == list.builtObjects) || rims != list.builtRims;
-    list.hasMotion = false;
-    if (rebuild) {
-        list.instances.clear();
-        list.motions.clear();
-        list.revision++;
+    // The instances: only the moved entities' ranges, unless the layout changed
+    list.builds++;
+    list.changed.clear();
+    list.motionChanged = false;
+    std::vector<RenderList::BuiltEntity> before;
+    std::vector<std::pair<uint32_t, glm::mat4>> rimsBefore;
+    if (checkUpdates) {
+        before = list.builtEntities;
+        rimsBefore = rims;
     }
+    if (!updateInstances(list, models, rims)) {
+        list.changed.clear();
+        remakeInstances(list, models, rims);
+    } else if (checkUpdates) {
+        RenderList scratch;
+        scratch.builtEntities = std::move(before);
+        remakeInstances(scratch, models, rimsBefore);
+        size_t wrong = 0;
+        for (size_t i = 0; i < list.instances.size() && i < scratch.instances.size(); i++) {
+            const RenderInstance& x = list.instances[i];
+            const RenderInstance& y = scratch.instances[i];
+            wrong += x.mesh != y.mesh || x.motion != y.motion || x.world != y.world ? 1 : 0;
+        }
+        if (wrong > 0 || list.instances.size() != scratch.instances.size() || list.motions != scratch.motions) {
+            checkFailures++;
+            std::cerr << "Scene update check: " << wrong << " of " << list.instances.size() << " instances ("
+                      << scratch.instances.size() << " remade) and " << (list.motions != scratch.motions ? "the" : "no")
+                      << " motions differ from a remake" << std::endl;
+        }
+    }
+
     list.lights.clear();
     list.portals.clear();
     for (const PlacedPair& pair : pairs) {
@@ -520,67 +688,21 @@ void Scene::buildRenderList(RenderList& list) {
             list.portals.push_back({end, pair.portal->size * 0.5f, pair.portal->shape});
         }
     }
-
-    // Motion vectors need where each point was last frame. The entities the instances were last made from are last
-    // frame's: had any of them changed since, the instances would have been remade then. Found by id (entities come
-    // and go); a new one has no motion. A child that moves with its parent has its own world transform here, so it
-    // gets its motion too.
-    std::unordered_map<EntityId, glm::mat4> previous;
-    if (rebuild) {
-        for (const RenderList::BuiltObject& built : list.builtObjects) {
-            previous.emplace(built.id, built.transform);
-        }
-    }
-
-    for (const RenderList::BuiltObject& object : current) {
-        if (!object.visible) {
+    for (const PlacedModel& placedModel : models) {
+        if (!placedModel.visible) {
             continue;
         }
-        const glm::mat4& objectTransform = object.transform;
-        const SceneModel& model = assets.model(object.model);
-        glm::mat4 placedModel = objectTransform * (object.originalSize ? glm::mat4(1.0f) : model.fit);
-        if (rebuild) {
-            // last frame's position = previous transform * inverse(current) * this frame's position. Exactly
-            // identity when it didn't move (the product can be off by rounding, which would count as motion).
-            auto last = previous.find(object.id);
-            glm::mat4 motion = last != previous.end() && last->second != objectTransform
-                                       ? last->second * glm::inverse(objectTransform)
-                                       : glm::mat4(1.0f);
-            if (motion != glm::mat4(1.0f)) {
-                list.hasMotion = true;
-            }
-            uint32_t motionIndex = static_cast<uint32_t>(list.motions.size());
-            list.motions.push_back(motion);
-            for (size_t p = 0; p < model.parts.size(); p++) {
-                if (p < object.hiddenParts.size() && object.hiddenParts[p]) {
-                    continue;
-                }
-                const MeshInstance& part = model.parts[p];
-                list.instances.push_back({part.meshIndex, motionIndex, placedModel * part.transform});
-            }
-        }
-
+        const SceneModel& model = assets.model(placedModel.component->model);
+        glm::mat4 world = placedModel.world * (placedModel.component->originalSize ? glm::mat4(1.0f) : model.fit);
         // The file's distances (falloff, range) are scaled with the object. The file's own node scales don't
         // count (glTF: they don't affect lights).
-        float scale = std::cbrt(std::abs(glm::determinant(glm::mat3(placedModel))));
+        float scale = std::cbrt(std::abs(glm::determinant(glm::mat3(world))));
         for (const PunctualLight& light : model.lights) {
             if (light.enabled) {
                 list.lights.push_back({light.type, light.color, light.intensity, light.range, light.innerConeAngle,
-                                       light.outerConeAngle, placedModel * light.transform, scale});
+                                       light.outerConeAngle, world * light.transform, scale});
             }
         }
-    }
-    if (rebuild) {
-        list.builtObjects = std::move(current);
-        // The portal rims: still (no motion), one shared identity motion
-        if (!rims.empty()) {
-            uint32_t motionIndex = static_cast<uint32_t>(list.motions.size());
-            list.motions.push_back(glm::mat4(1.0f));
-            for (const auto& [mesh, world] : rims) {
-                list.instances.push_back({mesh, motionIndex, world});
-            }
-        }
-        list.builtRims = std::move(rims);
     }
 }
 

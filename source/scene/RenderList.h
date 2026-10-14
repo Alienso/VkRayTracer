@@ -1,11 +1,12 @@
 //
 // Render list: what one frame draws, made by the Scene (Scene::buildRenderList) and read by the renderer. No
 // Vulkan: mesh indices into AssetStore::meshes(), world matrices, motion, lights, the camera and the environment.
-// The renderer turns the instances into TLAS instances one to one (instance i = TLAS instance i), and only when the
-// list's revision moved on.
+// The renderer turns the instances into TLAS instances one to one (instance i = TLAS instance i).
 //
-// Big scenes (vegetation) have millions of instances, too many to remake every frame: the Scene remakes them only
-// when an object changed, or something moved last time (its motion is then only right for that one frame).
+// Big scenes (vegetation) have millions of instances, too many to touch every frame. Each model entity owns a range
+// of the list (its visible parts, in order): when it moves, only its range's matrices are rewritten and named in
+// changedInstances(), and its motion. The whole list is remade (the revision goes up) only when its layout changes:
+// entities added, removed, re-parented, shown or hidden, parts shown or hidden, a model loaded or unloaded.
 // Punctual lights and portals are few and remade every frame.
 //
 
@@ -48,6 +49,12 @@ struct RenderPortal {
     PortalShape shape;
 };
 
+// Instances first, first + 1, ..., first + count - 1
+struct InstanceRange {
+    uint32_t first;
+    uint32_t count;
+};
+
 class RenderList {
 public:
     std::vector<RenderInstance> instances;
@@ -59,31 +66,41 @@ public:
     Camera camera;                 // copied every frame
     SceneEnvironment environment;  // copied every frame (its map: AssetStore::environmentMap)
 
-    // Goes up whenever instances or motions were remade. The renderer compares it with what it built from.
+    // Goes up whenever the instances and motions were remade: other instances, or in another order
     [[nodiscard]] uint64_t instanceRevision() const { return revision; }
+    // Counts the builds (Scene::buildRenderList), one per frame. What changed is what changed since the build before:
+    // a reader that missed a build has to take the whole list.
+    [[nodiscard]] uint64_t build() const { return builds; }
+    // The instances whose matrices this build rewrote (same meshes, same order), when the revision stayed the same
+    [[nodiscard]] const std::vector<InstanceRange>& changedInstances() const { return changed; }
+    // Some motion changed in this build (or the revision went up)
+    [[nodiscard]] bool motionsChanged() const { return motionChanged; }
 
 private:
     friend class Scene;
     uint64_t revision = 0;
-    bool hasMotion = false;  // some motion isn't identity: remake next frame, when it is out of date
+    uint64_t builds = 0;
+    std::vector<InstanceRange> changed;
+    bool motionChanged = false;
 
-    // What the instances were made from (the model entities): compared every frame, so only actual changes remake
-    // them. Also last frame's entities, for the motion of the next remake (Scene::buildRenderList).
-    struct BuiltObject {
+    // What the instances were made from: per model entity in tree order, its range of the instances and its motion.
+    // Compared with the entities every frame: a different layout remakes the list, a new world transform rewrites
+    // the entity's range. Also last frame's world transforms, for the motions (Scene::buildRenderList).
+    struct BuiltEntity {
         uint64_t id;  // the entity's id
         ModelHandle model;
-        bool visible;
+        bool visible;  // in the world (its parents too)
         bool originalSize;
-        glm::mat4 transform;  // the entity's world transform
-        std::vector<bool> hiddenParts;
-        bool operator==(const BuiltObject& o) const {
-            return id == o.id && model == o.model && visible == o.visible && originalSize == o.originalSize &&
-                   transform == o.transform && hiddenParts == o.hiddenParts;
-        }
+        glm::mat4 world;  // the entity's world transform
+        InstanceRange range;  // its visible parts (none when hidden)
+        uint32_t motion;      // its entry in motions (when visible)
     };
-    std::vector<BuiltObject> builtObjects;
-    // The portal rims' bars (mesh, world matrix) the instances were made with: compared the same way
+    std::vector<BuiltEntity> builtEntities;
+    uint64_t builtLayout = 0;  // Scene's layout revision and the AssetStore's revision the list was made with
+    uint64_t builtAssets = 0;
+    // The portal rims' bars (mesh, world matrix), after the entities' instances from firstRim on
     std::vector<std::pair<uint32_t, glm::mat4>> builtRims;
+    uint32_t firstRim = 0;
 };
 
 #endif //VULKANDEMO_RENDERLIST_H

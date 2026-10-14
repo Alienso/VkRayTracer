@@ -19,10 +19,13 @@
 #include "renderer/Renderer.h"
 #include "core/Configuration.h"
 
-void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity) {
+void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity, VkBufferUsageFlags usage,
+                                    VkPipelineStageFlags readers) {
     streamed.capacity = capacity;
-    createBuffer(capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
+    streamed.usage = usage;
+    streamed.readers = readers;
+    createBuffer(capacity, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
 
     streamed.staging.resize(Configuration::maxFramesInFlight);
     streamed.stagingMemory.resize(Configuration::maxFramesInFlight);
@@ -53,17 +56,17 @@ bool Renderer::ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize siz
         return false;
     }
     VkDeviceSize newCapacity = std::max(size, streamed.capacity * 2);
+    VkBufferUsageFlags usage = streamed.usage;
+    VkPipelineStageFlags readers = streamed.readers;
     destroyStreamedBuffer(streamed);
-    createStreamedBuffer(streamed, newCapacity);
+    createStreamedBuffer(streamed, newCapacity, usage, readers);
     return true;
 }
 
-void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size) {
-    if (size == 0) {
-        return;
-    }
-    std::memcpy(streamed.stagingMapped[currentFrame], data, size);
-
+// The copies from this frame's staging buffer (filled already) into the buffer, after its readers in the previous
+// frame are done with the old contents, before its readers in this one
+void Renderer::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
+                                    const std::vector<VkBufferCopy>& copies) {
     VkBufferMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -71,20 +74,58 @@ void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffe
     barrier.buffer = streamed.buffer;
     barrier.offset = 0;
     barrier.size = VK_WHOLE_SIZE;
-
-    // The previous frame's shader may still read the old contents.
+    // (Shader reads, and acceleration structure builds reading their input, both count as shader reads)
     barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(commandBuffer, streamed.readers, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 1, &barrier, 0, nullptr);
-
-    VkBufferCopy copy{0, 0, size};
-    vkCmdCopyBuffer(commandBuffer, streamed.staging[currentFrame], streamed.buffer, 1, &copy);
-
+    vkCmdCopyBuffer(commandBuffer, streamed.staging[currentFrame], streamed.buffer,
+                    static_cast<uint32_t>(copies.size()), copies.data());
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, streamed.readers,
                          0, 0, nullptr, 1, &barrier, 0, nullptr);
+}
+
+void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size) {
+    if (size == 0) {
+        return;
+    }
+    std::memcpy(streamed.stagingMapped[currentFrame], data, size);
+    recordStreamedCopies(commandBuffer, streamed, {{0, 0, size}});
+}
+
+// The same for some ranges of elements: each goes to the same place in the staging buffer and in the buffer
+void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
+                                    VkDeviceSize elementSize, const std::vector<InstanceRange>& ranges) {
+    if (ranges.empty()) {
+        return;
+    }
+    // Sorted, overlapping and touching ones joined: the same element may have changed in several frames
+    std::vector<InstanceRange> merged = ranges;
+    std::sort(merged.begin(), merged.end(),
+              [](const InstanceRange& a, const InstanceRange& b) { return a.first < b.first; });
+    size_t kept = 0;
+    for (size_t i = 1; i < merged.size(); i++) {
+        InstanceRange& last = merged[kept];
+        if (merged[i].first <= last.first + last.count) {
+            last.count = std::max(last.count, merged[i].first + merged[i].count - last.first);
+        } else {
+            merged[++kept] = merged[i];
+        }
+    }
+    merged.resize(kept + 1);
+
+    std::vector<VkBufferCopy> copies;
+    copies.reserve(merged.size());
+    for (const InstanceRange& range : merged) {
+        VkDeviceSize offset = range.first * elementSize;
+        VkDeviceSize size = range.count * elementSize;
+        std::memcpy(static_cast<uint8_t*>(streamed.stagingMapped[currentFrame]) + offset,
+                    static_cast<const uint8_t*>(data) + offset, size);
+        copies.push_back({offset, offset, size});
+    }
+    recordStreamedCopies(commandBuffer, streamed, copies);
 }
 
 void Renderer::createLightBuffers() {
@@ -108,20 +149,33 @@ static float luminance(glm::vec3 color) {
 
 // Collects the emissive triangles of this frame's instances (renderList's, one to one with the TLAS's) in world
 // space.
-void Renderer::buildLightList() {
+void Renderer::buildLightList(bool instancesChanged) {
     lightListPicking = settings.lightPicking;
+    auto emissionOf = [&](const Mesh& mesh) {
+        const Material& material = assets.materials()[mesh.materialIndex].material;
+        return material.emissiveColor * material.emissiveStrength;
+    };
+    // Which instances glow: only looked up when instances or materials changed (scenes with vegetation have millions)
+    if (instancesChanged) {
+        emissiveInstances.clear();
+        for (size_t i = 0; i < renderList->instances.size(); i++) {
+            if (luminance(emissionOf(assets.meshes()[renderList->instances[i].mesh])) > 0.0f) {
+                emissiveInstances.push_back(static_cast<uint32_t>(i));
+            }
+        }
+        instanceFirstLight.assign(renderList->instances.size(), -1);
+        instanceLightsUploadPending = true;
+    }
     emissiveTriangles.clear();
-    instanceFirstLight.assign(renderList->instances.size(), -1);
+    std::vector<int32_t> firstLights(emissiveInstances.size(), -1);  // per glowing instance, as instanceFirstLight
     double totalWeight = 0.0;
 
-    for (size_t i = 0; i < renderList->instances.size(); i++) {
+    for (size_t e = 0; e < emissiveInstances.size(); e++) {
+        uint32_t i = emissiveInstances[e];
         const Mesh& mesh = assets.meshes()[renderList->instances[i].mesh];
         const SceneMaterial& sceneMaterial = assets.materials()[mesh.materialIndex];
         const Material& material = sceneMaterial.material;
-        glm::vec3 emission = material.emissiveColor * material.emissiveStrength;
-        if (luminance(emission) <= 0.0f) {
-            continue;
-        }
+        glm::vec3 emission = emissionOf(mesh);
         // With an emissive texture, each triangle is weighted by the texture's average over it (computed at
         // load time), so the dark parts are (almost) never sampled. A triangle averaging black gets probability
         // 0 but stays in the list, so the shader still finds every hit triangle at firstLight + primitive index.
@@ -131,7 +185,7 @@ void Renderer::buildLightList() {
                           mesh.emissiveTextureAverage.size() * 3 == mesh.indices.size();
 
         // Every triangle of the mesh, in order, so the shader finds a hit triangle at firstLight + primitive index.
-        instanceFirstLight[i] = static_cast<int32_t>(emissiveTriangles.size());
+        firstLights[e] = static_cast<int32_t>(emissiveTriangles.size());
         const glm::mat4& transform = renderList->instances[i].world;
         for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
             const SceneVertex& v0 = mesh.vertices[mesh.indices[t]];
@@ -176,17 +230,22 @@ void Renderer::buildLightList() {
     } else {
         // Glowing materials, but all triangles have zero area or a black texture: nothing to sample.
         emissiveTriangles.clear();
-        instanceFirstLight.assign(renderList->instances.size(), -1);
+        firstLights.assign(firstLights.size(), -1);
         sampledEmissiveTriangles = 0;
         lightTree.clear();
         lightTreeDepth = 0;
     }
 
     std::vector<uint64_t> layout;
-    for (size_t i = 0; i < instanceFirstLight.size(); i++) {
-        if (instanceFirstLight[i] >= 0) {
-            layout.push_back(assets.meshIds()[renderList->instances[i].mesh]);
-            layout.push_back(static_cast<uint64_t>(instanceFirstLight[i]));
+    for (size_t e = 0; e < emissiveInstances.size(); e++) {
+        int32_t& first = instanceFirstLight[emissiveInstances[e]];
+        if (first != firstLights[e]) {
+            first = firstLights[e];
+            instanceLightsUploadPending = true;
+        }
+        if (first >= 0) {
+            layout.push_back(assets.meshIds()[renderList->instances[emissiveInstances[e]].mesh]);
+            layout.push_back(static_cast<uint64_t>(first));
         }
     }
     if (layout != lightLayout) {
@@ -274,8 +333,11 @@ void Renderer::buildLightTree() {
 void Renderer::recordLightUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, emissiveTriangleBuffer, emissiveTriangles.data(),
                          sizeof(EmissiveTriangle) * emissiveTriangles.size());
-    recordStreamedUpload(commandBuffer, instanceLightBuffer, instanceFirstLight.data(),
-                         sizeof(int32_t) * instanceFirstLight.size());
+    if (instanceLightsUploadPending) {
+        recordStreamedUpload(commandBuffer, instanceLightBuffer, instanceFirstLight.data(),
+                             sizeof(int32_t) * instanceFirstLight.size());
+        instanceLightsUploadPending = false;
+    }
     recordStreamedUpload(commandBuffer, lightTreeBuffer, lightTree.data(), sizeof(LightTreeNode) * lightTree.size());
     lightsUploadPending = false;
 }

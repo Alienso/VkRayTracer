@@ -310,7 +310,7 @@ void Editor::buildModelUi(EntityId id) {
                 ImGui::PushID(p);
                 bool visible = !component.hiddenParts[p];
                 if (ImGui::Checkbox(assets.meshes()[model.parts[p].meshIndex].name.c_str(), &visible)) {
-                    component.hiddenParts[p] = !visible;
+                    scene.setPartHidden(id, p, !visible);
                 }
                 ImGui::PopID();
             }
