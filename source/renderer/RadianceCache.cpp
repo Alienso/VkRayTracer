@@ -231,6 +231,12 @@ void Renderer::buildRadianceCacheUi() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("A cell needs this many samples before paths use it; until then they trace on.");
     }
+    ImGui::Checkbox("In fog too", &settings.cacheFog);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Cells in fog as well: paths stop at their second scatter point and take the light that\n"
+                          "comes there via further scattering from the cache. Much faster in thick fog; light inside\n"
+                          "the fog comes a little blurred and as if scattered evenly in all directions.");
+    }
     if (ImGui::Button("Clear cache")) {
         cacheClearPending = true;
     }

@@ -56,7 +56,7 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
   unbiased visibility.
 - **ReSTIR GI**: resampling of the first bounce's indirect light (off by default).
 - **Radiance cache**: a hash grid of surface cells holding indirect light; paths can stop after a diffuse bounce
-  and read it.
+  and read it. Fog has cells too: paths stop at their second scatter point (thick patchy fog 3x faster).
 - **DLSS Ray Reconstruction** (through NVIDIA Streamline): DLAA, Quality, Balanced, Performance and Ultra
   Performance; transformer or CNN models. The shader writes the guide images DLSS needs: depth, motion vectors,
   albedos, normals, roughness and specular hit distance, including through mirrors.

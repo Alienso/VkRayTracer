@@ -131,6 +131,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint portalCount;               // entries in the portal list (binding 31): two per pair
     float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
     uint lightCandidates;           // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
+    uint cacheFog;                  // 1 = scatter points in fog have cache cells too (see "Radiance cache")
 } scene;
 
 // (0 in a pipeline without the feature, so its code drops out)
@@ -798,8 +799,8 @@ struct Intersection {
 // (shadowTransmittance); varying fog needs its stretches in order (varyingTransmittance).
 // The density is the same for every color, so that chance and the light's loss always agree; the color is in the
 // scattered light only, not in what passes straight through.
-// Not in the fog's light: ReSTIR (its scatter points aren't surfaces), and the radiance cache (paths don't end at
-// them).
+// Not in the fog's light: ReSTIR (its scatter points aren't surfaces). The radiance cache has cells in fog too (see
+// there, scene.cacheFog).
 // Lamps (the punctual lights) are the exception to the light sampling at scatter points. Their light falls off as
 // 1 / distance^2, and the points the fog picks land near one only rarely, then very bright: the glow around a lamp
 // would sparkle forever. Instead every stretch of a path takes their light along its whole length, at a point picked
@@ -1479,8 +1480,8 @@ void tiltTowardsViewer(inout Hit hit, vec3 direction) {
 
 // A path's scatter point in fog (see "Fog") as a Hit, so the path's loop lights it and bounces from it like a
 // surface: marked by its material (isFog), the fog's material in meshIndex, facing back along the ray, light from
-// every side (two-sided, as diffuse transmission), no ReSTIR and no cache (restirSurface, cacheableSurface). Its
-// color is in the throughput.
+// every side (two-sided, as diffuse transmission), no ReSTIR (restirSurface), cache cells of their own (cacheCell).
+// Its color is in the throughput.
 const uint FOG_MATERIAL = 0xFFFFFFFFu;
 
 Hit fogHit(vec3 position, vec3 direction, float t, uint medium) {
@@ -3431,9 +3432,19 @@ bool traceCameraRay(ivec2 pixel, inout vec3 direction, inout uint seed, out Inte
 // Cells: about scene.cacheCellScale * distance wide (a few pixels on screen wherever they are), rounded to a power
 // of two so that nearby points agree, and separate per side a surface faces (floor and wall meeting at a corner
 // don't mix). Hash table with up to CACHE_PROBES slots tried per cell (linear probing).
+//
+// Fog (scene.cacheFog): scatter points have cells too, cubes facing no side. In thick fog a path scatters many times,
+// and past the first bounce each scatter point costs about as much as a surface (its bounce ray and shadow rays
+// through the scene), however few steps the tracking takes (LIMITATIONS.md, "Fog"). Image paths stop at their second
+// scatter point (the first one after a bounce that spread out, as at surfaces): its direct light by light sampling,
+// the rest from the cell. A cell holds the light leaving it without the fog's color (that is in the throughput up to
+// it, see fogHit), averaged over all directions: biased where the fog scatters mostly forward, which matters little
+// for light that has already scattered more than once.
 
 const uint CACHE_PROBES = 8;
-const uint CACHE_MAX_VERTICES = 8;      // update paths fill the cells of their first 8 surfaces
+// Update paths fill the cells of their first 4 surfaces (and scatter points). 8 cost registers: the update pass got
+// 168 instead of 128, 2x slower in thick fog (21 ms instead of 10), and Sponza converged no faster.
+const uint CACHE_MAX_VERTICES = 4;
 const float MIRROR_ROUGHNESS = 0.01;    // smoother reflections count as mirrors: no Russian roulette after them
 const float CACHE_ROUGHNESS = 0.25;     // smoother surfaces (and glass) reflect too sharply to be cached
 const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this (rare glints of the sun)
@@ -3444,19 +3455,23 @@ const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this
 const float CACHE_MIN_RAY_CELLS = 2.0;
 
 bool cacheableSurface(Hit hit) {
-    return hit.transmission <= 0.0 && hit.roughness >= CACHE_ROUGHNESS && !isFog(hit);
+    if (isFog(hit)) {
+        return scene.cacheFog != 0;
+    }
+    return hit.transmission <= 0.0 && hit.roughness >= CACHE_ROUGHNESS;
 }
 
-// The cell of a surface point: where the table search starts (slot) and the cell's id (fingerprint, never 0).
-// Two different hashes of the same cell coordinates, so two cells sharing a slot are told apart.
-void cacheCell(vec3 position, vec3 normal, out uint slot, out uint fingerprint, out float cellSize) {
-    float distance = max(length(position - scene.cameraPosition.xyz), 1e-4);
+// The cell of a surface point (or a scatter point in fog): where the table search starts (slot) and the cell's id
+// (fingerprint, never 0). Two different hashes of the same cell coordinates, so two cells sharing a slot are told apart.
+void cacheCell(Hit hit, out uint slot, out uint fingerprint, out float cellSize) {
+    float distance = max(length(hit.position - scene.cameraPosition.xyz), 1e-4);
     int level = clamp(int(floor(log2(distance * scene.cacheCellScale))), -14, 10);
     cellSize = exp2(float(level));
-    ivec3 cell = ivec3(floor(position / cellSize));
-    vec3 a = abs(normal);
+    ivec3 cell = ivec3(floor(hit.position / cellSize));
+    vec3 a = abs(hit.geometricNormal);
     uint axis = a.x >= a.y && a.x >= a.z ? 0u : (a.y >= a.z ? 1u : 2u);
-    uint facing = axis * 2u + (normal[axis] < 0.0 ? 1u : 0u);  // which of the 6 main directions it faces
+    // which of the 6 main directions it faces; fog faces none (6): its light comes from all sides
+    uint facing = isFog(hit) ? 6u : axis * 2u + (hit.geometricNormal[axis] < 0.0 ? 1u : 0u);
     uint extra = uint(level + 16) | (facing << 8);
     slot = pcgHash(uint(cell.x) + pcgHash(uint(cell.y) + pcgHash(uint(cell.z) + pcgHash(extra))));
     fingerprint = pcgHash((uint(cell.x) * 0x27d4eb2du) ^ pcgHash((uint(cell.y) * 0x165667b1u)
@@ -3582,10 +3597,20 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // Update paths: the cache entries of the surfaces hit so far, and per surface the light found after it,
     // as seen from that surface (divided by the throughput up to it). Adding to these as the light is found
     // (ADD_LIGHT) keeps dim light found late accurate, instead of subtracting large sums at the end.
-    int cacheEntries[CACHE_MAX_VERTICES];
+    // Each surface takes the light of as many bounces after it as an image path that ends in its cell would have
+    // traced (Max bounces - 1, as from the second surface): the update path goes on that far past its last cached
+    // surface (lastBounce), and light found later than that for an earlier surface stays out of its cell. Without
+    // this, surfaces found late got fewer bounces: thick fog, which keeps most of its light from one scatter to the
+    // next, came out 10-16% too dark. Entries: the table index in bits 0-23, the bounce it was hit at above.
+    uint cacheEntries[CACHE_MAX_VERTICES];
     vec3 cacheInverseThroughput[CACHE_MAX_VERTICES];
     vec3 cacheLight[CACHE_MAX_VERTICES];
     uint cacheVertices = 0;
+    uint cacheDepth = max(scene.maxBounces, 1u) - 1u;
+    uint lastBounce = scene.maxBounces;
+    // The bounce of the light being added: what this bounce's ray sees counts as found at this bounce, the light
+    // sampled at its surface as found at the next (as the next ray would have)
+    uint lightBounce = 0;
     bool previousLobeRough = false;  // the bounce that led to this hit spread out (diffuse or rough)
     // The update path's entry of the surface hit in this bounce and in the one before (-1: none): their direct
     // light (shadow rays from there, and the light-sampled lights their bounce ray hits) stays out of their cells.
@@ -3598,7 +3623,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     uint reflections = 0;
 #define ADD_LIGHT_EXCEPT(light, skipped) { vec3 light_ = (light); radiance += clampBounceLight(light_, clampDepth); \
         if (CACHE_UPDATE_PASS != 0) { for (int i_ = 0; i_ < int(cacheVertices); i_++) { \
-            if (i_ != (skipped)) { cacheLight[i_] += light_ * cacheInverseThroughput[i_]; } } } }
+            if (i_ != (skipped) && lightBounce - (cacheEntries[i_] >> 24u) <= cacheDepth) { \
+                cacheLight[i_] += light_ * cacheInverseThroughput[i_]; } } } }
 #define ADD_LIGHT(light) ADD_LIGHT_EXCEPT(light, -1)
     bool firstBounceSpecular = false;  // the bounce ray leaving the first hit came from a reflection/transmission
     float bouncePdf = 0.0;        // pdf of the bounce direction that led to the current hit (for MIS)
@@ -3647,10 +3673,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
-    // by bouncing would be one bounce short, and the methods wouldn't agree.
-    for (uint bounce = 0; bounce <= scene.maxBounces; bounce++) {
+    // by bouncing would be one bounce short, and the methods wouldn't agree. (Update paths: lastBounce, see above.)
+    for (uint bounce = 0; bounce <= lastBounce; bounce++) {
         // light found at this hit (the sky, the sun, a glowing surface). Not in a GI sample's Lo (see "ReSTIR GI").
         uint clampDepth = giState == 2 ? 0u : reflections;
+        lightBounce = bounce;
         // (not traceClosest: one copy of the code that builds a Hit, called once here, keeps the shader smaller)
         Intersection intersection;
         bool found;
@@ -3810,7 +3837,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
             ADD_LIGHT_EXCEPT(throughput * hit.emissive * weight, reflectedOnce && lightSampled ? previousVertex : -1);
         }
-        if (bounce == scene.maxBounces) {
+        if (bounce == lastBounce) {
             break;  // the final ray: only what it sees counts
         }
 
@@ -3851,11 +3878,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 if (cacheVertices < CACHE_MAX_VERTICES) {
                     uint slot, fingerprint;
                     float cellSize;
-                    cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
+                    cacheCell(hit, slot, fingerprint, cellSize);
                     int entry = cacheFindOrInsert(slot, fingerprint);
                     if (entry >= 0) {
                         currentVertex = int(cacheVertices);
-                        cacheEntries[cacheVertices] = entry;
+                        cacheEntries[cacheVertices] = uint(entry) | (min(bounce, 255u) << 24u);
+                        lastBounce = bounce + cacheDepth;
                         // Channels that carry (almost) nothing can't tell how bright the light behind them is
                         cacheInverseThroughput[cacheVertices] = mix(vec3(0.0), 1.0 / max(throughput, vec3(1e-8)),
                                                                     greaterThan(throughput, vec3(1e-6)));
@@ -3868,10 +3896,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 // shared by the reuse for many frames and pixels. Where cells are noisy (light through openings),
                 // the reuse also favours samples whose cell was momentarily bright: patches that came and went
                 // (Sponza's side aisle). The path goes on and may end in the cache one surface later.
+                // In fog the steps between scatter points are short where it is thick, and there are no corners for
+                // a cell's average to leak into: any length will do.
                 uint slot, fingerprint;
                 float cellSize;
-                cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
-                int entry = hit.t >= CACHE_MIN_RAY_CELLS * cellSize ? cacheFind(slot, fingerprint) : -1;
+                cacheCell(hit, slot, fingerprint, cellSize);
+                int entry = isFog(hit) || hit.t >= CACHE_MIN_RAY_CELLS * cellSize ? cacheFind(slot, fingerprint) : -1;
                 if (entry >= 0) {
                     vec4 cached = cacheValues[entry];
                     endInCache = cached.w >= scene.cacheMinWeight;
@@ -3898,6 +3928,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
             clampDepth = giState == 2 ? 0u : reflections + 1;  // light this surface reflects
+            lightBounce = bounce + 1;
             // (none at a scatter point in the fog: the stretches before take the lamps' light, see fogLampLight)
             uint lightSlots = (restirVertex && scene.restirPunctualCandidates > 0) || (isFog(hit) && CACHE_UPDATE_PASS == 0)
                               ? 3 : 3 + punctualLightSamples();
@@ -4128,10 +4159,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             if (any(isnan(light)) || any(isinf(light))) {
                 continue;
             }
-            atomicAdd(cacheAccumulators[cacheEntries[i]].x, light.r);
-            atomicAdd(cacheAccumulators[cacheEntries[i]].y, light.g);
-            atomicAdd(cacheAccumulators[cacheEntries[i]].z, light.b);
-            atomicAdd(cacheAccumulators[cacheEntries[i]].w, 1.0);
+            uint entry = cacheEntries[i] & 0xFFFFFFu;
+            atomicAdd(cacheAccumulators[entry].x, light.r);
+            atomicAdd(cacheAccumulators[entry].y, light.g);
+            atomicAdd(cacheAccumulators[entry].z, light.b);
+            atomicAdd(cacheAccumulators[entry].w, 1.0);
         }
     }
 #undef ADD_LIGHT
@@ -4178,7 +4210,7 @@ vec3 debugColor(vec3 direction, inout uint seed) {
             }
             uint slot, fingerprint;
             float cellSize;
-            cacheCell(hit.position, hit.geometricNormal, slot, fingerprint, cellSize);
+            cacheCell(hit, slot, fingerprint, cellSize);
             int entry = cacheFind(slot, fingerprint);
             if (entry < 0) {
                 return vec3(1.0, 0.0, 1.0);

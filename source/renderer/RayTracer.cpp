@@ -1043,6 +1043,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.cacheCellScale = 2.0f * uniforms.tanHalfFov / std::max(windowRenderRows, 1.0f) * settings.cacheCellPixels;
     uniforms.cacheMinWeight = settings.cacheMinSamples;
     uniforms.cacheUpdateTile = static_cast<uint32_t>(std::max(settings.cacheUpdateTile, 1));
+    uniforms.cacheFog = settings.cacheFog ? 1 : 0;
 
     // The cache holds light that is no longer right after the lighting or the cells change: start it over.
     // (Moving objects and edited materials are followed within its history instead; see cacheHistoryFrames.)
@@ -1052,7 +1053,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
             uniforms.maxBounces != previousUniforms.maxBounces || uniforms.shadowsEnabled != previousUniforms.shadowsEnabled ||
             uniforms.emissiveSampling != previousUniforms.emissiveSampling ||
             uniforms.blurCaustics != previousUniforms.blurCaustics ||
-            uniforms.cacheCellScale != previousUniforms.cacheCellScale;
+            uniforms.cacheCellScale != previousUniforms.cacheCellScale || uniforms.cacheFog != previousUniforms.cacheFog;
     if (lightingChanged) {
         cacheClearPending = true;
     }

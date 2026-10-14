@@ -289,9 +289,9 @@ and taking it from the cell is much less noisy than one shadow ray; a map's sun 
 share, so its shadows stay sharp). Cells are only used by
 rays longer than 2 cells (inside a corner the paths trace on). Measured against the plain path tracer (HDR):
 Sponza within 0.1%, the dark corner by the basin within the measurement's ±2-3%, Cornell box -0.2%, helmet
--0.1%. Cached values come from update paths that hit the cell at any depth, so they don't carry exactly
-`maxBounces` minus the depth of the path that reads them, and the light rules of glass and "Blur caustics"
-follow the update path's own history.
+-0.1%. Cached values carry the light of `maxBounces` - 1 bounces after the cell, as for an image path that reads
+them at its second surface (one that reads them later gets a few more than it would have traced), and the light
+rules of glass and "Blur caustics" follow the update path's own history. Cells in fog: see "Fog".
 - Where: shaders/raytrace.comp ("Radiance cache"), source/renderer/RadianceCache.cpp.
 - Workaround: the "Radiance cache" checkbox gives the plain path tracer (the noise reference always uses it).
 
@@ -587,3 +587,60 @@ turns the view upright at once as it comes out, instead of continuing it. Only t
 through (the fly controls); moving the camera in the editor, or an end onto the camera, doesn't.
 - Where: `Scene::moveCameraThroughPortals`.
 - Fix: a camera roll, turned back to upright over a moment after coming out.
+
+## Fog
+
+### Thick patchy fog is slow
+Patchy fog and fog with soft edges (varying density) are tracked exactly: delta tracking for where paths scatter,
+ratio tracking for shadow rays, both with steps of random length sized for the thickest fog anywhere in the volume
+(about one per 1 / thickness), each reading the noise and the distance field. Even fog stays cheap: its first step
+is where the path scatters. Fog orb scene, 1600x900, Accumulation, 8 bounces (image pass / cache update pass):
+
+| Fog | Thickness 1.9 | 7.5 | 30 |
+|---|---|---|---|
+| Even | 34 / 2.3 ms | | 31 / 2.1 ms |
+| Patchy (the orb's noise) | 34 / 5.8 ms | 55 / 10 ms | 87 / 14.5 ms |
+
+With 32 bounces the patchy fog at 30 takes 304 / 43 ms, even fog 74 / 5.5 ms. Of the 87 ms, about 22 are the first
+bounce (one bounce only: 21.9 ms); every further bounce adds ~8 ms. Past the first bounce the time is not in the
+steps: what each scatter point costs besides them (its bounce ray's query through the scene, the shadow rays'
+queries, light sampling) dominates.
+
+Tried and set aside, both measured against the exact tracking:
+- **Majorant grids** (VOLUMES_PLAN.md step 5): local maxima per grid cell, so empty space is crossed in long steps.
+  Slower everywhere (Cornell box with thick patchy fog 40 -> 67 ms): this noise leaves few cells empty, and the
+  extra code raised the shader's registers (128 -> 168).
+- **Ray marching** (2026-10-14): steps of a fixed share of the noise's blob size, the density read at one
+  jittered point per step; thickness then costs nothing more. It cut the steps per pixel 2-6x (thickness 30, step
+  half a blob: 132 -> 23) and the cache update pass 2-3x (14.5 -> 4.5 ms), but the image pass only ~20% at
+  thickness 30 (87 -> 70 ms) and none at 7.5 (55 -> 67-80 ms, slower): from the second bounce on, a bounce cost as
+  much as with exact tracking. Biased beyond what it saved: averaging the density over a step thins patchy fog
+  (scatter points per path at thickness 7.5: 2.57 exact, 2.30 at half a blob, 1.76 at a whole blob). Exact
+  tracking's speed was sensitive to the added code too (a nested loop in the shadow-ray march made it 87 -> 146 ms
+  with marching off).
+- Where: `deltaTrack`, `ratioTrack`, `varyingTransmittance` (shaders/raytrace.comp).
+
+What helped is fewer scatter points per path: the radiance cache has cells in fog too ("In fog too", on by default),
+and image paths stop at their second scatter point (2026-10-14). Same scene, cache update pass + image pass:
+
+| Fog | Without cells in fog | With |
+|---|---|---|
+| Even, thickness 30 | 2.3 + 31 ms | 2.4 + 8.3 ms |
+| Patchy 1.9 | 2.9 + 35 ms | 2.9 + 15 ms |
+| Patchy 7.5 | 7.0 + 58 ms | 6.5 + 24 ms |
+| Patchy 30 | 9.3 + 92 ms | 10 + 28 ms |
+
+(The update pass was also cut from 14.5 to 9.3 ms in thick fog by filling 4 cells per update path instead of 8:
+the shader then fits 128 registers instead of 168.) Thick patchy fog is still the slowest case; the first bounce
+(~22 ms at thickness 30) is now most of it. Next, if needed: sunlight through the fog precomputed per frame.
+
+### Light in fog from the cache is slightly biased
+A fog cell averages its volume (about 32 pixels wide, like surface cells) and all directions the light leaves it in,
+so the light that scatters more than once comes slightly blurred and as if the fog scattered evenly (strongly
+forward-scattering fog differs a little more). Direct light at the scatter point is still exact. Measured against
+the image without cells in fog (1024 frames): the averages within 0.2-1.1%, regions within 1-3%, which is about how
+much two runs of that reference differ from each other (up to 2.4%), so the real bias may be smaller.
+Update paths give each cell the light of Max bounces - 1 further bounces, as many as the image path that ends there
+would have traced; before that, thick fog came out 10-16% too dark (cells found late in an update path got fewer).
+- Where: shaders/raytrace.comp ("Radiance cache", `tracePath`).
+- Workaround: untick "In fog too" (Radiance cache settings).

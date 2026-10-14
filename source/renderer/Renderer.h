@@ -106,6 +106,7 @@ struct SceneUniforms {
     uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
     float fogTime;                   // seconds of fog drift (Material::fogDrift); 0 while no fog drifts
     uint32_t lightCandidates;        // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
+    uint32_t cacheFog;               // 1 = scatter points in fog have radiance cache cells too
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
@@ -480,6 +481,7 @@ struct RenderSettings {
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
     float cacheHistoryFrames = 32.0f;  // old cache samples fade out over about this many frames
+    bool cacheFog = true;           // paths also stop at their second scatter point in fog and read the light there
     // ReSTIR DI (LIMITATIONS.md): direct light at the first surface. Set separately for Accumulation (off: the
     // plain path tracer stays the reference) and the DLSS modes (on: less noise and flicker for DLSS to work with).
     bool restirDiAccumulation = false;
