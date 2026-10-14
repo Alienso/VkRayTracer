@@ -134,13 +134,25 @@ void Editor::buildMenuBar() {
         ImGui::EndMenu();
     }
 
-    // Right-aligned: the open scene, and whether it has unsaved changes
+    // Right-aligned: what is loading, the open scene, and whether it has unsaved changes
     std::string name = scenePath.empty() ? "new scene" : std::filesystem::path(scenePath).filename().string();
     if (unsaved) {
         name += "  (unsaved changes)";
     }
-    float width = ImGui::CalcTextSize(name.c_str()).x + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+    std::string loading;
+    if (!assets.currentLoad().empty()) {
+        loading = "loading " + assets.currentLoad();
+        if (assets.waitingLoads() > 0) {
+            loading += " (" + std::to_string(assets.waitingLoads()) + " more)";
+        }
+        loading += "    ";
+    }
+    float width = ImGui::CalcTextSize((loading + name).c_str()).x + ImGui::GetStyle().ItemSpacing.x * 2.0f;
     ImGui::SameLine(ImGui::GetWindowWidth() - width);
+    if (!loading.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "%s", loading.c_str());
+        ImGui::SameLine(0.0f, 0.0f);
+    }
     if (unsaved) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", name.c_str());
     } else {

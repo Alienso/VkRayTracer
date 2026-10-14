@@ -406,6 +406,58 @@ static glm::mat3x2 uvTransform(const cgltf_texture_view& view) {
 }
 
 // Loads the texture a material slot points at (once per texture and color space). Returns -1 if there is none.
+// The mip levels of an 8-bit RGBA image (files bring none), appended to texture.pixels: each texel the average of
+// the 2x2 below it (the last row / column of an odd size is dropped, a slight shift that doesn't show). sRGB
+// colors are averaged as light, i.e. linear: averaged as stored, a fine black-and-white pattern would turn darker
+// than the grey it looks like from afar. Alpha is coverage, averaged as it is.
+static void generateMipLevels(TextureData& texture) {
+    if (texture.format != TextureFormat::RGBA8 || texture.mipLevels > 1) {
+        return;
+    }
+    float toLinear[256];
+    for (int i = 0; i < 256; i++) {
+        float c = i / 255.0f;
+        toLinear[i] = texture.srgb ? (c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f)) : c;
+    }
+    auto toStored = [&](float linear) {
+        float c = texture.srgb ? (linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f)
+                               : linear;
+        return static_cast<uint8_t>(std::clamp(c * 255.0f + 0.5f, 0.0f, 255.0f));
+    };
+
+    uint32_t width = texture.width, height = texture.height;
+    size_t source = 0;  // where the level being halved starts in pixels
+    while (width > 1 || height > 1) {
+        uint32_t newWidth = std::max(width / 2, 1u), newHeight = std::max(height / 2, 1u);
+        size_t target = texture.pixels.size();
+        texture.pixels.resize(target + static_cast<size_t>(newWidth) * newHeight * 4);
+        for (uint32_t y = 0; y < newHeight; y++) {
+            for (uint32_t x = 0; x < newWidth; x++) {
+                float sum[4] = {};
+                for (uint32_t dy = 0; dy < 2; dy++) {
+                    for (uint32_t dx = 0; dx < 2; dx++) {
+                        uint32_t sx = std::min(x * 2 + dx, width - 1), sy = std::min(y * 2 + dy, height - 1);
+                        const uint8_t* p = &texture.pixels[source + (static_cast<size_t>(sy) * width + sx) * 4];
+                        for (int c = 0; c < 3; c++) {
+                            sum[c] += toLinear[p[c]];
+                        }
+                        sum[3] += p[3] / 255.0f;
+                    }
+                }
+                uint8_t* out = &texture.pixels[target + (static_cast<size_t>(y) * newWidth + x) * 4];
+                for (int c = 0; c < 3; c++) {
+                    out[c] = toStored(sum[c] * 0.25f);
+                }
+                out[3] = static_cast<uint8_t>(std::clamp(sum[3] * 0.25f * 255.0f + 0.5f, 0.0f, 255.0f));
+            }
+        }
+        source = target;
+        width = newWidth;
+        height = newHeight;
+        texture.mipLevels++;
+    }
+}
+
 class TextureLoader {
 public:
     TextureLoader(const cgltf_data* data, std::string directory, Model& model)
@@ -472,28 +524,38 @@ public:
         return index;
     }
 
-    // Makes the Toksvig textures, on all cores: a few seconds for a scene with dozens of 4K normal maps otherwise.
-    // The texture list doesn't change meanwhile, each job writes its own entry.
+    // Makes the Toksvig textures, then the mip levels of the 8-bit textures, on all cores: a few seconds for a scene
+    // with dozens of 4K normal maps otherwise. The texture list doesn't change meanwhile, each job writes its own
+    // entry. (The Toksvig textures read the normal maps' full size only, so their mip levels can come after.)
     void finish() {
+        forAllCores(varianceJobs.size(), [&](size_t job) {
+            makeNormalVarianceTexture(model.textures[varianceJobs[job].first], model.textures[varianceJobs[job].second]);
+        });
+        varianceJobs.clear();
+        forAllCores(model.textures.size(), [&](size_t texture) { generateMipLevels(model.textures[texture]); });
+    }
+
+private:
+    // job(0), ..., job(count - 1), spread over the cores
+    template <typename Job>
+    static void forAllCores(size_t count, Job&& job) {
         std::atomic<size_t> next{0};
         auto work = [&] {
-            for (size_t job = next++; job < varianceJobs.size(); job = next++) {
-                makeNormalVarianceTexture(model.textures[varianceJobs[job].first], model.textures[varianceJobs[job].second]);
+            for (size_t i = next++; i < count; i = next++) {
+                job(i);
             }
         };
         std::vector<std::thread> threads;
-        size_t count = std::min<size_t>(std::max(std::thread::hardware_concurrency(), 1u), varianceJobs.size());
-        for (size_t i = 1; i < count; i++) {
+        size_t threadCount = std::min<size_t>(std::max(std::thread::hardware_concurrency(), 1u), count);
+        for (size_t i = 1; i < threadCount; i++) {
             threads.emplace_back(work);
         }
         work();
         for (std::thread& thread : threads) {
             thread.join();
         }
-        varianceJobs.clear();
     }
 
-private:
     // cgltf keeps extensions it doesn't know as JSON text, e.g. {"source":3}
     const cgltf_image* ddsImage(const cgltf_texture& texture) const {
         for (cgltf_size i = 0; i < texture.extensions_count; i++) {

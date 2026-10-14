@@ -81,6 +81,8 @@ void Application::mainLoop() {
 
         renderer.beginFrame(deltaTime);
         assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
+        assets.update();  // a model or map loaded in the background arrives
+        scene.update();   // and shows up
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         editor.build();  // may change the scene

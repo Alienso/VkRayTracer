@@ -29,7 +29,7 @@ enum class TextureFormat : int { RGBA8 = 0, BC1, BC2, BC3, BC5, BC7, BC4 };
 // An image as it goes to the GPU: 8-bit RGBA, or the blocks of a compressed format.
 // Mip levels: each half the size of the one before (rounded down, at least 1), down to 1x1, for distant or blurry
 // hits (see the shader's ray cones). pixels holds them one after the other, the full-size level first. A .dds file
-// brings its own; for 8-bit images uploadNewTextures makes them.
+// brings its own; for 8-bit images the loader makes them.
 struct TextureData {
     std::string name;
     uint32_t width = 0;   // of level 0

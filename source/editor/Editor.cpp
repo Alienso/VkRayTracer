@@ -4,7 +4,6 @@
 // they dock, the menus, the log and the numbers over the image: EditorLayout.cpp.
 //
 
-#include <iostream>
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>  // MarkIniSettingsDirty
 #include "editor/Editor.h"
@@ -23,6 +22,11 @@ Editor::Editor(AssetStore& assets, Scene& scene, CameraController& cameraControl
 
 void Editor::build() {
     stats = renderer.stats();
+    for (const SceneMessage& message : scene.takeMessages()) {  // models and maps that arrived or failed
+        log(message.level == SceneMessage::Level::Error     ? LogLevel::Error
+            : message.level == SceneMessage::Level::Warning ? LogLevel::Warning
+                                                            : LogLevel::Info, message.text);
+    }
     if (stats.captureMessage != loggedCaptureMessage) {
         loggedCaptureMessage = stats.captureMessage;
         if (!loggedCaptureMessage.empty()) {
@@ -114,18 +118,6 @@ void Editor::buildLightingUi() {
 }
 
 
-// The editor picked a map: the scene loads it (on failure the old one stays, and the error is shown)
-void Editor::pickEnvironmentMap(const std::string& fileName) {
-    try {
-        scene.setEnvironmentMap(fileName);
-        environmentError.clear();
-    } catch (const std::exception& e) {
-        environmentError = e.what();
-        std::cerr << environmentError << std::endl;
-    }
-}
-
-
 // The "Sky" part of the Lighting panel: the scene's background, and how the renderer samples it (its own widgets). ImGui needs unique
 // IDs per widget; "##sky"/"##map" suffixes are hidden.
 void Editor::buildEnvironmentUi() {
@@ -134,8 +126,8 @@ void Editor::buildEnvironmentUi() {
     if (ImGui::Combo("Environment", &environment.background,
                      "Sky gradient\0HDR map\0Black (only emissive surfaces light the scene)\0White (furnace test)\0") &&
         environment.background == static_cast<int>(Background::Map) && !assets.isLoaded(environment.map) &&
-        !files.empty()) {
-        pickEnvironmentMap(files[0]);  // the first map, until another is picked
+        !scene.pendingEnvironmentMap().valid() && !files.empty()) {
+        scene.setEnvironmentMap(files[0]);  // the first map, until another is picked
     }
     Background mode = static_cast<Background>(environment.background);
     if (mode == Background::White) {
@@ -152,13 +144,18 @@ void Editor::buildEnvironmentUi() {
         } else {
             const char* current = assets.isLoaded(environment.map) ? assets.environmentMap(environment.map).name.c_str()
                                                                    : "(none)";
-            if (ImGui::BeginCombo("Map", current)) {
+            // One being loaded: named in the combo, the one shown stays until it arrives
+            std::string label = current;
+            if (EnvironmentHandle pending = scene.pendingEnvironmentMap(); pending.valid()) {
+                label = assets.environmentMap(pending).name + " (loading)";
+            }
+            if (ImGui::BeginCombo("Map", label.c_str())) {
                 if (ImGui::IsWindowAppearing()) {
                     assets.scanEnvironmentFiles();  // files put there while the program runs
                 }
                 for (const std::string& file : files) {
                     if (ImGui::Selectable(file.c_str(), file == current)) {
-                        pickEnvironmentMap(file);
+                        scene.setEnvironmentMap(file);  // (on failure the old one stays, and the error is shown)
                     }
                 }
                 ImGui::EndCombo();
@@ -180,8 +177,8 @@ void Editor::buildEnvironmentUi() {
                 ImGui::TextDisabled("a map with a sun in it already lights the scene: the Sun above adds a second one");
             }
         }
-        if (!environmentError.empty()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", environmentError.c_str());
+        if (!scene.environmentMapError().empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", scene.environmentMapError().c_str());
         }
     }
     if (mode != Background::Black) {

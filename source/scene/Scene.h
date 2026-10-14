@@ -10,6 +10,7 @@
 //
 // A model entity holds a reference to its model in the AssetStore (acquired when the component is made, released
 // when the entity is removed); a model no entity shows is kept for a while, then unloaded (see AssetStore.h).
+// Model files load in the background: the entity is there at once, its model shows up when it arrives (update).
 //
 
 #ifndef VULKANDEMO_SCENE_H
@@ -61,6 +62,10 @@ struct Entity {
 struct ModelComponent {
     ModelHandle model;              // invalid when the model couldn't be loaded (missingFile)
     bool originalSize = false;      // skip the model's fit: keep the file's own size and position (glTF: meters)
+    // Its model is still loading (AssetStore::isLoading): nothing is shown yet. loadingEntry is how a scene file
+    // names it (hidden parts included), applied when it arrives and saved as it is meanwhile.
+    bool loading = false;
+    std::string loadingEntry;
     // Per part of the model; missing entries count as visible. Changed through Scene::setPartHidden (models have up
     // to millions of parts: the render list doesn't compare them every frame).
     std::vector<bool> hiddenParts;
@@ -69,6 +74,12 @@ struct ModelComponent {
     std::string missingFile;
     std::string missingReason;
     std::string missingEntry;
+};
+
+// What happened while models and maps loaded (Scene::takeMessages): for the editor's log
+struct SceneMessage {
+    enum class Level { Info, Warning, Error } level;
+    std::string text;
 };
 
 class Scene {
@@ -87,16 +98,18 @@ public:
     // write leaves the old file; throws on errors.
     void save(const std::string& path) const;
     // Replaces the scene with the file's. Throws when the file can't be read or isn't a scene file (the scene is then
-    // unchanged); returns what was skipped: models or maps that couldn't be loaded (their entities are kept, see
-    // ModelComponent::missingFile), edits that don't fit the model any more.
+    // unchanged); returns what was skipped: built-in models that don't exist (their entities are kept, see
+    // ModelComponent::missingFile), edits that don't fit the model any more. Models and maps not loaded yet arrive
+    // later (update), with their hidden parts and edits; what goes wrong then comes as messages.
     std::vector<std::string> load(const std::string& path);
     // The scene as its file would have it, without the camera (moving around isn't a change to save): when this
     // differs from the text at the last save or load, there is something to save
     [[nodiscard]] std::string contentText() const;
 
-    // A new root entity showing that model file (loaded if it isn't yet). Fitted to the standard size and lined up
-    // next to the others, or (originalSize) in the file's own size and place, hiding the floor. Throws if the model
-    // can't be loaded (the scene is then unchanged).
+    // A new root entity showing that model file (loading it in the background if it isn't loaded yet). Fitted to the
+    // standard size and lined up next to the others, or (originalSize) in the file's own size and place, hiding the
+    // floor. Throws only for a built-in model that doesn't exist; a file that can't be loaded leaves the entity
+    // without its model (missingFile), reported by update.
     EntityId addObject(const std::string& fileName, bool originalSize);
     // A new entity without components (a group), under parent (0: a root)
     EntityId addEmpty(const std::string& name, EntityId parent);
@@ -137,6 +150,14 @@ public:
     void syncPortal(EntityId end);
     [[nodiscard]] ModelHandle portalRimModel() const { return rimModel; }  // valid while there are pairs
 
+    // Once per frame, after AssetStore::update: models that arrived are shown (with the scene file's hidden parts and
+    // edits), the ones that failed become missing (ModelComponent::missingFile); the environment map the same way
+    void update();
+    // What update (and loading) had to say since the last call
+    std::vector<SceneMessage> takeMessages() { return std::move(messages); }
+    // Some model or map of this scene is still loading
+    [[nodiscard]] bool loading() const;
+
     // This frame's instances, lights, portals, camera and environment, into list. Call once per frame, with the same
     // list: it holds last frame's entities (motion vectors, what changed). Only what changed is redone (see
     // RenderList.h); the lights and portals every time.
@@ -151,9 +172,11 @@ public:
 
     SceneEnvironment& environment() { return sceneEnvironment; }
     [[nodiscard]] const SceneEnvironment& environment() const { return sceneEnvironment; }
-    // The background map: loads that file if it isn't yet (throws if it can't be: nothing changes then) and releases
-    // the previous map
+    // The background map. One not loaded yet loads in the background: the previous map stays until it arrives, and
+    // stays when it can't be loaded (environmentMapError says why).
     void setEnvironmentMap(const std::string& fileName);
+    [[nodiscard]] EnvironmentHandle pendingEnvironmentMap() const { return pendingMap; }  // the one loading
+    [[nodiscard]] const std::string& environmentMapError() const { return mapError; }
 
 private:
     AssetStore& assets;
@@ -171,6 +194,12 @@ private:
     // removed or re-parented (the tree order), parts shown or hidden
     uint64_t layoutRevision = 1;
     uint64_t checkFailures = 0;
+    EnvironmentHandle pendingMap;  // asked for and acquired, still loading (then it becomes sceneEnvironment.map)
+    std::string mapError;
+    // A scene file's edits ("models" entries) for models that were still loading: (model name, the entry's text),
+    // applied when the model arrives, saved as they are meanwhile
+    std::vector<std::pair<std::string, std::string>> pendingModelEdits;
+    std::vector<SceneMessage> messages;
 
     Entity& create(const std::string& name, EntityId parent);
     // With an id from a file (entitiesMade is set after loading)
@@ -181,6 +210,14 @@ private:
     void takeFrom(Scene& other);
     // The file text: with or without the camera (SceneFile.cpp)
     [[nodiscard]] std::string toText(bool withCamera) const;
+    // A model that arrived: its hidden parts from the component's loadingEntry, its edits from pendingModelEdits
+    // (SceneFile.cpp). Return what didn't fit.
+    std::vector<std::string> applyLoadingEntry(ModelComponent& component);
+    std::vector<std::string> applyPendingEdits(const std::string& modelName);
+    // How a scene file names a model ({"file": ..., "originalSize": ...}), as text
+    static std::string modelEntryText(const std::string& fileName, bool builtIn, bool originalSize);
+    // The pending map arrived (it becomes the map) or failed
+    void updateEnvironmentMap();
     // Every entity in tree order: roots in order, each followed by its children's subtrees
     [[nodiscard]] std::vector<EntityId> treeOrder() const;
     // The children list the entity sits in: its parent's, or the roots

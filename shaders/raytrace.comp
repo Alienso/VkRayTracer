@@ -2653,7 +2653,7 @@ LightSample portalLightImage(uint end, uint which, vec3 position, inout uint see
 }
 
 // ---------------------------------------------------------------------------------------------
-// ReSTIR DI (see RESTIR_DI_PLAN.md)
+// ReSTIR DI (Bitterli et al. 2020; its shortcuts and measurements: LIMITATIONS.md)
 //
 // Direct light at the first surface the camera sees, if it is rough enough (restirSurface). Instead of a shadow
 // ray per kind of light, the RESTIR_PASS draws several candidate light samples per pixel (glowing triangles,
@@ -2796,7 +2796,7 @@ bool restirSurface(Hit hit) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// ReSTIR GI (RESTIR_GI_PLAN.md)
+// ReSTIR GI (Ouyang et al. 2021; its shortcuts and measurements: LIMITATIONS.md)
 //
 // The light that reaches a ReSTIR surface x1 (the first one, restirSurface) via another surface x2. The image path
 // bounces off x1 as usual and finds x2; at a surface that can be reused (restirGiSampleSurface) everything the path

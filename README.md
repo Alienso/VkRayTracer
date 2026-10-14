@@ -91,6 +91,11 @@ differs from the model file). `scenes/` in the project has Sponza, Bistro at nig
 them next to the program, but never over a scene already there. The JSON reader is nlohmann/json (include/nlohmann,
 MIT license).
 
+Model files and environment maps load in the background, one at a time, while the window keeps going: an entity
+shows "(loading)" in the Outliner until its model arrives, and the menu bar names what is loading. When it arrives,
+its upload to the GPU still holds up one frame (about 4.6 s for Jungle Ruins). A file that can't be loaded leaves its
+entity without a model; the Log says why, and saving keeps the entity as the scene file had it.
+
 The editor can add a cube, Cornell boxes (empty, with blocks, or with a point light), a mirror maze, a fog box and
 a light orb, besides any glTF file.
 

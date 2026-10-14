@@ -67,58 +67,6 @@ static VkFormat toVulkan(const TextureData& texture) {
     }
 }
 
-// The mip levels of an 8-bit RGBA image (files bring none), appended to texture.pixels: each texel the average of
-// the 2x2 below it (the last row / column of an odd size is dropped, a slight shift that doesn't show). sRGB
-// colors are averaged as light, i.e. linear: averaged as stored, a fine black-and-white pattern would turn darker
-// than the grey it looks like from afar. Alpha is coverage, averaged as it is.
-static void generateMipLevels(TextureData& texture) {
-    if (texture.format != TextureFormat::RGBA8 || texture.mipLevels > 1) {
-        return;
-    }
-    float toLinear[256];
-    for (int i = 0; i < 256; i++) {
-        float c = i / 255.0f;
-        toLinear[i] = texture.srgb ? (c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f)) : c;
-    }
-    auto toStored = [&](float linear) {
-        float c = texture.srgb ? (linear <= 0.0031308f ? linear * 12.92f : 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f)
-                               : linear;
-        return static_cast<uint8_t>(std::clamp(c * 255.0f + 0.5f, 0.0f, 255.0f));
-    };
-
-    uint32_t width = texture.width, height = texture.height;
-    size_t source = 0;  // where the level being halved starts in pixels
-    while (width > 1 || height > 1) {
-        uint32_t newWidth = std::max(width / 2, 1u), newHeight = std::max(height / 2, 1u);
-        size_t target = texture.pixels.size();
-        texture.pixels.resize(target + static_cast<size_t>(newWidth) * newHeight * 4);
-        for (uint32_t y = 0; y < newHeight; y++) {
-            for (uint32_t x = 0; x < newWidth; x++) {
-                float sum[4] = {};
-                for (uint32_t dy = 0; dy < 2; dy++) {
-                    for (uint32_t dx = 0; dx < 2; dx++) {
-                        uint32_t sx = std::min(x * 2 + dx, width - 1), sy = std::min(y * 2 + dy, height - 1);
-                        const uint8_t* p = &texture.pixels[source + (static_cast<size_t>(sy) * width + sx) * 4];
-                        for (int c = 0; c < 3; c++) {
-                            sum[c] += toLinear[p[c]];
-                        }
-                        sum[3] += p[3] / 255.0f;
-                    }
-                }
-                uint8_t* out = &texture.pixels[target + (static_cast<size_t>(y) * newWidth + x) * 4];
-                for (int c = 0; c < 3; c++) {
-                    out[c] = toStored(sum[c] * 0.25f);
-                }
-                out[3] = static_cast<uint8_t>(std::clamp(sum[3] * 0.25f * 255.0f + 0.5f, 0.0f, 255.0f));
-            }
-        }
-        source = target;
-        width = newWidth;
-        height = newHeight;
-        texture.mipLevels++;
-    }
-}
-
 // Bytes of one mip level
 static size_t levelSize(const TextureData& texture, uint32_t level) {
     uint32_t width = std::max(texture.width >> level, 1u), height = std::max(texture.height >> level, 1u);
@@ -167,11 +115,10 @@ void Renderer::syncTextures() {
     }
 }
 
-// Creates the image, copies the pixels (with mip levels) and frees them on the CPU. Returns the size in bytes.
+// Creates the image, copies the pixels (with their mip levels, made by the loader) and frees them on the CPU. Returns
+// the size in bytes.
 VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
     {
-        generateMipLevels(texture);
-
         VkFormat format = toVulkan(texture);
         createImage(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     gpu.image, gpu.memory, gpu.view, texture.mipLevels);

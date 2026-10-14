@@ -178,15 +178,23 @@ static std::string documentText(const Json& document) {
 }
 
 // How a file names a model: its file (relative to the models folder) or a built-in model's name
-static Json modelReference(const AssetStore& assets, ModelHandle handle) {
-    const std::string& name = assets.model(handle).name;
+static Json modelReference(const std::string& name, bool builtIn) {
     Json reference = Json::object();
-    if (handle == assets.floor() || isBuiltInModel(name)) {
-        reference["builtIn"] = name;
-    } else {
-        reference["file"] = name;
-    }
+    reference[builtIn ? "builtIn" : "file"] = name;
     return reference;
+}
+
+static Json modelReference(const AssetStore& assets, ModelHandle handle) {
+    const std::string& name = assets.modelName(handle);
+    return modelReference(name, handle == assets.floor() || isBuiltInModel(name));
+}
+
+std::string Scene::modelEntryText(const std::string& fileName, bool builtIn, bool originalSize) {
+    Json entry = modelReference(fileName, builtIn);
+    if (originalSize) {
+        entry["originalSize"] = true;
+    }
+    return entry.dump();
 }
 
 static Json materialEdits(const SceneMaterial& now, const SceneMaterial& file) {
@@ -232,7 +240,9 @@ std::string Scene::toText(bool withCamera) const {
     environment["skyHorizonColor"] = toJson(e.skyHorizonColor);
     environment["groundColor"] = toJson(e.groundColor);
     environment["skyIntensity"] = number(e.skyIntensity);
-    environment["map"] = e.map.valid() ? Json(assets.environmentMap(e.map).name) : Json();
+    // (The one picked last, also while it loads)
+    EnvironmentHandle map = pendingMap.valid() ? pendingMap : e.map;
+    environment["map"] = map.valid() ? Json(assets.environmentMap(map).name) : Json();
     environment["mapRotation"] = number(e.mapRotation);
     environment["mapIntensity"] = number(e.mapIntensity);
     document["environment"] = environment;
@@ -258,6 +268,11 @@ std::string Scene::toText(bool withCamera) const {
             Json m;
             if (!component->model.valid()) {
                 m = Json::parse(component->missingEntry);  // as the file had it
+            } else if (component->loading) {
+                m = Json::parse(component->loadingEntry);  // the same: its parts aren't known yet
+                if (std::find(models.begin(), models.end(), component->model) == models.end()) {
+                    models.push_back(component->model);
+                }
             } else {
                 m = modelReference(assets, component->model);
                 if (component->originalSize) {
@@ -295,6 +310,15 @@ std::string Scene::toText(bool withCamera) const {
 
     Json modelList = Json::array();
     for (ModelHandle handle : models) {
+        if (!assets.isLoaded(handle)) {
+            // Still loading: the edits the file had for it, as they were
+            for (const auto& [name, entry] : pendingModelEdits) {
+                if (name == assets.modelName(handle)) {
+                    modelList.push_back(Json::parse(entry));
+                }
+            }
+            continue;
+        }
         const SceneModel& sceneModel = assets.model(handle);
         Json materials = Json::array(), lights = Json::array();
         for (uint32_t i = 0; i < sceneModel.materialCount && i < sceneModel.fileMaterials.size(); i++) {
@@ -360,25 +384,58 @@ void Scene::save(const std::string& path) const {
 // ---------------------------------------------------------------------------------------------
 // Reading
 
-// The model a file's reference names, loaded and acquired; throws when it can't be loaded
+// The model a file's reference names, acquired: loaded, or loading in the background. Throws for a built-in model
+// that doesn't exist (or a broken reference).
 static ModelHandle loadModel(AssetStore& assets, const Json& reference) {
     ModelHandle handle;
     if (auto it = reference.find("builtIn"); it != reference.end()) {
         std::string name;
         fromJson(*it, name);
-        handle = name == "Floor" ? assets.floor() : assets.findOrLoad(name);
+        handle = name == "Floor" ? assets.floor() : assets.requestModel(name);
         if (name != "Floor" && !isBuiltInModel(name)) {
             throw std::runtime_error("no built-in model \"" + name + "\"");
         }
     } else if (auto file = reference.find("file"); file != reference.end()) {
         std::string name;
         fromJson(*file, name);
-        handle = assets.findOrLoad(name);
+        handle = assets.requestModel(name);
     } else {
         throw std::runtime_error("a model needs \"file\" or \"builtIn\"");
     }
     assets.acquire(handle);
     return handle;
+}
+
+// A model entry's "hide" and "show" lists into the component's hidden parts (which start as the model's). Parts the
+// model doesn't have are warned about; a list that isn't one throws.
+static void readParts(const SceneModel& model, ModelComponent& component, const Json& m,
+                      std::vector<std::string>& warnings) {
+    for (const char* key : {"hide", "show"}) {
+        auto list = m.find(key);
+        if (list == m.end()) {
+            continue;
+        }
+        if (!list->is_array()) {
+            throw std::runtime_error(std::string("\"") + key + "\": expected a list of parts");
+        }
+        for (const Json& part : *list) {
+            if (!part.is_number_unsigned() || part.get<size_t>() >= model.parts.size()) {
+                warnings.push_back("no part " + part.dump() + " in " + model.name);
+                continue;
+            }
+            component.hiddenParts[part.get<size_t>()] = std::string(key) == "hide";
+        }
+    }
+}
+
+std::vector<std::string> Scene::applyLoadingEntry(ModelComponent& component) {
+    std::vector<std::string> warnings;
+    try {
+        readParts(assets.model(component.model), component, Json::parse(component.loadingEntry), warnings);
+    } catch (const std::exception& e) {
+        warnings.push_back(e.what());
+    }
+    return warnings;
 }
 
 static std::string referenceName(const Json& reference) {
@@ -389,6 +446,75 @@ static std::string referenceName(const Json& reference) {
         name = builtIn->get<std::string>();
     }
     return name;
+}
+
+// A "models" entry's edits onto the model's materials and lights. An edit that no longer fits the model (the file
+// changed) is skipped, with a warning.
+static void applyEdits(AssetStore& assets, SceneModel& model, const Json& entry, std::vector<std::string>& warnings) {
+    const std::string& name = model.name;
+    auto edit = [&](const char* kind, size_t count, auto&& apply) {
+        auto items = entry.find(kind);
+        if (items == entry.end() || !items->is_array()) {
+            return;
+        }
+        for (const Json& item : *items) {
+            size_t index = item.contains("index") && item["index"].is_number_unsigned()
+                           ? item["index"].get<size_t>() : count;
+            std::string itemName;
+            if (auto n = item.find("name"); n != item.end() && n->is_string()) {
+                itemName = n->get<std::string>();
+            }
+            try {
+                apply(index, itemName, item);
+            } catch (const std::exception& e) {
+                warnings.push_back(name + ": " + kind + " " + std::to_string(index) + " (" + itemName +
+                                   "): " + e.what());
+            }
+        }
+    };
+    edit("materials", model.materialCount, [&](size_t index, const std::string& itemName, const Json& item) {
+        if (index >= model.materialCount || index >= model.fileMaterials.size() ||
+            model.fileMaterials[index].material.name != itemName) {
+            throw std::runtime_error("not in the model any more: edit skipped");
+        }
+        SceneMaterial material = assets.materials()[model.firstMaterial + index];  // a copy: all or nothing
+#define READ_FIELD(name) readOptional(item, #name, material.material.name);
+#define READ_SWITCH(name) readOptional(item, #name, material.name);
+        MATERIAL_FIELDS(READ_FIELD)
+        MATERIAL_SWITCHES(READ_SWITCH)
+#undef READ_FIELD
+#undef READ_SWITCH
+        assets.materials()[model.firstMaterial + index] = material;
+    });
+    edit("lights", model.lights.size(), [&](size_t index, const std::string& itemName, const Json& item) {
+        if (index >= model.lights.size() || index >= model.fileLights.size() ||
+            model.fileLights[index].name != itemName) {
+            throw std::runtime_error("not in the model any more: edit skipped");
+        }
+        PunctualLight light = model.lights[index];
+#define READ_LIGHT(name) readOptional(item, #name, light.name);
+        LIGHT_FIELDS(READ_LIGHT)
+#undef READ_LIGHT
+        model.lights[index] = light;
+    });
+}
+
+std::vector<std::string> Scene::applyPendingEdits(const std::string& modelName) {
+    std::vector<std::string> warnings;
+    for (auto it = pendingModelEdits.begin(); it != pendingModelEdits.end();) {
+        if (it->first != modelName) {
+            ++it;
+            continue;
+        }
+        for (const auto& [id, component] : modelTable) {
+            if (assets.isLoaded(component.model) && assets.modelName(component.model) == modelName) {
+                applyEdits(assets, assets.model(component.model), Json::parse(it->second), warnings);
+                break;
+            }
+        }
+        it = pendingModelEdits.erase(it);
+    }
+    return warnings;
 }
 
 std::vector<std::string> Scene::load(const std::string& path) {
@@ -460,28 +586,19 @@ std::vector<std::string> Scene::load(const std::string& path) {
                         warnings.push_back(where + " (" + name + "): model " + component.missingFile + " not loaded: " +
                                            e.what());
                     }
-                    if (component.model.valid()) {
+                    if (assets.isLoaded(component.model)) {
                         const SceneModel& model = assets.model(component.model);
                         for (const MeshInstance& part : model.parts) {
                             component.hiddenParts.push_back(part.hiddenByDefault);
                         }
-                        for (const char* key : {"hide", "show"}) {
-                            auto list = m->find(key);
-                            if (list == m->end()) {
-                                continue;
-                            }
-                            if (!list->is_array()) {
-                                throw std::runtime_error(std::string("\"") + key + "\": expected a list of parts");
-                            }
-                            for (const Json& part : *list) {
-                                if (!part.is_number_unsigned() || part.get<size_t>() >= model.parts.size()) {
-                                    warnings.push_back(where + " (" + name + "): no part " + part.dump() + " in " +
-                                                       model.name);
-                                    continue;
-                                }
-                                component.hiddenParts[part.get<size_t>()] = std::string(key) == "hide";
-                            }
+                        std::vector<std::string> partWarnings;
+                        readParts(model, component, *m, partWarnings);
+                        for (const std::string& warning : partWarnings) {
+                            warnings.push_back(where + " (" + name + "): " + warning);
                         }
+                    } else if (component.model.valid()) {
+                        component.loading = true;  // its parts when it arrives (update)
+                        component.loadingEntry = m->dump();
                     }
                 }
 
@@ -518,7 +635,7 @@ std::vector<std::string> Scene::load(const std::string& path) {
         }
         for (const auto& [id, portal] : loaded.portalTable) {
             if (portal.endA) {
-                loaded.rimModel = assets.findOrLoad(portalRimModelName());
+                loaded.rimModel = assets.requestModel(portalRimModelName());  // built in: made at once
                 assets.acquire(loaded.rimModel);  // one reference per pair
             }
         }
@@ -563,12 +680,7 @@ std::vector<std::string> Scene::load(const std::string& path) {
                 throw std::runtime_error(std::string("environment: ") + error.what());
             }
             if (auto map = en->find("map"); map != en->end() && map->is_string()) {
-                try {
-                    e.map = assets.findOrLoadEnvironment(map->get<std::string>());
-                    assets.acquire(e.map);
-                } catch (const std::exception& error) {
-                    warnings.push_back("environment map " + map->get<std::string>() + " not loaded: " + error.what());
-                }
+                loaded.setEnvironmentMap(map->get<std::string>());  // (a failure comes later, as a message)
             }
         }
     } catch (...) {
@@ -581,14 +693,14 @@ std::vector<std::string> Scene::load(const std::string& path) {
     takeFrom(loaded);
 
     // Model edits, on top of the files' materials and lights. An edit that no longer fits the model (the file
-    // changed) is skipped.
+    // changed) is skipped. Models still loading get theirs when they arrive.
     assets.resetEdits();
     if (auto list = document.find("models"); list != document.end() && list->is_array()) {
         for (const Json& entry : *list) {
             std::string name = referenceName(entry);
             ModelHandle handle;
             for (const auto& [id, component] : modelTable) {
-                if (component.model.valid() && assets.model(component.model).name == name) {
+                if (component.model.valid() && assets.modelName(component.model) == name) {
                     handle = component.model;
                     break;
                 }
@@ -596,52 +708,11 @@ std::vector<std::string> Scene::load(const std::string& path) {
             if (!handle.valid()) {
                 continue;  // no entity shows it (or it wasn't loaded: warned about above)
             }
-            SceneModel& model = assets.model(handle);
-            auto edit = [&](const char* kind, size_t count, auto&& apply) {
-                auto items = entry.find(kind);
-                if (items == entry.end() || !items->is_array()) {
-                    return;
-                }
-                for (const Json& item : *items) {
-                    size_t index = item.contains("index") && item["index"].is_number_unsigned()
-                                   ? item["index"].get<size_t>() : count;
-                    std::string itemName;
-                    if (auto n = item.find("name"); n != item.end() && n->is_string()) {
-                        itemName = n->get<std::string>();
-                    }
-                    try {
-                        apply(index, itemName, item);
-                    } catch (const std::exception& e) {
-                        warnings.push_back(name + ": " + kind + " " + std::to_string(index) + " (" + itemName +
-                                           "): " + e.what());
-                    }
-                }
-            };
-            edit("materials", model.materialCount, [&](size_t index, const std::string& itemName, const Json& item) {
-                if (index >= model.materialCount || index >= model.fileMaterials.size() ||
-                    model.fileMaterials[index].material.name != itemName) {
-                    throw std::runtime_error("not in the model any more: edit skipped");
-                }
-                SceneMaterial material = assets.materials()[model.firstMaterial + index];  // a copy: all or nothing
-#define READ_FIELD(name) readOptional(item, #name, material.material.name);
-#define READ_SWITCH(name) readOptional(item, #name, material.name);
-                MATERIAL_FIELDS(READ_FIELD)
-                MATERIAL_SWITCHES(READ_SWITCH)
-#undef READ_FIELD
-#undef READ_SWITCH
-                assets.materials()[model.firstMaterial + index] = material;
-            });
-            edit("lights", model.lights.size(), [&](size_t index, const std::string& itemName, const Json& item) {
-                if (index >= model.lights.size() || index >= model.fileLights.size() ||
-                    model.fileLights[index].name != itemName) {
-                    throw std::runtime_error("not in the model any more: edit skipped");
-                }
-                PunctualLight light = model.lights[index];
-#define READ_LIGHT(name) readOptional(item, #name, light.name);
-                LIGHT_FIELDS(READ_LIGHT)
-#undef READ_LIGHT
-                model.lights[index] = light;
-            });
+            if (assets.isLoaded(handle)) {
+                applyEdits(assets, assets.model(handle), entry, warnings);
+            } else {
+                pendingModelEdits.emplace_back(name, entry.dump());
+            }
         }
     }
     assets.materialsChanged();

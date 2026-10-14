@@ -86,8 +86,6 @@ private:
     std::string pendingPath;
     bool askAboutUnsaved = false;  // open the question this frame
     std::string shownTitle;        // the window title last set
-    // Lighting panel
-    std::string environmentError;  // why the picked environment map couldn't be loaded
     bool showImGuiDemo = false;
 
     // EditorLayout.cpp
@@ -105,7 +103,6 @@ private:
     void buildCameraUi();
     void buildLightingUi();
     void buildEnvironmentUi();
-    void pickEnvironmentMap(const std::string& fileName);
 
     // EditorFile.cpp
     void buildFileMenu();

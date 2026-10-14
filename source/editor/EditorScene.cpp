@@ -23,11 +23,13 @@ void Editor::init(const std::string& error) {
     savedText = scene.contentText();  // the starting scene counts as saved: nothing to ask about yet
 }
 
-// Adds an object for the UI: selects it, or logs why the model couldn't be loaded
+// Adds an object for the UI and selects it. Its model may still be loading: the log says when it arrives (or why
+// it couldn't be loaded).
 void Editor::addObject(const std::string& fileName) {
     try {
         selected = scene.addObject(fileName, addAtOriginalSize);
-        log(LogLevel::Info, "Added " + fileName);
+        const ModelComponent* component = scene.model(selected);
+        log(LogLevel::Info, (component != nullptr && component->loading ? "Loading " : "Added ") + fileName);
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         log(LogLevel::Error, e.what());
@@ -159,9 +161,14 @@ void Editor::buildEntityNode(EntityId id, TreeEdit& edit) {
     if (id == selected) {
         flags |= ImGuiTreeNodeFlags_Selected;
     }
+    const ModelComponent* component = scene.model(id);
+    const char* state = component == nullptr     ? ""
+                        : component->loading     ? "  (loading)"
+                        : !component->model.valid() ? "  (missing)"
+                                                    : "";
     // The id keeps entities with the same name apart
-    bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(id)), flags, "%s%s",
-                                  entity.name.c_str(), entity.visible ? "" : "  (hidden)");
+    bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(id)), flags, "%s%s%s",
+                                  entity.name.c_str(), entity.visible ? "" : "  (hidden)", state);
     if ((ImGui::IsItemClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right)) &&
         !ImGui::IsItemToggledOpen()) {
         selected = id;
@@ -291,8 +298,18 @@ void Editor::buildTransformUi(Entity& entity) {
 // entities showing it)
 void Editor::buildModelUi(EntityId id) {
     ModelComponent& component = *scene.model(id);
-    SceneModel& model = assets.model(component.model);
     ImGui::SeparatorText("Model");
+    if (component.loading) {
+        ImGui::TextDisabled("%s: loading ...", assets.modelName(component.model).c_str());
+        return;
+    }
+    if (!component.model.valid()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s: not loaded", component.missingFile.c_str());
+        ImGui::TextWrapped("%s", component.missingReason.c_str());
+        ImGui::TextDisabled("Kept as the scene file has it: saving writes it back.");
+        return;
+    }
+    SceneModel& model = assets.model(component.model);
     ImGui::TextDisabled("%s, %zu parts", model.name.c_str(), model.parts.size());
     if (component.model != assets.floor() && !isBuiltInModel(model.name)) {
         ImGui::Checkbox("Original size", &component.originalSize);

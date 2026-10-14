@@ -7,12 +7,18 @@
 // own start (its parts' mesh indices, firstMaterial, texture indices in its materials are into these lists). The
 // renderer mirrors the lists one to one (mesh i = MeshInfo i = BLAS i, material i = GPU material i, ...).
 //
-// Lifetime: objects hold references to their model (acquire / release). A model nobody references any more stays
-// loaded ("unused"), so showing it again is instant (no file read, no GPU upload), until the unused models together
-// take more than a memory budget: then the least recently used ones are unloaded. Unloading takes its meshes,
-// materials and textures out of the lists, and the ones after them move down (the other models' indices are
-// adjusted). The renderer notices by revision() and matches its GPU copies to the lists by meshIds() / textureIds(),
-// so it frees exactly what went and keeps the rest. The floor is pinned: never unloaded.
+// Loading: files load in the background, one at a time, on a worker thread (reading, decoding, mip levels: seconds
+// for a big scene), so the window keeps going meanwhile. requestModel gives a handle at once; the model arrives in a
+// later update() (once per frame, on the main thread), which puts it into the lists. Until then isLoading says so;
+// when it couldn't be loaded, loadError says why. Built-in models are made at once. The same file asked for again
+// while it loads is loaded once. Quitting during a load waits for it (the loader can't stop midway).
+//
+// Lifetime: objects hold references to their model (acquire / release, also while it loads). A model nobody
+// references any more stays loaded ("unused"), so showing it again is instant (no file read, no GPU upload), until
+// the unused models together take more than a memory budget: then the least recently used ones are unloaded.
+// Unloading takes its meshes, materials and textures out of the lists, and the ones after them move down (the other
+// models' indices are adjusted). The renderer notices by revision() and matches its GPU copies to the lists by
+// meshIds() / textureIds(), so it frees exactly what went and keeps the rest. The floor is pinned: never unloaded.
 //
 
 #ifndef VULKANDEMO_ASSETSTORE_H
@@ -20,6 +26,8 @@
 
 #include <glm/glm.hpp>
 #include <cstdint>
+#include <deque>
+#include <future>
 #include <string>
 #include <vector>
 #include "core/Handles.h"
@@ -76,6 +84,7 @@ public:
     static constexpr float fittedModelSize = 2.0f;  // loaded models are scaled so their largest side is this long
 
     AssetStore(std::string modelsDirectory, std::string environmentsDirectory);
+    ~AssetStore();  // waits for a load still running
 
     // The model files found in the models directory (subfolders too), built-in test scenes first
     void scanModelFiles();
@@ -85,13 +94,19 @@ public:
     ModelHandle addFloor();
     [[nodiscard]] ModelHandle floor() const { return floorModel; }
 
-    // The model of that file (or built-in name), loading it first if it isn't yet. Throws if it can't be loaded.
-    // Takes no reference: the caller acquires it (a model never acquired stays loaded).
-    ModelHandle findOrLoad(const std::string& fileName);
+    // The model of that file (or built-in name): the loaded one, the one loading, or a new load (see above). Built-in
+    // models are made at once (throws if there is no such one). Takes no reference: the caller acquires it.
+    ModelHandle requestModel(const std::string& fileName);
+    // Once per frame on the main thread: a finished load joins the lists (or fails), the next one starts. True when
+    // something arrived or failed.
+    bool update();
+    // The file loading now ("" when none), and how many more wait
+    [[nodiscard]] const std::string& currentLoad() const { return runningJob.name; }
+    [[nodiscard]] size_t waitingLoads() const { return jobs.size(); }
 
     // One more / one less object showing the model. After the last release it stays loaded but unused, until the
     // unused budget or the texture limit needs its room; once unloaded its handle is invalid (isLoaded says false,
-    // even once the slot holds another model).
+    // even once the slot holds another model). A model released while it loads arrives unused; a failed one goes.
     void acquire(ModelHandle model);
     void release(ModelHandle model);
 
@@ -102,17 +117,20 @@ public:
     // How many loaded models no object shows, and their memory
     [[nodiscard]] size_t unusedModelCount() const;
     [[nodiscard]] uint64_t unusedMemory() const;
-    [[nodiscard]] bool isLoaded(ModelHandle handle) const {
-        return handle.index < slots.size() && slots[handle.index].loaded &&
-               slots[handle.index].generation == handle.generation;
-    }
+    [[nodiscard]] bool isLoaded(ModelHandle handle) const { return state(handle) == State::Loaded; }
+    [[nodiscard]] bool isLoading(ModelHandle handle) const { return state(handle) == State::Loading; }
+    // Why the model couldn't be loaded ("" unless it failed)
+    [[nodiscard]] const std::string& loadError(ModelHandle handle) const;
+    // The file (or built-in) name of a model in any state
+    [[nodiscard]] const std::string& modelName(ModelHandle handle) const { return slots[handle.index].model.name; }
 
+    // A loaded model
     SceneModel& model(ModelHandle handle) { return slots[handle.index].model; }
     [[nodiscard]] const SceneModel& model(ModelHandle handle) const { return slots[handle.index].model; }
     // Calls f(const SceneModel&) for every loaded model
     template <typename F> void forEachModel(F f) const {
         for (const Slot& slot : slots) {
-            if (slot.loaded) {
+            if (slot.state == State::Loaded) {
                 f(slot.model);
             }
         }
@@ -144,35 +162,55 @@ public:
     // opened or started anew applies its own edits on top
     void resetEdits();
 
-    // Environment maps: the .hdr files there are, and the loaded ones. Same lifetime rules as models: the last
-    // release unloads the map (the renderer keeps its GPU copy until it gets another one).
+    // Environment maps: the .hdr files there are, and the loaded ones. Loaded in the background like models (the
+    // same queue); the last release unloads the map (the renderer keeps its GPU copy until it gets another one).
     void scanEnvironmentFiles();
     [[nodiscard]] const std::vector<std::string>& environmentFiles() const { return environmentFileList; }
-    EnvironmentHandle findOrLoadEnvironment(const std::string& fileName);  // throws if it can't be loaded
+    EnvironmentHandle requestEnvironment(const std::string& fileName);
     void acquire(EnvironmentHandle map);
     void release(EnvironmentHandle map);
-    [[nodiscard]] bool isLoaded(EnvironmentHandle handle) const {
-        return handle.index < environmentSlots.size() && environmentSlots[handle.index].loaded &&
-               environmentSlots[handle.index].generation == handle.generation;
-    }
+    [[nodiscard]] bool isLoaded(EnvironmentHandle handle) const { return state(handle) == State::Loaded; }
+    [[nodiscard]] bool isLoading(EnvironmentHandle handle) const { return state(handle) == State::Loading; }
+    [[nodiscard]] const std::string& loadError(EnvironmentHandle handle) const;
+    // A map in any state (only a loaded one has pixels)
     EnvironmentMap& environmentMap(EnvironmentHandle handle) { return environmentSlots[handle.index].map; }
     [[nodiscard]] const EnvironmentMap& environmentMap(EnvironmentHandle handle) const { return environmentSlots[handle.index].map; }
 
-    // At most this many textures in total (the renderer's descriptor array); loading past it throws
+    // At most this many textures in total (the renderer's descriptor array); a model that would pass it fails
     void setTextureLimit(uint32_t limit) { textureLimit = limit; }
 
 private:
-    // A model's place. Unloading frees it for the next model, with a new generation (stale handles tell).
+    // Free: nothing (a handle to it is stale); Loading: asked for, on the queue or the worker; Failed: kept with its
+    // error until the last reference goes
+    enum class State { Free, Loading, Loaded, Failed };
+
+    // A model's place. Freeing it moves the generation on (stale handles tell).
     struct Slot {
         SceneModel model;
         uint32_t generation = 0;
-        bool loaded = false;
+        State state = State::Free;
+        std::string error;
     };
 
     struct EnvironmentSlot {
         EnvironmentMap map;
         uint32_t generation = 0;
-        bool loaded = false;
+        State state = State::Free;
+        std::string error;
+    };
+
+    // A file to load, for the slot that waits for it
+    struct LoadJob {
+        bool environment = false;
+        uint32_t slot = 0;
+        std::string name;
+    };
+    // What the worker made of it
+    struct LoadResult {
+        Model model;
+        glm::mat4 fit = glm::mat4(1.0f);
+        EnvironmentMap map;
+        std::string error;  // empty: it worked
     };
 
     std::string directory;
@@ -194,8 +232,21 @@ private:
     uint32_t textureLimit = ~0u;
     uint64_t unusedBudget = defaultUnusedBudget;
     uint64_t useClock = 0;  // counts releases, for SceneModel::lastUsed
+    std::deque<LoadJob> jobs;          // waiting
+    LoadJob runningJob;                // on the worker (name "" when none)
+    std::future<LoadResult> running;
 
-    ModelHandle add(SceneModel model, Model& contents);
+    [[nodiscard]] State state(ModelHandle handle) const;  // Free for an invalid or stale handle
+    [[nodiscard]] State state(EnvironmentHandle handle) const;
+    uint32_t freeSlot();
+    uint32_t freeEnvironmentSlot();
+    // Puts the model's contents into the lists, into that slot. Throws if there is no room for its textures.
+    void add(uint32_t slot, SceneModel model, Model& contents);
+    // Loads the file (on the worker thread: touches nothing of the store but its arguments)
+    static LoadResult load(const LoadJob& job, const std::string& modelsDirectory,
+                           const std::string& environmentsDirectory);
+    void startNextLoad();
+    void finishLoad(LoadResult result);
     void unload(uint32_t slot);
     // Unloads the unused model released longest ago; false if there is none
     bool unloadOldestUnused();

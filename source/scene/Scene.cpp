@@ -75,6 +75,9 @@ void Scene::createDefault() {
 
 void Scene::clear() {
     releaseAll();
+    pendingMap = EnvironmentHandle();
+    mapError.clear();
+    pendingModelEdits.clear();
     entityList.clear();
     entityIndex.clear();
     rootList.clear();
@@ -103,6 +106,9 @@ void Scene::releaseAll() {
     if (sceneEnvironment.map.valid()) {
         assets.release(sceneEnvironment.map);
     }
+    if (pendingMap.valid()) {
+        assets.release(pendingMap);
+    }
 }
 
 void Scene::takeFrom(Scene& other) {
@@ -116,6 +122,10 @@ void Scene::takeFrom(Scene& other) {
     rimModel = other.rimModel;
     sceneCamera = other.sceneCamera;
     sceneEnvironment = other.sceneEnvironment;
+    pendingMap = other.pendingMap;
+    mapError = other.mapError;
+    pendingModelEdits = std::move(other.pendingModelEdits);
+    messages.insert(messages.end(), other.messages.begin(), other.messages.end());
     layoutRevision++;  // (its own counter: the render list compares with this scene's)
     other.entityList.clear();
     other.entityIndex.clear();
@@ -123,6 +133,9 @@ void Scene::takeFrom(Scene& other) {
     other.modelTable.clear();
     other.portalTable.clear();
     other.sceneEnvironment.map = EnvironmentHandle();
+    other.pendingMap = EnvironmentHandle();
+    other.pendingModelEdits.clear();
+    other.messages.clear();
 }
 
 std::vector<EntityId> Scene::treeOrder() const {
@@ -178,11 +191,15 @@ void Scene::reindex() {
 
 EntityId Scene::addObject(const std::string& fileName, bool originalSize) {
     ModelComponent component;
-    component.model = assets.findOrLoad(fileName);  // throws if it can't be loaded: nothing changed yet
+    component.model = assets.requestModel(fileName);  // (throws only for a missing built-in: nothing changed yet)
     component.originalSize = originalSize && !isBuiltInModel(fileName);
-    const SceneModel& model = assets.model(component.model);
-    for (const MeshInstance& part : model.parts) {
-        component.hiddenParts.push_back(part.hiddenByDefault);
+    if (assets.isLoaded(component.model)) {
+        for (const MeshInstance& part : assets.model(component.model).parts) {
+            component.hiddenParts.push_back(part.hiddenByDefault);
+        }
+    } else {
+        component.loading = true;  // its parts come when it arrives (update)
+        component.loadingEntry = modelEntryText(fileName, false, component.originalSize);
     }
     std::string name = std::filesystem::path(fileName).stem().string();
 
@@ -223,7 +240,7 @@ EntityId Scene::addPortalPair() {
     glm::vec3 center = sceneCamera.position + forward * 3.0f;
     float yaw = glm::degrees(std::atan2(-forward.x, -forward.z)) + 0.0f;  // +Z towards the camera (+ 0: no -0)
 
-    rimModel = assets.findOrLoad(portalRimModelName());
+    rimModel = assets.requestModel(portalRimModelName());  // built in: made at once
     assets.acquire(rimModel);
 
     Entity& group = create("Portal " + std::to_string(++portalPairsMade), 0);
@@ -635,7 +652,7 @@ void Scene::buildRenderList(RenderList& list) {
     }
     for (const Placed& p : placed) {
         EntityId id = p.entity->id;
-        if (const ModelComponent* component = model(id); component != nullptr && component->model.valid()) {
+        if (const ModelComponent* component = model(id); component != nullptr && assets.isLoaded(component->model)) {
             models.push_back({id, component, p.visible, p.world});
         }
         const PortalComponent* portal = this->portal(id);
@@ -707,11 +724,95 @@ void Scene::buildRenderList(RenderList& list) {
 }
 
 void Scene::setEnvironmentMap(const std::string& fileName) {
-    EnvironmentHandle map = assets.findOrLoadEnvironment(fileName);
+    EnvironmentHandle map = assets.requestEnvironment(fileName);
+    mapError.clear();
+    if (map == pendingMap) {
+        return;  // already on its way
+    }
+    if (pendingMap.valid()) {
+        assets.release(pendingMap);  // another one was picked meanwhile: that one isn't wanted any more
+        pendingMap = EnvironmentHandle();
+    }
     if (map == sceneEnvironment.map) {
         return;
     }
     assets.acquire(map);
-    assets.release(sceneEnvironment.map);  // the last user of the old map: it is unloaded
-    sceneEnvironment.map = map;
+    pendingMap = map;
+    updateEnvironmentMap();  // (already loaded: at once)
+}
+
+void Scene::updateEnvironmentMap() {
+    if (!pendingMap.valid() || assets.isLoading(pendingMap)) {
+        return;
+    }
+    if (assets.isLoaded(pendingMap)) {
+        if (sceneEnvironment.map.valid()) {
+            assets.release(sceneEnvironment.map);  // the last user of the old map: it is unloaded
+        }
+        sceneEnvironment.map = pendingMap;
+    } else {
+        mapError = assets.environmentMap(pendingMap).name + " not loaded: " + assets.loadError(pendingMap);
+        messages.push_back({SceneMessage::Level::Error, "Environment map " + mapError});
+        assets.release(pendingMap);
+    }
+    pendingMap = EnvironmentHandle();
+}
+
+bool Scene::loading() const {
+    if (pendingMap.valid()) {
+        return true;
+    }
+    for (const auto& [id, component] : modelTable) {
+        if (component.loading) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Scene::update() {
+    std::vector<ModelHandle> arrived;  // reported once per model, not per entity
+    for (auto& [id, component] : modelTable) {
+        if (!component.loading || assets.isLoading(component.model)) {
+            continue;
+        }
+        const std::string& entityName = find(id)->name;
+        component.loading = false;
+        if (assets.isLoaded(component.model)) {
+            const SceneModel& model = assets.model(component.model);
+            component.hiddenParts.clear();
+            for (const MeshInstance& part : model.parts) {
+                component.hiddenParts.push_back(part.hiddenByDefault);
+            }
+            for (const std::string& warning : applyLoadingEntry(component)) {
+                messages.push_back({SceneMessage::Level::Warning, entityName + ": " + warning});
+            }
+            if (std::find(arrived.begin(), arrived.end(), component.model) == arrived.end()) {
+                arrived.push_back(component.model);
+                messages.push_back({SceneMessage::Level::Info, "Loaded " + model.name});
+                for (const std::string& warning : applyPendingEdits(model.name)) {
+                    messages.push_back({SceneMessage::Level::Warning, warning});  // (names the model)
+                }
+            }
+            layoutRevision++;
+        } else {
+            // Failed: kept as a missing model, its entry saved as it was
+            component.missingFile = assets.modelName(component.model);
+            component.missingReason = assets.loadError(component.model);
+            component.missingEntry = component.loadingEntry;
+            messages.push_back({SceneMessage::Level::Error, entityName + ": model " + component.missingFile +
+                                                            " not loaded: " + component.missingReason});
+            const std::string& name = component.missingFile;
+            pendingModelEdits.erase(std::remove_if(pendingModelEdits.begin(), pendingModelEdits.end(),
+                                                   [&](const auto& edit) { return edit.first == name; }),
+                                    pendingModelEdits.end());
+            assets.release(component.model);
+            component.model = ModelHandle();
+        }
+        component.loadingEntry.clear();
+    }
+    if (!arrived.empty()) {
+        assets.materialsChanged();  // the edits applied
+    }
+    updateEnvironmentMap();
 }

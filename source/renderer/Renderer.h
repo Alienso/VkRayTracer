@@ -480,7 +480,7 @@ struct RenderSettings {
     float cacheCellPixels = 32.0f;  // cache cells are about this many pixels wide on screen (measured best in Sponza)
     int cacheUpdateTile = 4;        // one cache update path per N x N pixels
     float cacheHistoryFrames = 32.0f;  // old cache samples fade out over about this many frames
-    // ReSTIR DI (RESTIR_DI_PLAN.md): direct light at the first surface. Set separately for Accumulation (off: the
+    // ReSTIR DI (LIMITATIONS.md): direct light at the first surface. Set separately for Accumulation (off: the
     // plain path tracer stays the reference) and the DLSS modes (on: less noise and flicker for DLSS to work with).
     bool restirDiAccumulation = false;
     bool restirDiDlss = true;
@@ -503,7 +503,7 @@ struct RenderSettings {
     float restirSpatialRadius = 30.0f;   // render pixels
     int restirDisocclusionNeighbors = 8;  // for pixels without history (just uncovered)
     bool restirSpatialVisibility = true;  // unbiased: else Sponza ends up 9.7% too dark (neighbors within 30 pixels)
-    // ReSTIR GI (RESTIR_GI_PLAN.md): light reaching the first surface via a second one. Independent of ReSTIR DI,
+    // ReSTIR GI (LIMITATIONS.md): light reaching the first surface via a second one. Independent of ReSTIR DI,
     // set separately for Accumulation and the DLSS modes as it is. Off in both: under DLSS it barely lowered the noise
     // once unbiased (boiling filter off, temporal visibility ray), for 3-10 ms, and its kept samples flash.
     bool restirGiAccumulation = false;

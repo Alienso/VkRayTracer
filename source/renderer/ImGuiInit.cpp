@@ -141,7 +141,7 @@ void Renderer::buildRenderingUi() {
     ImGui::EndDisabled();
 }
 
-// ReSTIR DI (see RESTIR_DI_PLAN.md)
+// ReSTIR DI (see LIMITATIONS.md)
 void Renderer::buildRestirUi() {
     ImGui::SeparatorText("ReSTIR DI");
     bool& restirDi = settings.restirDi(settings.renderMode);
@@ -206,7 +206,7 @@ void Renderer::buildRestirUi() {
     ImGui::EndDisabled();
     ImGui::EndDisabled();
 
-    // ReSTIR GI (see RESTIR_GI_PLAN.md)
+    // ReSTIR GI (see LIMITATIONS.md)
     ImGui::SeparatorText("ReSTIR GI");
     bool& restirGi = settings.restirGi(settings.renderMode);
     ImGui::Checkbox(accumulation ? "ReSTIR GI (Accumulation)" : "ReSTIR GI (DLSS modes)", &restirGi);
