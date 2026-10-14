@@ -908,6 +908,12 @@ SceneUniforms Renderer::buildSceneUniforms() {
     frameView = camera.viewMatrix();
     frameProjection = camera.projectionMatrix(aspectRatio, Configuration::cameraNear, Configuration::cameraFar);
     frameViewProjection = frameProjection * frameView;
+    // The camera went through a portal: last frame it saw this frame's points where they were before going through
+    // with it, so the motion vectors (and DLSS's history) carry on as if it had seen them directly
+    bool teleported = renderList->cameraTeleport != glm::mat4(1.0f);
+    if (teleported && hasPreviousViewProjection) {
+        previousViewProjection = previousViewProjection * glm::inverse(renderList->cameraTeleport);
+    }
     framePreviousViewProjection = hasPreviousViewProjection ? previousViewProjection : frameViewProjection;
     uniforms.viewProjection = frameViewProjection;
     uniforms.previousViewProjection = framePreviousViewProjection;
@@ -1066,7 +1072,9 @@ SceneUniforms Renderer::buildSceneUniforms() {
     // ReSTIR history (after the comparison above: these change every frame). Last frame's reservoirs are usable if
     // ReSTIR ran last frame, at this size (createRayTracingImages), and no light was added or removed: their samples
     // name lights by index in lists that are then rebuilt.
-    uniforms.restirHistoryValid = restirHistoryAvailable && !restirLightsChanged ? 1 : 0;
+    // (Nor after the camera went through a portal: pixels seen through one have no reservoirs, and their surfaces
+    // are now seen directly.)
+    uniforms.restirHistoryValid = restirHistoryAvailable && !restirLightsChanged && !teleported ? 1 : 0;
     uniforms.restirCurrentHalf = restirCurrentHalf;
     // Shuffle of last frame's pixels (see restirTemporal): on (bit 4) and this frame's random offset (bits 0-3)
     uint32_t permutationHash = frameIndex * 0x9E3779B9u;
@@ -1075,7 +1083,8 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.restirPermutation = (settings.restirPermutation ? 16u : 0u) | (permutationHash & 15u);
     // GI samples carry the light they saw (Lo): after the lighting changed (as for the radiance cache, above) it is
     // out of date, so drop them, as when lights are added or removed. Lights that move rely on the age limit.
-    uniforms.restirGiHistoryValid = restirGiHistoryAvailable && !restirLightsChanged && !lightingChanged ? 1 : 0;
+    uniforms.restirGiHistoryValid =
+            restirGiHistoryAvailable && !restirLightsChanged && !lightingChanged && !teleported ? 1 : 0;
     // Bounce light clamp (DLSS modes, see clampBounceLight in the shader). The limit is set on screen, so it is
     // divided by the exposure: the GPU's from a few frames ago (exposureInfo), or the manual one. After the
     // comparison above: it changes every frame with the auto exposure.

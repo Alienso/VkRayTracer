@@ -169,6 +169,11 @@ public:
 
     Camera& camera() { return sceneCamera; }
     [[nodiscard]] const Camera& camera() const { return sceneCamera; }
+    // After moving the camera from `from` to where it is now: if that line goes through a portal's opening, the
+    // camera comes out of the other end (also more than once), seeing what it saw through the opening. Rays start
+    // at the camera's position, so it is on one side or the other, never half in. Its roll is lost (the camera
+    // has none): a pair whose ends lean differently turns the view upright as it comes out.
+    void moveCameraThroughPortals(const glm::vec3& from);
 
     SceneEnvironment& environment() { return sceneEnvironment; }
     [[nodiscard]] const SceneEnvironment& environment() const { return sceneEnvironment; }
@@ -189,6 +194,7 @@ private:
     int portalPairsMade = 0;    // for their names
     ModelHandle rimModel;       // the built-in portal rim, while there are pairs
     Camera sceneCamera;
+    glm::mat4 cameraTeleport = glm::mat4(1.0f);  // since the last render list (RenderList::cameraTeleport)
     SceneEnvironment sceneEnvironment;
     // Goes up when the render list's layout changes in ways it doesn't find by comparing entities: entities added,
     // removed or re-parented (the tree order), parts shown or hidden
@@ -239,6 +245,8 @@ private:
         glm::mat4 ends[2];
         const PortalComponent* portal;
     };
+    // The enabled pairs (both ends visible), in the order of their A ends
+    [[nodiscard]] std::vector<PlacedPair> placePairs(const std::vector<Placed>& placed) const;
     // The bars of the pairs' rims: (mesh, world matrix) for each
     [[nodiscard]] std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims(
             const std::vector<PlacedPair>& pairs) const;

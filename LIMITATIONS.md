@@ -523,7 +523,6 @@ change it, and 310.3.0 (`--dlss-cnn`) doesn't do it. Harmless as far as visible.
 At 1600x900 output the transformer models take ~8.5 ms (DLAA), ~4.5 ms (Quality), ~3.2 ms (Performance), more
 than the path tracing at those render sizes (helmet scene 0.5-1.8 ms, Sponza 1.7-7.2 ms); they are meant for
 newer GPUs. The CNN models (DLSS model combo) take about half (Quality: ~2.2-2.4 ms) and look a little softer.
-Tables in PHASE7_PLAN.md.
 
 ### Streamline warns that it can't hook some Vulkan commands
 `Hook sl.common:Vulkan:CmdBindPipeline / CmdBindDescriptorSets / BeginCommandBuffer is NOT supported`: with
@@ -581,3 +580,10 @@ Through a portal, depth and motion vectors are for where the surface appears (co
 still), but the normal guide is the surface's real one, not turned like the view. A moving portal or an object
 moving behind one gives wrong motion vectors there.
 - Where: `storeSurfaceGuides`.
+
+### The camera comes out upright
+The camera has no roll, so going through a pair whose ends lean differently (one in a wall, the other in the floor)
+turns the view upright at once as it comes out, instead of continuing it. Only the camera's own movement takes it
+through (the fly controls); moving the camera in the editor, or an end onto the camera, doesn't.
+- Where: `Scene::moveCameraThroughPortals`.
+- Fix: a camera roll, turned back to upright over a moment after coming out.

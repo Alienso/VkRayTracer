@@ -64,6 +64,9 @@ public:
     std::vector<RenderLight> lights;
     std::vector<RenderPortal> portals;
     Camera camera;                 // copied every frame
+    // Where the camera went through portals since the last build: takes points from where it was to where it is now
+    // (identity when it didn't). The same view continues, so last frame's image is still this one's history.
+    glm::mat4 cameraTeleport = glm::mat4(1.0f);
     SceneEnvironment environment;  // copied every frame (its map: AssetStore::environmentMap)
 
     // Goes up whenever the instances and motions were remade: other instances, or in another order

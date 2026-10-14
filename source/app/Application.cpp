@@ -89,7 +89,9 @@ void Application::mainLoop() {
         ImGui::Render();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
+        glm::vec3 cameraFrom = scene.camera().position;
         cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        scene.moveCameraThroughPortals(cameraFrom);
         scene.buildRenderList(renderList);
         if (window.takeResized()) {  // dragged, maximized, fullscreen (F11 or the editor)
             renderer.resize();

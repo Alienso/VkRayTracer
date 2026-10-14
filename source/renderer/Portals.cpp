@@ -22,7 +22,6 @@ void Renderer::destroyPortalBuffer() {
 void Renderer::buildPortalList() {
     framePortals.clear();
     const std::vector<RenderPortal>& portals = renderList->portals;
-    const glm::mat4 halfTurn = glm::rotate(glm::mat4(1.0f), glm::pi<float>(), glm::vec3(0.0f, 1.0f, 0.0f));
     for (size_t i = 0; i < portals.size(); i++) {
         const RenderPortal& portal = portals[i];
         const RenderPortal& partner = portals[i ^ 1];
@@ -33,7 +32,7 @@ void Renderer::buildPortalList() {
         gpu.halfWidth = std::max(portal.halfSize.x, 1e-4f);
         gpu.halfHeight = std::max(portal.halfSize.y, 1e-4f);
         gpu.shape = static_cast<uint32_t>(portal.shape);
-        gpu.toPartner = glm::mat4x3(partner.world * halfTurn * glm::inverse(portal.world));
+        gpu.toPartner = glm::mat4x3(portalToPartner(portal.world, partner.world));
         framePortals.push_back(gpu);
     }
 }

@@ -86,6 +86,7 @@ void Scene::clear() {
     entitiesMade = 0;
     portalPairsMade = 0;
     sceneCamera = Camera();
+    cameraTeleport = glm::mat4(1.0f);
     sceneEnvironment = SceneEnvironment();
     assets.resetEdits();
     layoutRevision++;
@@ -121,6 +122,7 @@ void Scene::takeFrom(Scene& other) {
     portalPairsMade = other.portalPairsMade;
     rimModel = other.rimModel;
     sceneCamera = other.sceneCamera;
+    cameraTeleport = glm::mat4(1.0f);
     sceneEnvironment = other.sceneEnvironment;
     pendingMap = other.pendingMap;
     mapError = other.mapError;
@@ -638,24 +640,18 @@ bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& mo
     return true;
 }
 
-void Scene::buildRenderList(RenderList& list) {
-    std::vector<Placed> placed = placeAll();
-
-    // The model entities, in tree order (also the instances' order)
-    std::vector<PlacedModel> models;
-    // The enabled portal pairs (both ends visible), in the order of their A ends
+std::vector<Scene::PlacedPair> Scene::placePairs(const std::vector<Placed>& placed) const {
     std::vector<PlacedPair> pairs;
+    if (portalTable.empty()) {
+        return pairs;
+    }
     std::unordered_map<EntityId, size_t> placedIndex;
     placedIndex.reserve(placed.size());
     for (size_t i = 0; i < placed.size(); i++) {
         placedIndex[placed[i].entity->id] = i;
     }
     for (const Placed& p : placed) {
-        EntityId id = p.entity->id;
-        if (const ModelComponent* component = model(id); component != nullptr && assets.isLoaded(component->model)) {
-            models.push_back({id, component, p.visible, p.world});
-        }
-        const PortalComponent* portal = this->portal(id);
+        const PortalComponent* portal = this->portal(p.entity->id);
         if (portal != nullptr && portal->endA && p.visible) {
             auto other = placedIndex.find(portal->other);
             if (other != placedIndex.end() && placed[other->second].visible) {
@@ -663,8 +659,79 @@ void Scene::buildRenderList(RenderList& list) {
             }
         }
     }
+    return pairs;
+}
+
+// Whether the line from a to b crosses an end's opening (end: its placement without scale), and where along it
+// (0..1). The same test as the shader's portalOpeningHit, for a line instead of a ray.
+static bool crossesOpening(const glm::mat4& end, const PortalComponent& portal, const glm::vec3& a, const glm::vec3& b,
+                           float& along) {
+    glm::vec3 center(end[3]);
+    glm::vec3 normal(end[2]);
+    float da = glm::dot(a - center, normal);
+    float db = glm::dot(b - center, normal);
+    if ((da >= 0.0f) == (db >= 0.0f)) {
+        return false;  // on the same side
+    }
+    along = da / (da - db);
+    glm::vec3 offset = a + (b - a) * along - center;
+    glm::vec2 p(glm::dot(offset, glm::vec3(end[0])) / (portal.size.x * 0.5f),
+                glm::dot(offset, glm::vec3(end[1])) / (portal.size.y * 0.5f));
+    return portal.shape == PortalShape::Ellipse ? glm::dot(p, p) <= 1.0f : std::max(std::abs(p.x), std::abs(p.y)) <= 1.0f;
+}
+
+void Scene::moveCameraThroughPortals(const glm::vec3& from) {
+    if (portalTable.empty() || from == sceneCamera.position) {
+        return;
+    }
+    std::vector<PlacedPair> pairs = placePairs(placeAll());
+    glm::vec3 a = from;
+    int cameOutOf = -1;  // the end it just came out of (2 * pair + end): the line starts on its plane
+    // As many times as the shader lets a ray through (MAX_PORTAL_CROSSINGS): a step that long is rare anyway
+    for (int crossing = 0; crossing < 8; crossing++) {
+        int nearest = -1;
+        float nearestAlong = 2.0f;
+        for (size_t i = 0; i < pairs.size() * 2; i++) {
+            float along;
+            if (static_cast<int>(i) != cameOutOf &&
+                crossesOpening(pairs[i / 2].ends[i % 2], *pairs[i / 2].portal, a, sceneCamera.position, along) &&
+                along < nearestAlong) {
+                nearest = static_cast<int>(i);
+                nearestAlong = along;
+            }
+        }
+        if (nearest < 0) {
+            return;
+        }
+        const PlacedPair& pair = pairs[nearest / 2];
+        glm::mat4 toPartner = portalToPartner(pair.ends[nearest % 2], pair.ends[1 - nearest % 2]);
+        glm::vec3 crossedAt = a + (sceneCamera.position - a) * nearestAlong;
+        a = glm::vec3(toPartner * glm::vec4(crossedAt, 1.0f));
+        sceneCamera.position = glm::vec3(toPartner * glm::vec4(sceneCamera.position, 1.0f));
+        glm::vec3 forward = glm::normalize(glm::mat3(toPartner) * sceneCamera.forward());
+        sceneCamera.pitch = glm::clamp(glm::degrees(std::asin(glm::clamp(forward.y, -1.0f, 1.0f))), -89.0f, 89.0f);
+        sceneCamera.yaw = glm::degrees(std::atan2(forward.x, -forward.z));
+        cameraTeleport = toPartner * cameraTeleport;
+        cameOutOf = nearest ^ 1;
+    }
+}
+
+void Scene::buildRenderList(RenderList& list) {
+    std::vector<Placed> placed = placeAll();
+
+    // The model entities, in tree order (also the instances' order)
+    std::vector<PlacedModel> models;
+    for (const Placed& p : placed) {
+        EntityId id = p.entity->id;
+        if (const ModelComponent* component = model(id); component != nullptr && assets.isLoaded(component->model)) {
+            models.push_back({id, component, p.visible, p.world});
+        }
+    }
+    std::vector<PlacedPair> pairs = placePairs(placed);
     std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims(pairs);
     list.camera = sceneCamera;
+    list.cameraTeleport = cameraTeleport;
+    cameraTeleport = glm::mat4(1.0f);
     list.environment = sceneEnvironment;
 
     // The instances: only the moved entities' ranges, unless the layout changed

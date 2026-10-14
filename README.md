@@ -47,6 +47,8 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 - Pairs of flat openings (rectangles or ellipses) placed in the editor: a ray that enters one leaves through the
   other. Light sampling reaches the sun and the punctual lights through them. Each end is an entity of its own, so
   either can be moved, or attached to something that moves.
+- The camera can fly through: it comes out of the other end, seeing what it saw through the opening, with no seam
+  (also in the DLSS modes: the motion vectors follow it through).
 - Optional rims.
 
 ### Noise reduction and real-time modes
