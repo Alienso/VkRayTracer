@@ -100,8 +100,21 @@ void Renderer::buildRenderingUi() {
                           "often, wherever it is. Light tree: also by how near it is and whether the surface faces it,\n"
                           "so in scenes with many small lights (Bistro at night) the nearby ones get the rays.");
     }
-    ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", sampledEmissiveTriangles, lightTree.size(),
-                        lightTreeDepth);
+    if (settings.lightPicking == static_cast<int>(LightPicking::Power)) {
+        ImGui::SliderInt("Power candidates", &settings.lightCandidates, 1, 16);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Glowing triangles picked by power to keep one of, by how near it is and how it and the\n"
+                              "surface face each other: no extra rays, only picks. 1: the plain pick. Bistro at night\n"
+                              "with DLAA + ReSTIR: 8 left about a third of the noise, for ~3-5 ms more (Debug).\n"
+                              "(The light tree weighs distance and angle itself.)");
+        }
+    }
+    if (lightTree.empty()) {
+        ImGui::TextDisabled("%zu glowing triangles", sampledEmissiveTriangles);
+    } else {
+        ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", sampledEmissiveTriangles,
+                            lightTree.size(), lightTreeDepth);
+    }
     ImGui::Checkbox("Texture mipmaps", &settings.textureMipmaps);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("On: each hit reads textures at the size that fits how much of the surface one pixel sees\n"

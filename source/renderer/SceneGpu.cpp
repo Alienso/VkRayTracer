@@ -207,8 +207,9 @@ void Renderer::updateScene() {
         }
     }
 
-    // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list.
-    if (tlasDirty || gpuAssets.materialsDirty) {
+    // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list. Also when light
+    // picking changes: the tree is built only for picking with it.
+    if (tlasDirty || gpuAssets.materialsDirty || settings.lightPicking != lightListPicking) {
         buildLightList();  // uploaded in this frame's command buffer
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
         VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();

@@ -130,6 +130,7 @@ layout(binding = 3) uniform SceneUniforms {
     uint emissiveSolidAngle;        // 1 = points on glowing triangles by solid angle (see sphericalSolidAngle), 0 = by area
     uint portalCount;               // entries in the portal list (binding 31): two per pair
     float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
+    uint lightCandidates;           // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
 } scene;
 
 // (0 in a pipeline without the feature, so its code drops out)
@@ -2418,17 +2419,63 @@ int pickEmissiveTriangle(vec3 p, vec3 n, bool twoSided, float pick, out float pi
     return pickProbability > 0.0 ? lightIndex : -1;
 }
 
+// How much a glowing triangle could light the point p (normal n), per unit of its power: roughly its solid angle
+// (facing cosine over the distance squared) times the surface's cosine, both towards its center. Never 0 (each
+// cosine at least 0.05, the area added to the distance squared), so every triangle that may light p keeps a chance
+// (see sampleEmissiveLight).
+float lightCandidateReach(EmissiveTriangle light, vec3 p, vec3 n, bool twoSided) {
+    vec3 toCenter = (light.p0 + light.p1 + light.p2) / 3.0 - p;
+    float distanceSquared = dot(toCenter, toCenter);
+    float cosine = dot(n, toCenter) * inversesqrt(max(distanceSquared, 1e-12));
+    vec3 lightNormal = normalize(cross(light.p1 - light.p0, light.p2 - light.p0));
+    float cosLight = abs(dot(lightNormal, toCenter)) * inversesqrt(max(distanceSquared, 1e-12));
+    return max(twoSided ? abs(cosine) : cosine, 0.05) * max(cosLight, 0.05) / (distanceSquared + light.area);
+}
+
 // One randomly picked point on the glowing triangles, seen from surfacePoint. random: x picks the
-// triangle, y and z the point.
-LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, vec3 random) {
+// triangle, y and z the point, w which candidate is kept.
+// Candidates (scene.lightCandidates, resampled importance sampling; picking by power only, 1 with the tree): picking
+// by power alone sends many shadow rays to lights that are far away or behind the surface. So pick several, keep one
+// with a chance proportional to target / pickProbability, target = its power x lightCandidateReach, and scale its
+// light by the mean of those weights over the kept one's: on average exactly the light of all triangles.
+// The candidates cost a pick and a read each, no ray. With 1, it is the plain pick.
+// MIS (with the bounce rays) still uses the pick's pdf, here and where bounce rays hit the triangle: the two weights
+// still add up to 1 everywhere, so nothing is counted twice or lost; they are just less well balanced.
+LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, vec4 random, inout uint seed) {
     LightSample s = noLightSample();
     // 1: pick a triangle
-    float pickProbability;
-    int lightIndex = pickEmissiveTriangle(hit.position, shadingNormal, hit.diffuseTransmission > 0.0, random.x,
-                                          pickProbability);
+    bool twoSided = hit.diffuseTransmission > 0.0;
+    int lightIndex = -1;
+    float pickProbability = 0.0;
+    float weightSum = 0.0;
+    float keptWeight = 0.0;
+    float u = random.w;
+    [[dont_unroll]] for (uint i = 0u; i < scene.lightCandidates; i++) {
+        float candidateProbability;
+        int candidate = pickEmissiveTriangle(hit.position, shadingNormal, twoSided,
+                                             i == 0u ? random.x : randomFloat(seed), candidateProbability);
+        if (candidate < 0) {
+            continue;
+        }
+        EmissiveTriangle c = emissiveTriangles[candidate];
+        float weight = c.probability * lightCandidateReach(c, hit.position, shadingNormal, twoSided)
+                       / candidateProbability;
+        weightSum += weight;
+        float keep = weight / weightSum;  // one random number for all: rescaled after each choice
+        if (u < keep) {
+            u /= keep;
+            lightIndex = candidate;
+            pickProbability = candidateProbability;
+            keptWeight = weight;
+        } else {
+            u = (u - keep) / (1.0 - keep);
+        }
+        u = min(u, 0.99999994);
+    }
     if (lightIndex < 0) {
         return s;
     }
+    float candidateScale = weightSum / (float(scene.lightCandidates) * keptWeight);
     EmissiveTriangle light = emissiveTriangles[lightIndex];
 
     // 2: a point on it
@@ -2449,7 +2496,7 @@ LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, 
     }
     s.distance = distance - stopShortOf(lightPoint, lightNormal, cosLight);  // the light itself would count as a blocker
     s.pdf = lightPdf(lightIndex, pickProbability, surfacePoint, distance, cosLight);
-    s.light = emissionAt(light.materialIndex, lightUv) / s.pdf;
+    s.light = emissionAt(light.materialIndex, lightUv) / s.pdf * candidateScale;
     s.mis = scene.emissiveSampling == EMISSIVE_MIS ? MIS_UNLESS_GLASS : MIS_NONE;
     s.shadowed = true;
     return s;
@@ -3892,7 +3939,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                         s = restirReservoirSample(pixel, hit.position);
                     } else if (sampleLights) {
                         s = sampleEmissiveLight(hit, hit.normal, hit.position,
-                                                pathSample(bounce, SAMPLE_EMISSIVE, seed).xyz);
+                                                pathSample(bounce, SAMPLE_EMISSIVE, seed), seed);
                     }
                 } else if (slot < lightSlots) {
                     s = samplePunctualLight(slot - 3, hit.position, seed);

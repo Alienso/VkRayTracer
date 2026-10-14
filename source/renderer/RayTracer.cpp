@@ -959,6 +959,9 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
     uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !lightTree.empty() ? 1 : 0;
+    // Only for picking by power: the tree already weighs distance and angle, candidates only added time there
+    uniforms.lightCandidates = uniforms.lightTree != 0
+                               ? 1u : static_cast<uint32_t>(std::clamp(settings.lightCandidates, 1, 16));
     uniforms.blurCaustics = settings.blurCaustics ? 1 : 0;
     uniforms.textureMipmaps = settings.textureMipmaps ? 1 : 0;
     uniforms.normalMapFiltering = settings.normalMapFiltering ? 1 : 0;
@@ -1051,8 +1054,8 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.frameIndex = frameIndex;
     uniforms.accumulatedFrames = accumulatedFrames;
     // ReSTIR history (after the comparison above: these change every frame). Last frame's reservoirs are usable if
-    // ReSTIR ran last frame, at this size (createRayTracingImages), and no light was added, removed or moved: their
-    // samples name lights by index in lists that are then rebuilt.
+    // ReSTIR ran last frame, at this size (createRayTracingImages), and no light was added or removed: their samples
+    // name lights by index in lists that are then rebuilt.
     uniforms.restirHistoryValid = restirHistoryAvailable && !restirLightsChanged ? 1 : 0;
     uniforms.restirCurrentHalf = restirCurrentHalf;
     // Shuffle of last frame's pixels (see restirTemporal): on (bit 4) and this frame's random offset (bits 0-3)
@@ -1105,8 +1108,11 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     readTimestamps();
     vkCmdResetQueryPool(commandBuffer, timestampQueryPool, currentFrame * timestampsPerFrame, timestampsPerFrame);
 
-    // Lights uploaded this frame may have new indices: ReSTIR can't reuse last frame's samples then
-    restirLightsChanged = lightsUploadPending || environmentUploadPending || punctualLightsUploadPending;
+    // Lights uploaded this frame may have new indices: ReSTIR can't reuse last frame's samples then. Glowing
+    // triangles only when their indices changed (lightIndicesChanged): moved ones keep theirs, and a reused sample is
+    // evaluated where its triangle is now.
+    restirLightsChanged = lightIndicesChanged || environmentUploadPending || punctualLightsUploadPending;
+    lightIndicesChanged = false;
 
     // Objects moved (or the scene changed): rebuild the TLAS first. Sets resetAccumulation,
     // so it has to happen before the uniforms are built.

@@ -105,6 +105,7 @@ struct SceneUniforms {
     uint32_t emissiveSolidAngle;     // 1 = points on glowing triangles picked by solid angle, 0 = by area
     uint32_t portalCount;            // entries in the portal list (binding 31): two per pair
     float fogTime;                   // seconds of fog drift (Material::fogDrift); 0 while no fog drifts
+    uint32_t lightCandidates;        // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
@@ -452,6 +453,7 @@ struct RenderSettings {
 
     int emissiveSampling = static_cast<int>(EmissiveSampling::Mis);
     int lightPicking = static_cast<int>(LightPicking::Tree);
+    int lightCandidates = 8;  // picking by power: this many glowing triangles, one kept (by distance and angle)
     int skySampling = static_cast<int>(SkySampling::On);  // shadow rays towards the sky (see Environment.cpp)
     bool punctualLights = true;        // the lights that came with the models (KHR_lights_punctual)
     float punctualLightScale = 1.0f;   // multiplies them all
@@ -709,6 +711,11 @@ private:
     StreamedBuffer instanceLightBuffer;
     std::vector<LightTreeNode> lightTree;
     uint32_t lightTreeDepth = 0;  // levels below the root, for the UI
+    int lightListPicking = -1;    // settings.lightPicking the list was built for: the tree only exists for Tree
+    // What the light indices name: per glowing instance its mesh's id and firstLight. While it stays the same (lights
+    // only moved or changed brightness), index i is still the same triangle, so ReSTIR keeps its history.
+    std::vector<uint64_t> lightLayout;
+    bool lightIndicesChanged = false;  // the last rebuild changed lightLayout (cleared when ReSTIR has been told)
     StreamedBuffer lightTreeBuffer;
     bool lightsUploadPending = false;
     // Punctual lights (Lights.cpp): this frame's, and what the GPU has (uploaded only when they differ)

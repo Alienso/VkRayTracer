@@ -109,6 +109,7 @@ static float luminance(glm::vec3 color) {
 // Collects the emissive triangles of this frame's instances (renderList's, one to one with the TLAS's) in world
 // space.
 void Renderer::buildLightList() {
+    lightListPicking = settings.lightPicking;
     emissiveTriangles.clear();
     instanceFirstLight.assign(renderList->instances.size(), -1);
     double totalWeight = 0.0;
@@ -165,7 +166,13 @@ void Renderer::buildLightList() {
             triangle.cdf = static_cast<float>(sum);
         }
         emissiveTriangles.back().cdf = 1.0f;  // no rounding gap at the end
-        buildLightTree();
+        // Only when it is used: it's most of the rebuild's time (picking by power needs just the CDF)
+        if (lightListPicking == static_cast<int>(LightPicking::Tree)) {
+            buildLightTree();
+        } else {
+            lightTree.clear();
+            lightTreeDepth = 0;
+        }
     } else {
         // Glowing materials, but all triangles have zero area or a black texture: nothing to sample.
         emissiveTriangles.clear();
@@ -173,6 +180,18 @@ void Renderer::buildLightList() {
         sampledEmissiveTriangles = 0;
         lightTree.clear();
         lightTreeDepth = 0;
+    }
+
+    std::vector<uint64_t> layout;
+    for (size_t i = 0; i < instanceFirstLight.size(); i++) {
+        if (instanceFirstLight[i] >= 0) {
+            layout.push_back(assets.meshIds()[renderList->instances[i].mesh]);
+            layout.push_back(static_cast<uint64_t>(instanceFirstLight[i]));
+        }
+    }
+    if (layout != lightLayout) {
+        lightLayout = std::move(layout);
+        lightIndicesChanged = true;
     }
     lightsUploadPending = true;
 }
