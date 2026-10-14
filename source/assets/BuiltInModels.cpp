@@ -15,6 +15,10 @@
 //
 // The light orb: a small glowing ball floating at the height of a fog box's middle, to light fog from inside.
 //
+// The flashlight: a 25 cm torch floating at the same height, its beam a spot light (KHR_lights_punctual's kind) along
+// -Z, away from where the default camera looks from. Turn the object to aim it; the beam's brightness, color and cone
+// are under the object's "Lights".
+//
 // The portal rim: two glowing cubes (blue for the A ends, orange for the B ends) that the Scene stretches into the
 // bars of the portals' frames.
 //
@@ -34,9 +38,10 @@ static const char* cubeName = "Cube";
 static const char* mirrorMazeName = "Mirror maze";
 static const char* fogBoxName = "Fog box";
 static const char* lightOrbName = "Light orb";
+static const char* flashlightName = "Flashlight";
 
 const std::vector<std::string>& builtInModelNames() {
-    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName, fogBoxName, lightOrbName};
+    static const std::vector<std::string> names = {cubeName, cornellBoxName, cornellBoxWithBlocksName, cornellBoxPointLightName, mirrorMazeName, fogBoxName, lightOrbName, flashlightName};
     return names;
 }
 
@@ -217,6 +222,116 @@ static Model createLightOrb() {
     model.boundsMax = mesh.boundsMax;
     model.meshes.push_back(mesh);
     model.instances.push_back({0, glm::mat4(1.0f)});
+    return model;
+}
+
+// A tube around the Z axis from z0 to z1, its radius going from r0 to r1 (a cone's slice when they differ), sides
+// only, smooth normals. inward: the normals point to the axis (the inside of a rim).
+static void addTube(Mesh& mesh, float z0, float z1, float r0, float r1, bool inward = false) {
+    const uint32_t segments = 32;
+    float slope = (r1 - r0) / (z1 - z0);  // how fast the radius grows along z
+    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+    for (uint32_t segment = 0; segment <= segments; segment++) {
+        float phi = 2.0f * glm::pi<float>() * static_cast<float>(segment % segments) / segments;
+        glm::vec2 around(std::cos(phi), std::sin(phi));
+        glm::vec3 normal = glm::normalize(glm::vec3(around, -slope)) * (inward ? -1.0f : 1.0f);
+        float u = static_cast<float>(segment) / segments;
+        mesh.vertices.push_back({glm::vec3(around * r0, z0), normal, {u, 0.0f}, glm::vec4(0.0f)});
+        mesh.vertices.push_back({glm::vec3(around * r1, z1), normal, {u, 1.0f}, glm::vec4(0.0f)});
+    }
+    for (uint32_t segment = 0; segment < segments; segment++) {
+        uint32_t a = base + segment * 2;
+        mesh.indices.insert(mesh.indices.end(), {a, a + 2, a + 1, a + 1, a + 2, a + 3});
+    }
+}
+
+// A flat ring around the Z axis at z, between radii inner and outer (inner 0: a disc), facing +Z or -Z
+static void addRing(Mesh& mesh, float z, float inner, float outer, bool facingPlusZ) {
+    const uint32_t segments = 32;
+    glm::vec3 normal(0.0f, 0.0f, facingPlusZ ? 1.0f : -1.0f);
+    uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+    for (uint32_t segment = 0; segment <= segments; segment++) {
+        float phi = 2.0f * glm::pi<float>() * static_cast<float>(segment % segments) / segments;
+        glm::vec2 around(std::cos(phi), std::sin(phi));
+        mesh.vertices.push_back({glm::vec3(around * inner, z), normal, around * (inner / outer) * 0.5f + 0.5f,
+                                 glm::vec4(0.0f)});
+        mesh.vertices.push_back({glm::vec3(around * outer, z), normal, around * 0.5f + 0.5f, glm::vec4(0.0f)});
+    }
+    for (uint32_t segment = 0; segment < segments; segment++) {
+        uint32_t a = base + segment * 2;
+        mesh.indices.insert(mesh.indices.end(), {a, a + 2, a + 1, a + 1, a + 2, a + 3});
+    }
+}
+
+// A torch 25 cm long along Z, floating 1.5 above the ground: a rubber grip, a metal head widening towards the front,
+// a lens that glows a little (so it looks switched on), and the beam: a spot light just in front of the lens. Its
+// light is far more than the lens's glow, as with a real torch's reflector.
+static Model createFlashlight() {
+    Model model;
+    model.name = flashlightName;
+    enum { Grip, Head, Lens };
+    Material grip = matte("grip", {0.03f, 0.03f, 0.03f});
+    grip.roughness = 0.6f;
+    model.materials.push_back(grip);
+    Material head = matte("head", {0.75f, 0.75f, 0.78f});  // brushed aluminium
+    head.metallic = 1.0f;
+    head.roughness = 0.3f;
+    model.materials.push_back(head);
+    Material lens = matte("lens", {0.9f, 0.9f, 0.9f});
+    lens.emissiveColor = {1.0f, 0.93f, 0.8f};  // a slightly warm white LED
+    lens.emissiveStrength = 20.0f;
+    model.materials.push_back(lens);
+
+    // Along z: the tail at +0.12, the grip to -0.06, the neck widening to -0.10, the head to the front rim at -0.13,
+    // the lens set 3 mm back in it
+    const float tail = 0.12f, gripEnd = -0.06f, neckEnd = -0.10f, front = -0.13f, lensZ = -0.127f;
+    const float gripRadius = 0.032f, headRadius = 0.048f, lensRadius = 0.044f;
+    Mesh gripMesh;
+    gripMesh.name = "grip";
+    gripMesh.materialIndex = Grip;
+    addTube(gripMesh, tail, gripEnd, gripRadius, gripRadius);
+    addRing(gripMesh, tail, 0.0f, gripRadius, true);
+    Mesh headMesh;
+    headMesh.name = "head";
+    headMesh.materialIndex = Head;
+    addTube(headMesh, gripEnd, neckEnd, gripRadius, headRadius);
+    addTube(headMesh, neckEnd, front, headRadius, headRadius);
+    addRing(headMesh, front, lensRadius, headRadius, false);
+    addTube(headMesh, front, lensZ, lensRadius, lensRadius, true);
+    Mesh lensMesh;
+    lensMesh.name = "lens";
+    lensMesh.materialIndex = Lens;
+    addRing(lensMesh, lensZ, 0.0f, lensRadius, false);
+
+    const glm::mat4 place = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.5f, 0.0f));
+    for (Mesh* mesh : {&gripMesh, &headMesh, &lensMesh}) {
+        mesh->hasNormals = true;
+        for (SceneVertex& vertex : mesh->vertices) {
+            vertex.position = glm::vec3(place * glm::vec4(vertex.position, 1.0f));
+        }
+        computeBounds(*mesh);
+        model.instances.push_back({static_cast<uint32_t>(model.meshes.size()), glm::mat4(1.0f)});
+        model.meshes.push_back(std::move(*mesh));
+    }
+
+    // The beam: a bright core of 10 degrees fading out by 20, as an LED torch's. 40 candela light a wall 3 m away
+    // about as brightly as the default sun does.
+    PunctualLight beam;
+    beam.name = "beam";
+    beam.type = LightType::Spot;
+    beam.color = lens.emissiveColor;
+    beam.intensity = 40.0f;
+    beam.innerConeAngle = glm::radians(10.0f);
+    beam.outerConeAngle = glm::radians(20.0f);
+    beam.transform = place * glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, front - 0.005f));  // shines down -Z
+    model.lights.push_back(beam);
+
+    model.boundsMin = model.meshes[0].boundsMin;
+    model.boundsMax = model.meshes[0].boundsMax;
+    for (const Mesh& mesh : model.meshes) {
+        model.boundsMin = glm::min(model.boundsMin, mesh.boundsMin);
+        model.boundsMax = glm::max(model.boundsMax, mesh.boundsMax);
+    }
     return model;
 }
 
@@ -417,6 +532,9 @@ Model createBuiltInModel(const std::string& name) {
     }
     if (name == lightOrbName) {
         return createLightOrb();
+    }
+    if (name == flashlightName) {
+        return createFlashlight();
     }
     if (name == portalRimModelName()) {
         return createPortalRim();

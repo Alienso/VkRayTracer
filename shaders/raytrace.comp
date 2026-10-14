@@ -2561,6 +2561,39 @@ LightSample samplePunctualLight(uint index, vec3 position, inout uint seed) {
     return s;
 }
 
+// The part of [span.x, span.y] along a ray (origin, direction) inside a spot light's cone (x >= y: none). The cone
+// (under 90 degrees wide) is convex, so that part is one stretch: its ends are among the span's ends and where the
+// ray crosses the cone's surface, a quadratic's roots; between two of them it is all in or all out.
+vec2 spotConeSpan(PunctualLight light, vec3 origin, vec3 direction, vec2 span) {
+    vec3 fromApex = origin - light.position;
+    float along = dot(direction, light.direction), startAlong = dot(fromApex, light.direction);
+    float c2 = light.cosOuterCone * light.cosOuterCone;
+    // inside: dot(p - apex, axis) >= cos * |p - apex|, i.e. a t^2 + b t + c >= 0 with dot(p - apex, axis) >= 0
+    float a = along * along - c2 * dot(direction, direction);
+    float b = 2.0 * (along * startAlong - c2 * dot(direction, fromApex));
+    float c = startAlong * startAlong - c2 * dot(fromApex, fromApex);
+    float ends[4] = float[4](span.x, span.y, span.y, span.y);
+    float discriminant = b * b - 4.0 * a * c;
+    if (discriminant >= 0.0 && abs(a) > 1e-12) {
+        float root = sqrt(discriminant);
+        ends[1] = clamp((-b - root) / (2.0 * a), span.x, span.y);
+        ends[2] = clamp((-b + root) / (2.0 * a), span.x, span.y);
+        if (ends[1] > ends[2]) {
+            float swap = ends[1]; ends[1] = ends[2]; ends[2] = swap;
+        }
+    }
+    vec2 inside = vec2(span.y, span.x);
+    for (int i = 0; i < 3; i++) {
+        float t = 0.5 * (ends[i] + ends[i + 1]);
+        vec3 p = fromApex + direction * t;
+        float axial = dot(p, light.direction);
+        if (ends[i + 1] > ends[i] && axial >= 0.0 && axial * axial >= c2 * dot(p, p)) {
+            inside = vec2(min(inside.x, ends[i]), max(inside.y, ends[i + 1]));
+        }
+    }
+    return inside;
+}
+
 // The light fog scatters into a ray from the punctual lights along its stretches inside fog (Intersection.lampSpan):
 // one stretch, picked by its majorant times its length, one light picked at random, at one point picked by equi-angular sampling
 // (Kulla & Fajardo 2012, "Importance Sampling Techniques for Path Tracing in Participating Media"): evenly by the
@@ -2574,6 +2607,12 @@ vec3 fogLampLight(vec3 origin, vec3 direction, Intersection stretch, uint bounce
     vec4 u = pathSample(bounce, SAMPLE_FOG, seed);  // x: where the ray scatters (intersectClosest)
     uint count = punctualLightCount();
     PunctualLight light = punctualLights[min(uint(u.y * float(count)), count - 1)];
+    // A spot light lights only the part inside its cone: the points are picked there (a narrow beam seen from the
+    // side got few points in it: slow-fading speckles)
+    vec2 lit = light.type == LIGHT_SPOT ? spotConeSpan(light, origin, direction, span) : span;
+    if (!(lit.x < lit.y)) {
+        return vec3(0.0);
+    }
     float t, pdf;
     if (light.type == LIGHT_DIRECTIONAL) {
         t = mix(span.x, span.y, u.z);
@@ -2581,8 +2620,8 @@ vec3 fogLampLight(vec3 origin, vec3 direction, Intersection stretch, uint bounce
     } else {
         float along = dot(light.position - origin, direction);  // the ray's point nearest the lamp
         float height = max(length(light.position - origin - direction * along), 1e-4);  // and its distance
-        float angleA = atan((span.x - along) / height);
-        float angleB = atan((span.y - along) / height);
+        float angleA = atan((lit.x - along) / height);
+        float angleB = atan((lit.y - along) / height);
         float offset = height * tan(mix(angleA, angleB, u.z));
         t = along + offset;
         pdf = height / ((angleB - angleA) * (height * height + offset * offset));

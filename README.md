@@ -98,8 +98,8 @@ shows "(loading)" in the Outliner until its model arrives, and the menu bar name
 its upload to the GPU still holds up one frame (about 4.6 s for Jungle Ruins). A file that can't be loaded leaves its
 entity without a model; the Log says why, and saving keeps the entity as the scene file had it.
 
-The editor can add a cube, Cornell boxes (empty, with blocks, or with a point light), a mirror maze, a fog box and
-a light orb, besides any glTF file.
+The editor can add a cube, Cornell boxes (empty, with blocks, or with a point light), a mirror maze, a fog box,
+a light orb and a flashlight (a spot light), besides any glTF file.
 
 Larger scenes are prepared with the scripts in `tools/` (run through Blender's Python):
 - `tools/sponza`: Intel's Sponza 2022, with textures converted to compressed DDS.

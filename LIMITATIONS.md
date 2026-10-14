@@ -644,3 +644,23 @@ Update paths give each cell the light of Max bounces - 1 further bounces, as man
 would have traced; before that, thick fog came out 10-16% too dark (cells found late in an update path got fewer).
 - Where: shaders/raytrace.comp ("Radiance cache", `tracePath`).
 - Workaround: untick "In fog too" (Radiance cache settings).
+
+### DLSS lags behind changes seen through fog
+A pixel looking into fog gets one path per frame, which either scatters in the fog or reaches what is behind: the
+pixel jumps between the two from frame to frame. DLSS can't tell a real change from that noise and keeps old frames:
+a flashlight moving through thin fog leaves its glow where the beam was, and a dark trail where its grip was (fog box,
+DLAA: the moving frame 21-24% too bright, against 2% standing still). The guides can't help: the fog really stands
+still (motion 0), and a moving beam is a change of light, not of geometry.
+Tried and dropped (2026-10-14):
+- **Guides of the fog** (the camera ray traced again without chance, the fog where it hides half of what is behind
+  as a surface): fog kept its shape when the camera moved (error 0.121 -> 0.114, fog orb), but a moving flashlight
+  was no better (0.393 -> 0.397), for 4-6 ms.
+- **DLSS RR's transparency overlay** (the fog in front as a layer of its own, the surface behind as the input color
+  with its own guides): the trail and the lingering glow were gone, but DLSS filters that layer far less than the
+  input color: it came out speckled and 12-19% too dark (flashlight scene, standing still: error 0.37-0.47 against
+  0.22 without), also with its opacity made exact and its light forced from a scatter point in every pixel. The layer
+  composites as premultiplied, and our two parts added up matched the reference (Accumulation), so the encoding was
+  right. Tagging the layer also gave validation errors inside DLSS (internal images in UNDEFINED layout, first frame).
+- Fix: a fog layer clean enough for that overlay (our own temporal and spatial filter on it), or the fog composited
+  after DLSS.
+- Where: `tracePath` (the camera ray in fog), `recordDlss` (source/renderer/Dlss.cpp).
