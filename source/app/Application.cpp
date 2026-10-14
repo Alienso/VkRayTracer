@@ -18,6 +18,7 @@ void Application::run() {
     scene.buildRenderList(renderList);
     // The UI: ImGui's context and its input from the window are the program's; the renderer adds the Vulkan side
     ImGui::CreateContext();
+    editor.initUi();
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);  // true: install input callbacks, chaining the window's own
     renderer.init(window.handle(), renderList);
     mainLoop();
@@ -45,9 +46,9 @@ void Application::createDefaultScene() {
             std::cerr << error << std::endl;
         }
     }
-    editor.init(defaultModel, error);
+    editor.init(error);
     if (!startScene.empty()) {
-        editor.openSceneFile(startScene);  // on failure the error shows in the Scene tab, over the default scene
+        editor.openSceneFile(startScene);  // on failure the error shows in the Log panel, over the default scene
     }
 }
 

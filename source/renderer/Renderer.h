@@ -648,6 +648,7 @@ private:
     // shared by many resources, instead of one vkAllocateMemory each (Vulkan only promises 4096 of those)
     VmaAllocator allocator = VK_NULL_HANDLE;
     VkQueue graphicsQueue;
+    uint32_t graphicsQueueFamily = 0;
     VkQueue presentQueue;
     VkSwapchainKHR swapChain;
     std::vector<VkImage> swapChainImages;
@@ -826,7 +827,7 @@ private:
     // changes (updateTracePipelines, before a frame).
     bool basicTraceShader = false;
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
-    // has it): registers per thread etc., for the Debug tab. Empty if not available.
+    // has it): registers per thread etc., for the Debug panel. Empty if not available.
     bool pipelineStatisticsSupported = false;
     std::string rtPipelineStatistics;
     bool memoryBudgetSupported = false;  // VK_EXT_memory_budget (gpuMemory)
@@ -964,7 +965,6 @@ private:
     SceneUniforms previousUniforms{};
 
 
-    VkDescriptorPool imGuiPool;
 
 
     void cleanup();

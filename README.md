@@ -82,7 +82,7 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 ## Built-in scenes and objects
 
 The scene is a tree of entities: models, portal ends and groups. Each has a position, rotation and scale relative to
-its parent, so moving a group moves everything under it; in the editor's list, drag an entity onto another to attach
+its parent, so moving a group moves everything under it; in the editor's Outliner, drag an entity onto another to attach
 it there (it stays where it is).
 
 Scenes are saved as JSON files (one line per entity, so changes show in a diff) in the `scenes` folder next to
@@ -122,4 +122,8 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
    Streamline), `--dlss-cnn` (the DLSS version that still has the CNN models).
 
 Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
-for fullscreen.
+for fullscreen, F1 to hide the UI, Ctrl+S to save the scene.
+
+The editor's panels (Outliner, Details, Rendering, Lighting, ...) dock around the image and can be dragged into other
+places, tabbed together or closed; View > Reset layout puts them back. The layout is kept in `imgui.ini` next to the
+program. The UI is Dear ImGui (docking branch, include/imgui, MIT license).

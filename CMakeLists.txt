@@ -43,7 +43,7 @@ add_executable(vulkanDemo main.cpp
         include/vma/vk_mem_alloc.cpp include/vma/vk_mem_alloc.h
         source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
         source/app/CameraController.cpp source/app/CameraController.h
-        source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp source/editor/EditorFile.cpp
+        source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp source/editor/EditorFile.cpp source/editor/EditorLayout.cpp
         source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneFile.cpp source/scene/SceneEnvironment.h source/scene/Camera.cpp
         source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
         source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/EditableFields.h source/assets/ModelLoader.cpp

@@ -299,7 +299,7 @@ void Renderer::recordEnvironmentUpload(VkCommandBuffer commandBuffer) {
     environmentUploadPending = false;
 }
 
-// How the renderer samples the sky (part of the editor's Lighting tab, shown unless the background is black)
+// How the renderer samples the sky (part of the editor's Lighting panel, shown unless the background is black)
 void Renderer::buildSkySamplingUi() {
     ImGui::Combo("Sample the sky", &settings.skySampling, "Auto (HDR maps only)\0On\0Off\0");
     if (ImGui::IsItemHovered()) {

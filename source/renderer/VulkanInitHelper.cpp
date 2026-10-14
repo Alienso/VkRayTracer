@@ -184,7 +184,7 @@ void Renderer::createLogicalDevice(){
     std::vector<const char*> extensions = Configuration::deviceExtensions;
     addStreamlineDeviceRequirements(extensions, vulkan12Features, vulkan13Features);
 
-    // Optional: the driver's statistics about compiled shaders (registers per thread, ...), see the Debug tab
+    // Optional: the driver's statistics about compiled shaders (registers per thread, ...), see the Debug panel
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executableFeatures{};
     executableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
     executableFeatures.pipelineExecutableInfo = VK_TRUE;
@@ -235,7 +235,8 @@ void Renderer::createLogicalDevice(){
         throw std::runtime_error("failed to create logical device!");
     }
 
-    vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
+    graphicsQueueFamily = indices.graphicsFamily.value();
+    vkGetDeviceQueue(device, graphicsQueueFamily, 0, &graphicsQueue);
     connectStreamline(indices.graphicsFamily.value());  // DLSS: tell Streamline about the device
     vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
 

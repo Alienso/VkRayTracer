@@ -1,8 +1,8 @@
 //
-// The editor's Scene tab: adding models, groups and portals, the tree of entities (drag one onto another to move it
-// under it), and the selected entity: its transform, model (parts, materials, lights) and portal end. It changes the
-// Scene and the assets' materials and lights; the renderer picks the changes up through the render list and the
-// asset store's revisions.
+// The editor's Outliner and Details panels: adding models, groups and portals (the Add menu), the tree of entities
+// (drag one onto another to move it under it; right click for more), and the selected entity: its transform, model
+// (parts, materials, lights) and portal end. It changes the Scene and the assets' materials and lights; the renderer
+// picks the changes up through the render list and the asset store's revisions.
 //
 
 #include <algorithm>
@@ -14,74 +14,60 @@
 #include "editor/Editor.h"
 #include "assets/BuiltInModels.h"
 
-void Editor::init(const std::string& defaultModel, const std::string& error) {
-    const std::vector<std::string>& files = assets.modelFiles();
-    auto it = std::find(files.begin(), files.end(), defaultModel);
-    modelToAdd = it != files.end() ? static_cast<int>(it - files.begin()) : 0;
+void Editor::init(const std::string& error) {
     const std::vector<EntityId>& roots = scene.roots();
     selected = roots.size() > 1 ? roots.back() : 0;  // the default model, not the floor
-    loadError = error;
-    scanSceneFiles();
+    if (!error.empty()) {
+        log(LogLevel::Error, error);
+    }
     savedText = scene.contentText();  // the starting scene counts as saved: nothing to ask about yet
 }
 
-// Adds an object for the UI: selects it, or shows why the model couldn't be loaded
+// Adds an object for the UI: selects it, or logs why the model couldn't be loaded
 void Editor::addObject(const std::string& fileName) {
     try {
         selected = scene.addObject(fileName, addAtOriginalSize);
-        loadError.clear();
+        log(LogLevel::Info, "Added " + fileName);
     } catch (const std::exception& e) {
-        loadError = e.what();
-        std::cerr << loadError << std::endl;
+        std::cerr << e.what() << std::endl;
+        log(LogLevel::Error, e.what());
     }
 }
 
-void Editor::buildSceneUi() {
-    buildFileUi();
-
-    // Add a model from the models folder
-    const std::vector<std::string>& availableModels = assets.modelFiles();
-    const char* preview = availableModels.empty() ? "(no models found)" : availableModels[modelToAdd].c_str();
-    if (ImGui::BeginCombo("##modelToAdd", preview)) {
-        for (int i = 0; i < static_cast<int>(availableModels.size()); i++) {
-            if (ImGui::Selectable(availableModels[i].c_str(), i == modelToAdd)) {
-                modelToAdd = i;
+// The Add menu (in the menu bar and the Outliner): a model from the models folder, a group, a portal pair
+void Editor::buildAddMenu() {
+    if (ImGui::BeginMenu("Model")) {
+        if (ImGui::IsWindowAppearing()) {
+            assets.scanModelFiles();  // files put there while the program runs
+        }
+        ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+        ImGui::MenuItem("Original size", nullptr, &addAtOriginalSize);
+        ImGui::PopItemFlag();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Off: new models are scaled to %.0f units and stood on the floor.\n"
+                              "On: they keep the file's own size and position (glTF uses meters),\n"
+                              "for whole scenes like Sponza. The built-in floor is then hidden.",
+                              AssetStore::fittedModelSize);
+        }
+        ImGui::Separator();
+        const std::vector<std::string>& files = assets.modelFiles();
+        if (files.empty()) {
+            ImGui::TextDisabled("none: put .glb/.gltf files (or folders) into resource/models");
+        }
+        for (const std::string& file : files) {
+            if (ImGui::MenuItem(file.c_str())) {
+                addObject(file);
             }
         }
-        ImGui::EndCombo();
+        ImGui::EndMenu();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Add") && !availableModels.empty()) {
-        addObject(availableModels[modelToAdd]);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Rescan")) {
-        std::string current = availableModels.empty() ? "" : availableModels[modelToAdd];
-        assets.scanModelFiles();
-        assets.scanEnvironmentFiles();
-        auto it = std::find(availableModels.begin(), availableModels.end(), current);
-        modelToAdd = it != availableModels.end() ? static_cast<int>(it - availableModels.begin()) : 0;
-    }
-    ImGui::Checkbox("Original size", &addAtOriginalSize);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Off: new models are scaled to %.0f units and stood on the floor.\n"
-                          "On: they keep the file's own size and position (glTF uses meters),\n"
-                          "for whole scenes like Sponza. The built-in floor is then hidden.", AssetStore::fittedModelSize);
-    }
-    ImGui::TextDisabled("put .glb/.gltf files (or folders) into resource/models");
-    if (!loadError.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", loadError.c_str());
-    }
-    if (ImGui::Button("Add group")) {
+    if (ImGui::MenuItem("Group")) {
         selected = scene.addEmpty("Group", 0);
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("An entity with nothing to show: drag others onto it in the list to move them together.");
+        ImGui::SetTooltip("An entity with nothing to show: drag others onto it in the Outliner to move them together.");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Add portal pair")) {
+    if (ImGui::MenuItem("Portal pair")) {
         selected = scene.addPortalPair();
     }
     if (ImGui::IsItemHovered()) {
@@ -90,57 +76,80 @@ void Editor::buildSceneUi() {
                           "Added as a group with its two ends, which can also be moved on their own.\n"
                           "Light from the sun and lamps doesn't pass through them yet, only bounced light.");
     }
+}
 
+void Editor::buildOutliner() {
+    if (ImGui::Button("+ Add")) {
+        ImGui::OpenPopup("addMenu");
+    }
+    if (ImGui::BeginPopup("addMenu")) {
+        buildAddMenu();
+        ImGui::EndPopup();
+    }
+    ImGui::Separator();
     buildEntityTree();
-    if (scene.find(selected) != nullptr) {
-        buildEntityUi(selected);
-    } else {
-        selected = 0;
-    }
+}
 
-    ImGui::Text("%zu models, %zu meshes, %zu instances", assets.modelCount(), stats.meshes, stats.instances);
-    if (size_t unused = assets.unusedModelCount(); unused > 0) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%zu unused, %.0f MB)", unused, assets.unusedMemory() / (1024.0 * 1024.0));
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Models no object shows any more stay loaded, so adding them again is instant.\n"
-                              "Beyond %.0f MB together, or when GPU memory runs short, the ones removed longest\n"
-                              "ago are unloaded.", AssetStore::defaultUnusedBudget / (1024.0 * 1024.0));
-        }
+void Editor::buildDetails() {
+    if (scene.find(selected) == nullptr) {
+        selected = 0;
+        ImGui::TextDisabled("Nothing selected: click an entity in the Outliner.");
+        return;
     }
-    ImGui::Text("%zu materials, %zu textures (%.1f MB)", assets.materials().size(), stats.textures,
-                stats.textureMemory / (1024.0 * 1024.0));
-    ImGui::Text("%zu emissive triangles (%zu bright enough to sample)", stats.emissiveTriangles,
-                stats.sampledEmissiveTriangles);
-    ImGui::Text("BLAS memory: %.2f MB -> %.2f MB compacted",
-                stats.blasBuildSize / (1024.0 * 1024.0), stats.blasSize / (1024.0 * 1024.0));
+    buildEntityUi(selected);
 }
 
 // The entities as a tree. Dragging one onto another moves it under that one (it stays where it is in the world);
-// onto "move to the top" (shown while dragging), out of its parent. Applied after the tree is drawn.
+// onto the empty space below the tree, out of its parent. Right click: add a child, duplicate, unparent, delete;
+// Delete deletes the selected one. The changes wait until the tree is drawn (they change the children lists).
 void Editor::buildEntityTree() {
-    EntityMove move;
-    ImGui::BeginChild("entities", ImVec2(0.0f, 10.0f * ImGui::GetTextLineHeightWithSpacing()), true);
+    TreeEdit edit;
     for (EntityId root : scene.roots()) {
-        buildEntityNode(root, move);
+        buildEntityNode(root, edit);
     }
-    ImGui::EndChild();
-    const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
-    if (dragging != nullptr && dragging->IsDataType("ENTITY")) {
-        ImGui::Button("move to the top (no parent)");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
-                move = {*static_cast<const EntityId*>(payload->Data), 0};
-            }
-            ImGui::EndDragDropTarget();
+    // The rest of the panel: drop here to move to the top, click to select nothing
+    ImVec2 space = ImGui::GetContentRegionAvail();
+    ImGui::Dummy(ImVec2(std::max(space.x, 1.0f), std::max(space.y, 2.0f * ImGui::GetTextLineHeightWithSpacing())));
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
+            edit = {TreeEdit::Move, *static_cast<const EntityId*>(payload->Data), 0};
         }
+        ImGui::EndDragDropTarget();
     }
-    if (move.entity != 0 && scene.setParent(move.entity, move.parent)) {
-        selected = move.entity;
+    if (ImGui::IsItemClicked()) {
+        selected = 0;
+    }
+    if (selected != 0 && ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+        edit = {TreeEdit::Delete, selected, 0};
+    }
+
+    switch (edit.kind) {
+        case TreeEdit::Move:
+            if (scene.setParent(edit.entity, edit.parent)) {
+                selected = edit.entity;
+            }
+            break;
+        case TreeEdit::AddChild:
+            selected = scene.addEmpty("Group", edit.entity);
+            break;
+        case TreeEdit::Duplicate:
+            selected = scene.duplicate(edit.entity);
+            break;
+        case TreeEdit::Delete: {
+            EntityId parent = scene.find(edit.entity)->parent;
+            scene.remove(edit.entity);  // with everything under it
+            if (scene.find(selected) == nullptr) {
+                selected = parent;
+            }
+            break;
+        }
+        case TreeEdit::None:
+            break;
     }
 }
 
-void Editor::buildEntityNode(EntityId id, EntityMove& move) {
+void Editor::buildEntityNode(EntityId id, TreeEdit& edit) {
     const Entity& entity = *scene.find(id);
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                                ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen;
@@ -153,8 +162,25 @@ void Editor::buildEntityNode(EntityId id, EntityMove& move) {
     // The id keeps entities with the same name apart
     bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(id)), flags, "%s%s",
                                   entity.name.c_str(), entity.visible ? "" : "  (hidden)");
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+    if ((ImGui::IsItemClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right)) &&
+        !ImGui::IsItemToggledOpen()) {
         selected = id;
+    }
+    if (ImGui::BeginPopupContextItem()) {
+        if (ImGui::MenuItem("Add child")) {
+            edit = {TreeEdit::AddChild, id, 0};
+        }
+        if (ImGui::MenuItem("Duplicate")) {
+            edit = {TreeEdit::Duplicate, id, 0};
+        }
+        if (entity.parent != 0 && ImGui::MenuItem("Unparent")) {
+            edit = {TreeEdit::Move, id, 0};
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete", "Del")) {
+            edit = {TreeEdit::Delete, id, 0};
+        }
+        ImGui::EndPopup();
     }
     if (ImGui::BeginDragDropSource()) {
         ImGui::SetDragDropPayload("ENTITY", &id, sizeof(id));
@@ -163,13 +189,13 @@ void Editor::buildEntityNode(EntityId id, EntityMove& move) {
     }
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
-            move = {*static_cast<const EntityId*>(payload->Data), id};
+            edit = {TreeEdit::Move, *static_cast<const EntityId*>(payload->Data), id};
         }
         ImGui::EndDragDropTarget();
     }
     if (open && !entity.children.empty()) {
         for (EntityId child : entity.children) {
-            buildEntityNode(child, move);
+            buildEntityNode(child, edit);
         }
         ImGui::TreePop();
     }

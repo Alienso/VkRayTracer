@@ -12,44 +12,27 @@
 #include <vulkan/vulkan.h>
 
 void Renderer::initImGui(){
-    // 1: create descriptor pool for IMGUI
-    //  ImGui itself only needs a combined image sampler for its font texture,
-    //  the extra room is for textures we may show in the UI later.
-    VkDescriptorPoolSize pool_sizes[] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 } };
-
-    VkDescriptorPoolCreateInfo pool_info = {};
-    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool_info.maxSets = 100;
-    pool_info.poolSizeCount = (uint32_t)std::size(pool_sizes);
-    pool_info.pPoolSizes = pool_sizes;
-
-    if (vkCreateDescriptorPool(device, &pool_info, nullptr, &imGuiPool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create imGui descriptor pool!");
-    }
-
-    // 2: initialize imgui library
-
     // The ImGui context and its GLFW side are the program's (Application::run); this is the Vulkan side, drawing
     // the UI over the image in the render pass
     ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.ApiVersion = VK_API_VERSION_1_3;  // as the instance's
     init_info.Instance = instance;
     init_info.PhysicalDevice = physicalDevice;
     init_info.Device = device;
+    init_info.QueueFamily = graphicsQueueFamily;
     init_info.Queue = graphicsQueue;
-    init_info.DescriptorPool = imGuiPool;
+    // ImGui makes its own descriptor pool, room for its font texture and textures we may show in the UI later
+    init_info.DescriptorPoolSize = 100;
     init_info.MinImageCount = static_cast<uint32_t>(swapChainImages.size());
     init_info.ImageCount = static_cast<uint32_t>(swapChainImages.size());
-    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-
     // ImGui creates its pipeline against our render pass, subpass 0
-    if (!ImGui_ImplVulkan_Init(&init_info, renderPass)) {
+    init_info.PipelineInfoMain.RenderPass = renderPass;
+    init_info.PipelineInfoMain.Subpass = 0;
+    init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    // The font texture is uploaded by ImGui itself when it first draws (and again when it changes)
+    if (!ImGui_ImplVulkan_Init(&init_info)) {
         throw std::runtime_error("failed to initialize imGui Vulkan backend!");
     }
-
-    // execute a gpu command to upload imgui font textures, then free the staging buffer
-    immediateSubmit([&](VkCommandBuffer cmd) { ImGui_ImplVulkan_CreateFontsTexture(cmd); });
-    ImGui_ImplVulkan_DestroyFontUploadObjects();
 }
 
 // Under the editor's Sun settings: the renderer's shadow switch
@@ -365,5 +348,4 @@ void Renderer::immediateSubmit(std::function<void(VkCommandBuffer cmd)>&& functi
 
 void Renderer::cleanupImGui(){
     ImGui_ImplVulkan_Shutdown();
-    vkDestroyDescriptorPool(device, imGuiPool, nullptr);
 }

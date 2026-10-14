@@ -321,7 +321,7 @@ void Renderer::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
     punctualLightsUploadPending = false;
 }
 
-// The "Lights from models" part of the Lighting tab
+// The "Lights from models" part of the Lighting panel
 void Renderer::buildPunctualLightSettingsUi() {
     ImGui::Checkbox("Enabled##punctual", &settings.punctualLights);
     ImGui::SameLine();

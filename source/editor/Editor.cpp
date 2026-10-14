@@ -1,85 +1,80 @@
 //
-// The editor: the settings window over the image (ImGui). Its tabs edit the scene (objects, camera, sun and sky:
-// here and EditorScene.cpp) and show the renderer's own settings (Renderer::buildRenderingUi and co.); the numbers
-// at the top come from Renderer::stats.
+// The editor: the menu bar and the panels around the image (ImGui). The panels edit the scene (objects, camera, sun
+// and sky: here and EditorScene.cpp) and show the renderer's own settings (Renderer::buildRenderingUi and co.); where
+// they dock, the menus, the log and the numbers over the image: EditorLayout.cpp.
 //
 
 #include <iostream>
 #include <imgui/imgui.h>
+#include <imgui/imgui_internal.h>  // MarkIniSettingsDirty
 #include "editor/Editor.h"
 
 Editor::Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
                Window& window)
-        : assets(assets), scene(scene), cameraController(cameraController), renderer(renderer), window(window) {}
+        : assets(assets), scene(scene), cameraController(cameraController), renderer(renderer), window(window),
+          panels{{{"Outliner", true, &Editor::buildOutliner},
+                  {"Details", true, &Editor::buildDetails},
+                  {"Rendering", true, &Editor::buildRenderingPanel},
+                  {"Lighting", true, &Editor::buildLightingUi},
+                  {"Camera", true, &Editor::buildCameraUi},
+                  {"Debug", true, &Editor::buildDebugPanel},
+                  {"Log", true, &Editor::buildLogUi},
+                  {"Statistics", true, &Editor::buildStatisticsUi}}} {}  // the last made is the tab in front
 
 void Editor::build() {
     stats = renderer.stats();
-
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    // Always visible, whichever tab is open
-    ImGui::Text("GPU: %s", stats.deviceName.c_str());
-    if (stats.gpuMemory.budget > 0) {
-        ImGui::Text("GPU memory: %.2f of %.2f GB", stats.gpuMemory.used / 1073741824.0,
-                    stats.gpuMemory.budget / 1073741824.0);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Video memory this program uses, and how much it can have without slowing down\n"
-                              "(the driver's estimate, less what other programs use)\n"
-                              "%u buffers and images in %u memory objects (Vulkan promises 4096 objects)",
-                              stats.gpuMemory.allocations, stats.gpuMemory.memoryObjects);
+    if (stats.captureMessage != loggedCaptureMessage) {
+        loggedCaptureMessage = stats.captureMessage;
+        if (!loggedCaptureMessage.empty()) {
+            log(LogLevel::Info, loggedCaptureMessage);
         }
     }
-    ImGui::Text("%.1f FPS (%.3f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
-    ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
-                stats.gpuPassMs[0], stats.gpuPassMs[1], stats.gpuPassMs[2], stats.gpuPassMs[3], stats.gpuPassMs[4],
-                stats.gpuPassMs[5]);
-    ImGui::Text("%llu triangles", static_cast<unsigned long long>(stats.triangles));
-    if (ImGui::Button("Capture")) {
-        renderer.requestCapture();  // the next frame's image, without this window, as a PNG next to the executable
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", stats.captureMessage.empty() ? "PNG of the image, without the UI" : stats.captureMessage.c_str());
-    if (stats.accumulating) {
-        ImGui::Text("%u frames accumulated", stats.accumulatedFrames);
-    }
-    if (stats.debugView) {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Debug view on (Debug tab)");
+    if (ImGui::GetTime() - unsavedCheckTime > 1.0) {
+        hasUnsavedChanges();
     }
 
-    // The window sizes itself to the open tab
-    if (ImGui::BeginTabBar("settingsTabs")) {
-        if (ImGui::BeginTabItem("Scene")) {
-            buildSceneUi();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Camera")) {
-            buildCameraUi();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Lighting")) {
-            buildLightingUi();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Rendering")) {
-            renderer.buildRenderingUi();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Debug")) {
-            renderer.buildDebugUi();
-            ImGui::Separator();
-            ImGui::Checkbox("Show ImGui demo", &showImGuiDemo);
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
+    // Keys that work wherever the mouse is (but not while typing into a field)
+    if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
+        uiHidden = !uiHidden;
     }
-    ImGui::End();
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        if (scenePath.empty()) {
+            askSaveAs = true;
+        } else {
+            saveTo(scenePath);
+        }
+    }
 
-    if (showImGuiDemo) {
-        ImGui::ShowDemoWindow(&showImGuiDemo);
+    if (!uiHidden) {
+        buildMenuBar();
+        buildDockSpace();
+        for (Panel& panel : panels) {
+            if (!panel.open) {
+                continue;
+            }
+            if (showLogNow && std::string(panel.name) == "Log") {
+                ImGui::SetNextWindowFocus();
+                showLogNow = false;
+            }
+            if (ImGui::Begin(panel.name, &panel.open)) {
+                (this->*panel.build)();
+            }
+            ImGui::End();
+            if (!panel.open) {
+                ImGui::MarkIniSettingsDirty();  // closed with its x: remembered
+            }
+        }
+        if (showOverlay) {
+            buildOverlay();
+        }
+        if (showImGuiDemo) {
+            ImGui::ShowDemoWindow(&showImGuiDemo);
+        }
     }
+    // Also with the panels hidden: closing the window asks about unsaved changes
+    buildSaveAsQuestion();
     buildUnsavedQuestion();
     updateTitle();
-
 }
 
 
@@ -131,7 +126,7 @@ void Editor::pickEnvironmentMap(const std::string& fileName) {
 }
 
 
-// The "Sky" part of the Lighting tab: the scene's background, and how the renderer samples it (its own widgets). ImGui needs unique
+// The "Sky" part of the Lighting panel: the scene's background, and how the renderer samples it (its own widgets). ImGui needs unique
 // IDs per widget; "##sky"/"##map" suffixes are hidden.
 void Editor::buildEnvironmentUi() {
     SceneEnvironment& environment = scene.environment();
@@ -158,6 +153,9 @@ void Editor::buildEnvironmentUi() {
             const char* current = assets.isLoaded(environment.map) ? assets.environmentMap(environment.map).name.c_str()
                                                                    : "(none)";
             if (ImGui::BeginCombo("Map", current)) {
+                if (ImGui::IsWindowAppearing()) {
+                    assets.scanEnvironmentFiles();  // files put there while the program runs
+                }
                 for (const std::string& file : files) {
                     if (ImGui::Selectable(file.c_str(), file == current)) {
                         pickEnvironmentMap(file);

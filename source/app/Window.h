@@ -1,6 +1,6 @@
 //
 // The program's window (GLFW): creating it, fullscreen, and noticing when its framebuffer changes size. The renderer
-// draws into it (its surface and size); the editor's Camera tab switches fullscreen.
+// draws into it (its surface and size); the editor's Camera panel switches fullscreen.
 //
 
 #ifndef VULKANDEMO_WINDOW_H
