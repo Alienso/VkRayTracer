@@ -77,6 +77,8 @@ void Editor::build() {
     if (showImGuiDemo) {
         ImGui::ShowDemoWindow(&showImGuiDemo);
     }
+    buildUnsavedQuestion();
+    updateTitle();
 
 }
 

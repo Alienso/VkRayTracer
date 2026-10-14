@@ -3,8 +3,11 @@
 // other: into the front of one, out of the front of the other; into the back, out of the back. The renderer traces
 // them (see "Portals" in shaders/raytrace.comp); the scene only places them.
 //
-// An end's opening lies in its local XY plane, centered on its position, X along its width, Y along its height,
-// facing +Z (the side it "looks at"). Both ends of a pair have the same shape and size.
+// Each end is an entity with a PortalComponent naming the other end, so either end can be placed (and parented)
+// on its own. An end's opening lies in its entity's local XY plane, centered on its position, X along its width,
+// Y along its height, facing +Z (the side it "looks at"). Scale doesn't apply to ends: the size is the pair's.
+// Both ends of a pair have the same shape, size and rim (Scene::syncPortal keeps them equal). A pair is enabled
+// while both ends are visible.
 //
 // The rim is ordinary geometry around the opening (outside it, so it never covers the view): the Scene stretches
 // the built-in rim model's cube into bars, rimDepth thick, centered on the opening's plane.
@@ -14,23 +17,15 @@
 #define VULKANDEMO_PORTAL_H
 
 #include <glm/glm.hpp>
-#include <string>
+#include <cstdint>
 
 enum class PortalShape { Rectangle = 0, Ellipse = 1 };  // values as in the shader
 
-struct PortalEnd {
-    glm::vec3 position = glm::vec3(0.0f);
-    glm::vec3 rotation = glm::vec3(0.0f);  // degrees, as SceneObject::rotation (yaw, then pitch, then roll)
-
-    glm::mat4 transform() const;  // translate * rotate: no scale, the size is the pair's
-};
-
-struct PortalPair {
-    std::string name;
-    bool enabled = true;
+struct PortalComponent {
+    uint64_t other = 0;   // the other end's entity
+    bool endA = false;    // the pair's first end (rim A; the render list lists a pair as A, B)
     PortalShape shape = PortalShape::Rectangle;
     glm::vec2 size = glm::vec2(1.0f, 2.0f);  // width, height of both ends
-    PortalEnd ends[2];                        // A and B
     bool rim = true;
     float rimWidth = 0.06f;   // how far the frame reaches out from the opening's edge
     float rimDepth = 0.04f;   // its thickness across the opening's plane

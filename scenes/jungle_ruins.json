@@ -1,0 +1,13 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 4,
+  "portalPairsMade": 0,
+  "camera": {"position":[0.0,1.6,4.0],"yaw":0.0,"pitch":-9.926247,"fov":60.0},
+  "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
+  "entities": [
+    {"id":1,"name":"Floor","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"visible":false,"model":{"builtIn":"Floor"}},
+    {"id":3,"name":"JungleRuins","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"file":"JungleRuins/JungleRuins.gltf","originalSize":true}}
+  ],
+  "models": []
+}

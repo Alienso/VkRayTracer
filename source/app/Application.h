@@ -25,9 +25,13 @@ public:
     void setDlssCnn(bool cnn) {  // --dlss-cnn
         renderer.setDlssCnn(cnn);
     }
+    void setStartScene(const std::string& path) {  // a scene file on the command line: opened instead of the default
+        startScene = path;
+    }
 
 private:
     Window window;
+    std::string startScene;
     bool fullscreenKeyDown = false;  // F11 toggles once per press
 
     // Each refers to the ones before it, so they come in this order

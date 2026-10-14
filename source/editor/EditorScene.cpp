@@ -1,10 +1,12 @@
 //
-// The editor's Scene tab: adding models, the object list, an object's transform, parts, materials and lights,
-// portals, and the actions behind it. It changes the Scene and the assets' materials and lights; the renderer picks the changes
-// up through the render list and the asset store's revisions.
+// The editor's Scene tab: adding models, groups and portals, the tree of entities (drag one onto another to move it
+// under it), and the selected entity: its transform, model (parts, materials, lights) and portal end. It changes the
+// Scene and the assets' materials and lights; the renderer picks the changes up through the render list and the
+// asset store's revisions.
 //
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <tuple>
@@ -16,14 +18,17 @@ void Editor::init(const std::string& defaultModel, const std::string& error) {
     const std::vector<std::string>& files = assets.modelFiles();
     auto it = std::find(files.begin(), files.end(), defaultModel);
     modelToAdd = it != files.end() ? static_cast<int>(it - files.begin()) : 0;
-    selectedObject = scene.objects().size() > 1 ? static_cast<int>(scene.objects().size()) - 1 : -1;
+    const std::vector<EntityId>& roots = scene.roots();
+    selected = roots.size() > 1 ? roots.back() : 0;  // the default model, not the floor
     loadError = error;
+    scanSceneFiles();
+    savedText = scene.contentText();  // the starting scene counts as saved: nothing to ask about yet
 }
 
 // Adds an object for the UI: selects it, or shows why the model couldn't be loaded
 void Editor::addObject(const std::string& fileName) {
     try {
-        selectedObject = scene.addObject(fileName, addAtOriginalSize);
+        selected = scene.addObject(fileName, addAtOriginalSize);
         loadError.clear();
     } catch (const std::exception& e) {
         loadError = e.what();
@@ -32,6 +37,8 @@ void Editor::addObject(const std::string& fileName) {
 }
 
 void Editor::buildSceneUi() {
+    buildFileUi();
+
     // Add a model from the models folder
     const std::vector<std::string>& availableModels = assets.modelFiles();
     const char* preview = availableModels.empty() ? "(no models found)" : availableModels[modelToAdd].c_str();
@@ -67,95 +74,29 @@ void Editor::buildSceneUi() {
     if (!loadError.empty()) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", loadError.c_str());
     }
-
-    // Object list
-    std::vector<SceneObject>& sceneObjects = scene.objects();
-    if (ImGui::BeginListBox("Objects", ImVec2(0.0f, 6.0f * ImGui::GetTextLineHeightWithSpacing()))) {
-        for (int i = 0; i < static_cast<int>(sceneObjects.size()); i++) {
-            ImGui::PushID(i);  // names can repeat; the ID keeps the items apart
-            std::string label = sceneObjects[i].name + (sceneObjects[i].visible ? "" : "  (hidden)");
-            if (ImGui::Selectable(label.c_str(), i == selectedObject)) {
-                selectedObject = i;
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndListBox();
+    if (ImGui::Button("Add group")) {
+        selected = scene.addEmpty("Group", 0);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("An entity with nothing to show: drag others onto it in the list to move them together.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add portal pair")) {
+        selected = scene.addPortalPair();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Two openings that are one window: what goes into one comes out of the other,\n"
+                          "front to front and back to back. An end faces its +Z (rotation 0: towards +Z).\n"
+                          "Added as a group with its two ends, which can also be moved on their own.\n"
+                          "Light from the sun and lamps doesn't pass through them yet, only bounced light.");
     }
 
-    // The selected object's transform
-    if (selectedObject >= 0 && selectedObject < static_cast<int>(sceneObjects.size())) {
-        ImGui::PushID("selectedObject");  // "Position" etc. also exist in the camera section
-        SceneObject& object = sceneObjects[selectedObject];
-        SceneModel& model = assets.model(object.model);
-
-        ImGui::Checkbox("Visible", &object.visible);
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s, %zu parts", model.name.c_str(), model.parts.size());
-
-        ImGui::DragFloat3("Position", &object.position.x, 0.01f);
-        ImGui::DragFloat3("Rotation", &object.rotation.x, 0.5f, 0.0f, 0.0f, "%.1f");
-        ImGui::SameLine();
-        ImGui::TextDisabled("(?)");
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Degrees around X, Y, Z.\nApplied as yaw (Y), then pitch (X), then roll (Z).");
-        }
-
-        if (object.uniformScale) {
-            float scale = object.scale.x;
-            if (ImGui::DragFloat("Scale", &scale, 0.01f, 0.01f, 100.0f)) {
-                object.scale = glm::vec3(scale);
-            }
-        } else {
-            ImGui::DragFloat3("Scale", &object.scale.x, 0.01f, 0.01f, 100.0f);
-        }
-        ImGui::SameLine();
-        if (ImGui::Checkbox("Uniform", &object.uniformScale) && object.uniformScale) {
-            object.scale = glm::vec3(object.scale.x);
-        }
-        if (object.model != assets.floor() && !isBuiltInModel(model.name)) {
-            ImGui::Checkbox("Original size", &object.originalSize);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(file units, not fitted to %.0f)", AssetStore::fittedModelSize);
-        }
-
-        if (model.parts.size() > 1 && ImGui::TreeNode("parts", "Parts (%zu)", model.parts.size())) {
-            object.hiddenParts.resize(model.parts.size(), false);
-            // Only the rows in view are drawn: scenes with vegetation have millions of parts
-            ImGuiListClipper clipper;
-            clipper.Begin(static_cast<int>(model.parts.size()));
-            while (clipper.Step()) {
-                for (int p = clipper.DisplayStart; p < clipper.DisplayEnd; p++) {
-                    ImGui::PushID(p);
-                    bool visible = !object.hiddenParts[p];
-                    if (ImGui::Checkbox(assets.meshes()[model.parts[p].meshIndex].name.c_str(), &visible)) {
-                        object.hiddenParts[p] = !visible;
-                    }
-                    ImGui::PopID();
-                }
-            }
-            ImGui::TreePop();
-        }
-        buildMaterialUi(model);
-        buildPunctualLightUi(model);
-
-        if (ImGui::Button("Reset transform")) {
-            object.rotation = glm::vec3(0.0f);
-            object.scale = glm::vec3(1.0f);
-            object.position.y = 0.0f;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Duplicate")) {
-            selectedObject = scene.duplicateObject(selectedObject);  // (object is no longer valid: the list grew)
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Delete")) {
-            scene.removeObject(selectedObject);
-            selectedObject = std::min(selectedObject, static_cast<int>(sceneObjects.size()) - 1);
-        }
-        ImGui::PopID();
+    buildEntityTree();
+    if (scene.find(selected) != nullptr) {
+        buildEntityUi(selected);
+    } else {
+        selected = 0;
     }
-
-    buildPortalUi();
 
     ImGui::Text("%zu models, %zu meshes, %zu instances", assets.modelCount(), stats.meshes, stats.instances);
     if (size_t unused = assets.unusedModelCount(); unused > 0) {
@@ -175,68 +116,218 @@ void Editor::buildSceneUi() {
                 stats.blasBuildSize / (1024.0 * 1024.0), stats.blasSize / (1024.0 * 1024.0));
 }
 
-// Portal pairs: the list, and the selected pair's shape, size and its two ends' places
-void Editor::buildPortalUi() {
-    std::vector<PortalPair>& pairs = scene.portals();
-    if (!ImGui::TreeNode("portals", "Portals (%zu pairs)", pairs.size())) {
-        return;
+// The entities as a tree. Dragging one onto another moves it under that one (it stays where it is in the world);
+// onto "move to the top" (shown while dragging), out of its parent. Applied after the tree is drawn.
+void Editor::buildEntityTree() {
+    EntityMove move;
+    ImGui::BeginChild("entities", ImVec2(0.0f, 10.0f * ImGui::GetTextLineHeightWithSpacing()), true);
+    for (EntityId root : scene.roots()) {
+        buildEntityNode(root, move);
     }
-    if (ImGui::Button("Add portal pair")) {
-        selectedPortal = scene.addPortalPair();
+    ImGui::EndChild();
+    const ImGuiPayload* dragging = ImGui::GetDragDropPayload();
+    if (dragging != nullptr && dragging->IsDataType("ENTITY")) {
+        ImGui::Button("move to the top (no parent)");
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
+                move = {*static_cast<const EntityId*>(payload->Data), 0};
+            }
+            ImGui::EndDragDropTarget();
+        }
+    }
+    if (move.entity != 0 && scene.setParent(move.entity, move.parent)) {
+        selected = move.entity;
+    }
+}
+
+void Editor::buildEntityNode(EntityId id, EntityMove& move) {
+    const Entity& entity = *scene.find(id);
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                               ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen;
+    if (entity.children.empty()) {
+        flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    }
+    if (id == selected) {
+        flags |= ImGuiTreeNodeFlags_Selected;
+    }
+    // The id keeps entities with the same name apart
+    bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(id)), flags, "%s%s",
+                                  entity.name.c_str(), entity.visible ? "" : "  (hidden)");
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+        selected = id;
+    }
+    if (ImGui::BeginDragDropSource()) {
+        ImGui::SetDragDropPayload("ENTITY", &id, sizeof(id));
+        ImGui::Text("%s", entity.name.c_str());
+        ImGui::EndDragDropSource();
+    }
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
+            move = {*static_cast<const EntityId*>(payload->Data), id};
+        }
+        ImGui::EndDragDropTarget();
+    }
+    if (open && !entity.children.empty()) {
+        for (EntityId child : entity.children) {
+            buildEntityNode(child, move);
+        }
+        ImGui::TreePop();
+    }
+}
+
+// The selected entity: name, visibility, parent, transform, its components, and what can be done with it
+void Editor::buildEntityUi(EntityId id) {
+    ImGui::PushID("selectedEntity");  // "Position" etc. also exist in the camera section
+    Entity& entity = *scene.find(id);
+
+    char name[128];
+    std::strncpy(name, entity.name.c_str(), sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    if (ImGui::InputText("Name", name, sizeof(name))) {
+        entity.name = name;
+    }
+    ImGui::Checkbox("Visible", &entity.visible);
+    if (const Entity* parent = scene.find(entity.parent)) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("under %s", parent->name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unparent")) {
+            scene.setParent(id, 0);  // (entity stays valid: no entity added or removed)
+        }
+    }
+    buildTransformUi(entity);
+    if (scene.model(id) != nullptr) {
+        buildModelUi(id);
+    }
+    if (scene.portal(id) != nullptr) {
+        buildPortalUi(id);
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Reset transform")) {
+        entity.local.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+        entity.local.scale = glm::vec3(1.0f);
+        entity.local.position.y = 0.0f;
+    }
+    // The ones below add or remove entities: entity is no longer valid after them
+    ImGui::SameLine();
+    if (ImGui::Button("Add child")) {
+        selected = scene.addEmpty("Group", id);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Duplicate")) {
+        selected = scene.duplicate(id);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete")) {
+        EntityId parent = scene.find(id)->parent;
+        scene.remove(id);  // with everything under it
+        selected = parent;
+    }
+    ImGui::PopID();
+}
+
+void Editor::buildTransformUi(Entity& entity) {
+    Transform& local = entity.local;
+    ImGui::DragFloat3("Position", &local.position.x, 0.01f);
+
+    if (eulerEntity != entity.id || local.rotation != eulerRotation) {
+        eulerEntity = entity.id;
+        eulerRotation = local.rotation;
+        eulerDegrees = quatToEuler(local.rotation);
+    }
+    if (ImGui::DragFloat3("Rotation", &eulerDegrees.x, 0.5f, 0.0f, 0.0f, "%.1f")) {
+        local.rotation = eulerToQuat(eulerDegrees);
+        eulerRotation = local.rotation;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Two openings that are one window: what goes into one comes out of the other,\n"
-                          "front to front and back to back. An end faces its +Z (rotation 0: towards +Z).\n"
-                          "Light from the sun and lamps doesn't pass through them yet, only bounced light.");
-    }
-    if (!pairs.empty() && ImGui::BeginListBox("##portalList", ImVec2(0.0f, 3.0f * ImGui::GetTextLineHeightWithSpacing()))) {
-        for (int i = 0; i < static_cast<int>(pairs.size()); i++) {
-            ImGui::PushID(i);
-            std::string label = pairs[i].name + (pairs[i].enabled ? "" : "  (off)");
-            if (ImGui::Selectable(label.c_str(), i == selectedPortal)) {
-                selectedPortal = i;
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndListBox();
+        ImGui::SetTooltip("Degrees around X, Y, Z.\nApplied as yaw (Y), then pitch (X), then roll (Z).\n"
+                          "Position, rotation and scale are relative to the parent.");
     }
 
-    if (selectedPortal >= 0 && selectedPortal < static_cast<int>(pairs.size())) {
-        ImGui::PushID("selectedPortal");
-        PortalPair& pair = pairs[selectedPortal];
-        ImGui::Checkbox("Enabled", &pair.enabled);
-        static const char* shapeNames[] = {"Rectangle", "Ellipse"};
-        int shape = static_cast<int>(pair.shape);
-        if (ImGui::Combo("Shape", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
-            pair.shape = static_cast<PortalShape>(shape);
+    if (entity.uniformScale) {
+        float scale = local.scale.x;
+        if (ImGui::DragFloat("Scale", &scale, 0.01f, 0.01f, 100.0f)) {
+            local.scale = glm::vec3(scale);
         }
-        ImGui::DragFloat2("Size", &pair.size.x, 0.01f, 0.01f, 100.0f);
+    } else {
+        ImGui::DragFloat3("Scale", &local.scale.x, 0.01f, 0.01f, 100.0f);
+    }
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Uniform", &entity.uniformScale) && entity.uniformScale) {
+        local.scale = glm::vec3(local.scale.x);
+    }
+}
+
+// The entity's model: original size, its parts, materials and lights (the last two are the model's: shared by all
+// entities showing it)
+void Editor::buildModelUi(EntityId id) {
+    ModelComponent& component = *scene.model(id);
+    SceneModel& model = assets.model(component.model);
+    ImGui::SeparatorText("Model");
+    ImGui::TextDisabled("%s, %zu parts", model.name.c_str(), model.parts.size());
+    if (component.model != assets.floor() && !isBuiltInModel(model.name)) {
+        ImGui::Checkbox("Original size", &component.originalSize);
         ImGui::SameLine();
-        ImGui::TextDisabled("width, height");
-        ImGui::Checkbox("Rim", &pair.rim);
-        if (pair.rim) {
-            ImGui::DragFloat("Rim width", &pair.rimWidth, 0.002f, 0.001f, 1.0f, "%.3f");
-            ImGui::DragFloat("Rim depth", &pair.rimDepth, 0.002f, 0.001f, 1.0f, "%.3f");
-        }
-        for (int e = 0; e < 2; e++) {
-            ImGui::PushID(e);
-            ImGui::SeparatorText(e == 0 ? "End A" : "End B");
-            ImGui::DragFloat3("Position", &pair.ends[e].position.x, 0.01f);
-            ImGui::DragFloat3("Rotation", &pair.ends[e].rotation.x, 0.5f, 0.0f, 0.0f, "%.1f");
-            ImGui::PopID();
-        }
-        if (ImGui::Button("Delete portal pair")) {
-            scene.removePortalPair(selectedPortal);
-            selectedPortal = std::min(selectedPortal, static_cast<int>(pairs.size()) - 1);
-        }
-        ImGui::PopID();
+        ImGui::TextDisabled("(file units, not fitted to %.0f)", AssetStore::fittedModelSize);
     }
-    if (!pairs.empty()) {
-        buildMaterialUi(assets.model(scene.portalRimModel()));  // rim A and rim B, shared by all pairs
+
+    if (model.parts.size() > 1 && ImGui::TreeNode("parts", "Parts (%zu)", model.parts.size())) {
+        component.hiddenParts.resize(model.parts.size(), false);
+        // Only the rows in view are drawn: scenes with vegetation have millions of parts
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(model.parts.size()));
+        while (clipper.Step()) {
+            for (int p = clipper.DisplayStart; p < clipper.DisplayEnd; p++) {
+                ImGui::PushID(p);
+                bool visible = !component.hiddenParts[p];
+                if (ImGui::Checkbox(assets.meshes()[model.parts[p].meshIndex].name.c_str(), &visible)) {
+                    component.hiddenParts[p] = !visible;
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::TreePop();
     }
-    ImGui::TreePop();
+    buildMaterialUi(model);
+    buildPunctualLightUi(model);
+}
+
+// A portal end: the pair's shape, size and rim (the same on both ends), and the other end
+void Editor::buildPortalUi(EntityId id) {
+    PortalComponent& portal = *scene.portal(id);
+    ImGui::SeparatorText(portal.endA ? "Portal end A" : "Portal end B");
+    bool changed = false;
+    static const char* shapeNames[] = {"Rectangle", "Ellipse"};
+    int shape = static_cast<int>(portal.shape);
+    if (ImGui::Combo("Shape", &shape, shapeNames, IM_ARRAYSIZE(shapeNames))) {
+        portal.shape = static_cast<PortalShape>(shape);
+        changed = true;
+    }
+    changed |= ImGui::DragFloat2("Size", &portal.size.x, 0.01f, 0.01f, 100.0f);
+    ImGui::SameLine();
+    ImGui::TextDisabled("width, height");
+    changed |= ImGui::Checkbox("Rim", &portal.rim);
+    if (portal.rim) {
+        changed |= ImGui::DragFloat("Rim width", &portal.rimWidth, 0.002f, 0.001f, 1.0f, "%.3f");
+        changed |= ImGui::DragFloat("Rim depth", &portal.rimDepth, 0.002f, 0.001f, 1.0f, "%.3f");
+    }
+    if (changed) {
+        scene.syncPortal(id);
+    }
+    if (const Entity* other = scene.find(portal.other)) {
+        ImGui::TextDisabled("Other end: %s", other->name.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Select")) {
+            selected = portal.other;
+        }
+        if (!scene.visibleInWorld(id) || !scene.visibleInWorld(portal.other)) {
+            ImGui::TextDisabled("Off: both ends have to be visible");
+        }
+    }
+    buildMaterialUi(assets.model(scene.portalRimModel()));  // rim A and rim B, shared by all pairs
 }
 
 // Whether a mesh is closed: every edge shared by exactly two triangles (corners at the same place count as one, a

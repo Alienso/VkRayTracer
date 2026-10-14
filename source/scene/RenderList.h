@@ -26,7 +26,7 @@
 struct RenderInstance {
     uint32_t mesh;       // index into AssetStore::meshes()
     uint32_t motion;     // index into RenderList::motions (the object's)
-    glm::mat4 world;     // object * fit * part
+    glm::mat4 world;     // entity (world) * fit * part
 };
 
 // A punctual light of a visible object, in world space but still in the file's units (the renderer converts it)
@@ -37,13 +37,13 @@ struct RenderLight {
     float range;
     float innerConeAngle;
     float outerConeAngle;
-    glm::mat4 world;  // object * fit * the light's node
+    glm::mat4 world;  // entity (world) * fit * the light's node
     float scale;      // the object's (and fit's) scale: distances in the file grow by this much
 };
 
 // One end of an enabled portal pair. The pairs' ends follow each other: entries 2k and 2k + 1 are a pair.
 struct RenderPortal {
-    glm::mat4 world;      // PortalEnd::transform: the opening in its XY plane, facing +Z
+    glm::mat4 world;      // the end entity's world placement without scale: the opening in its XY plane, facing +Z
     glm::vec2 halfSize;   // half the width and height
     PortalShape shape;
 };
@@ -51,8 +51,8 @@ struct RenderPortal {
 class RenderList {
 public:
     std::vector<RenderInstance> instances;
-    // Per visible object: this frame's world position -> last frame's (identity when it didn't move). Shared by all
-    // its instances: a part's world matrix is object * fit * part, and only the object's transform changes.
+    // Per visible model entity: this frame's world position -> last frame's (identity when it didn't move). Shared by
+    // all its instances: a part's world matrix is entity * fit * part, and only the entity's transform changes.
     std::vector<glm::mat4> motions;
     std::vector<RenderLight> lights;
     std::vector<RenderPortal> portals;
@@ -67,14 +67,14 @@ private:
     uint64_t revision = 0;
     bool hasMotion = false;  // some motion isn't identity: remake next frame, when it is out of date
 
-    // What the instances were made from: compared every frame, so only actual changes remake them. Also last frame's
-    // objects, for the motion of the next remake (Scene::buildRenderList).
+    // What the instances were made from (the model entities): compared every frame, so only actual changes remake
+    // them. Also last frame's entities, for the motion of the next remake (Scene::buildRenderList).
     struct BuiltObject {
-        uint64_t id;  // SceneObject::id
+        uint64_t id;  // the entity's id
         ModelHandle model;
         bool visible;
         bool originalSize;
-        glm::mat4 transform;
+        glm::mat4 transform;  // the entity's world transform
         std::vector<bool> hiddenParts;
         bool operator==(const BuiltObject& o) const {
             return id == o.id && model == o.model && visible == o.visible && originalSize == o.originalSize &&

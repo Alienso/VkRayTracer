@@ -1,31 +1,62 @@
 //
-// The scene's objects and portals: adding, duplicating and removing them. See Scene.h.
+// The scene's entities: the tree, adding, duplicating and removing them, and the render list. See Scene.h.
 //
 
+#define GLM_ENABLE_EXPERIMENTAL  // glm/gtx: Euler angles
 #include "scene/Scene.h"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <unordered_map>
+#include <unordered_set>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/euler_angles.hpp>
 #include "assets/BuiltInModels.h"
 #include "core/Configuration.h"
 
-// Read right to left: rotate, then move into place. Rotation in degrees: yaw (Y), then pitch (X), then roll (Z).
-static glm::mat4 placement(const glm::vec3& position, const glm::vec3& rotation) {
-    glm::mat4 m = glm::translate(glm::mat4(1.0f), position);
-    m = glm::rotate(m, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
-    m = glm::rotate(m, glm::radians(rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    return glm::rotate(m, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+glm::mat4 Transform::matrix() const {
+    // Read right to left: scale, rotate, then move into place
+    return glm::scale(glm::translate(glm::mat4(1.0f), position) * glm::mat4_cast(rotation), scale);
 }
 
-glm::mat4 SceneObject::transform() const {
-    return glm::scale(placement(position, rotation), scale);  // scaled first
+glm::quat eulerToQuat(const glm::vec3& degrees) {
+    return glm::angleAxis(glm::radians(degrees.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+           glm::angleAxis(glm::radians(degrees.x), glm::vec3(1.0f, 0.0f, 0.0f)) *
+           glm::angleAxis(glm::radians(degrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
 }
 
-glm::mat4 PortalEnd::transform() const {
-    return placement(position, rotation);
+glm::vec3 quatToEuler(const glm::quat& rotation) {
+    float yaw, pitch, roll;
+    glm::extractEulerAngleYXZ(glm::mat4_cast(rotation), yaw, pitch, roll);  // the inverse of Ry * Rx * Rz
+    return glm::degrees(glm::vec3(pitch, yaw, roll));
+}
+
+// A transform with that matrix: the columns' lengths are the scale (one negated if it mirrors), the rest the rotation.
+// A matrix with shear (a rotated non-uniform scale above) has no exact transform: this one is close.
+static Transform toTransform(const glm::mat4& m) {
+    Transform t;
+    t.position = glm::vec3(m[3]);
+    t.scale = glm::vec3(glm::length(glm::vec3(m[0])), glm::length(glm::vec3(m[1])), glm::length(glm::vec3(m[2])));
+    if (glm::determinant(glm::mat3(m)) < 0.0f) {
+        t.scale.x = -t.scale.x;
+    }
+    glm::mat3 rotation = glm::mat3(glm::vec3(m[0]) / t.scale.x, glm::vec3(m[1]) / t.scale.y,
+                                   glm::vec3(m[2]) / t.scale.z);
+    t.rotation = glm::normalize(glm::quat_cast(rotation));
+    return t;
+}
+
+// A portal end's placement without scale (Portal.h: the size is the pair's). Columns that are already unit length are
+// left exactly as they are.
+static glm::mat4 withoutScale(glm::mat4 m) {
+    for (int c = 0; c < 3; c++) {
+        glm::vec3 axis(m[c]);
+        float lengthSquared = glm::dot(axis, axis);
+        if (std::abs(lengthSquared - 1.0f) > 1e-6f && lengthSquared > 0.0f) {
+            m[c] = glm::vec4(axis / std::sqrt(lengthSquared), 0.0f);
+        }
+    }
+    return m;
 }
 
 Scene::Scene(AssetStore& assets) : assets(assets) {}
@@ -35,87 +66,361 @@ void Scene::createDefault() {
     sceneCamera.fov = Configuration::fov;
     sceneCamera.lookAt({0.0f, 0.9f, 0.0f});
 
-    SceneObject floorObject;
-    floorObject.name = "Floor";
-    floorObject.id = ++objectsMade;
-    floorObject.model = assets.addFloor();
-    assets.acquire(floorObject.model);
-    objectList.push_back(floorObject);
+    ModelComponent floor;
+    floor.model = assets.isLoaded(assets.floor()) ? assets.floor() : assets.addFloor();  // made once, then kept
+    assets.acquire(floor.model);
+    modelTable[create("Floor", 0).id] = floor;
 }
 
-int Scene::addObject(const std::string& fileName, bool originalSize) {
-    SceneObject object;
-    object.model = assets.findOrLoad(fileName);
-    object.name = std::filesystem::path(fileName).stem().string();
-    object.originalSize = originalSize && !isBuiltInModel(fileName);
+void Scene::clear() {
+    releaseAll();
+    entityList.clear();
+    entityIndex.clear();
+    rootList.clear();
+    modelTable.clear();
+    portalTable.clear();
+    entitiesMade = 0;
+    portalPairsMade = 0;
+    sceneCamera = Camera();
+    sceneEnvironment = SceneEnvironment();
+    assets.resetEdits();
+    createDefault();
+}
 
-    const SceneModel& model = assets.model(object.model);
-    for (const MeshInstance& part : model.parts) {
-        object.hiddenParts.push_back(part.hiddenByDefault);
+void Scene::releaseAll() {
+    for (const auto& [id, component] : modelTable) {
+        if (component.model.valid()) {
+            assets.release(component.model);
+        }
     }
+    for (const auto& [id, component] : portalTable) {
+        if (component.endA) {
+            assets.release(rimModel);
+        }
+    }
+    if (sceneEnvironment.map.valid()) {
+        assets.release(sceneEnvironment.map);
+    }
+}
+
+void Scene::takeFrom(Scene& other) {
+    entityList = std::move(other.entityList);
+    entityIndex = std::move(other.entityIndex);
+    rootList = std::move(other.rootList);
+    modelTable = std::move(other.modelTable);
+    portalTable = std::move(other.portalTable);
+    entitiesMade = other.entitiesMade;
+    portalPairsMade = other.portalPairsMade;
+    rimModel = other.rimModel;
+    sceneCamera = other.sceneCamera;
+    sceneEnvironment = other.sceneEnvironment;
+    other.entityList.clear();
+    other.entityIndex.clear();
+    other.rootList.clear();
+    other.modelTable.clear();
+    other.portalTable.clear();
+    other.sceneEnvironment.map = EnvironmentHandle();
+}
+
+std::vector<EntityId> Scene::treeOrder() const {
+    std::vector<EntityId> order;
+    order.reserve(entityList.size());
+    auto visit = [&](auto&& self, EntityId id) -> void {
+        order.push_back(id);
+        for (EntityId child : find(id)->children) {
+            self(self, child);
+        }
+    };
+    for (EntityId root : rootList) {
+        visit(visit, root);
+    }
+    return order;
+}
+
+Entity& Scene::create(const std::string& name, EntityId parent) {
+    return createWithId(++entitiesMade, name, parent);
+}
+
+Entity& Scene::createWithId(EntityId id, const std::string& name, EntityId parent) {
+    Entity entity;
+    entity.id = id;
+    entity.name = name;
+    entity.parent = parent;
+    siblings(parent).push_back(entity.id);  // (before the list grows: siblings may point into it)
+    entityIndex[entity.id] = entityList.size();
+    entityList.push_back(std::move(entity));
+    return entityList.back();
+}
+
+std::vector<EntityId>& Scene::siblings(EntityId parent) {
+    return parent == 0 ? rootList : find(parent)->children;
+}
+
+std::vector<EntityId> Scene::subtree(EntityId id) const {
+    std::vector<EntityId> ids = {id};
+    for (size_t i = 0; i < ids.size(); i++) {  // grows while going through it
+        const Entity* entity = find(ids[i]);
+        ids.insert(ids.end(), entity->children.begin(), entity->children.end());
+    }
+    return ids;
+}
+
+void Scene::reindex() {
+    entityIndex.clear();
+    for (size_t i = 0; i < entityList.size(); i++) {
+        entityIndex[entityList[i].id] = i;
+    }
+}
+
+EntityId Scene::addObject(const std::string& fileName, bool originalSize) {
+    ModelComponent component;
+    component.model = assets.findOrLoad(fileName);  // throws if it can't be loaded: nothing changed yet
+    component.originalSize = originalSize && !isBuiltInModel(fileName);
+    const SceneModel& model = assets.model(component.model);
+    for (const MeshInstance& part : model.parts) {
+        component.hiddenParts.push_back(part.hiddenByDefault);
+    }
+    std::string name = std::filesystem::path(fileName).stem().string();
 
     // Line objects up: 0, +1, -1, +2, -2, ... spacings from the center, so they don't overlap.
     // Built-in rooms and original-size scenes go to the center instead, around whatever already stands there.
-    if (object.originalSize) {
+    glm::vec3 position(0.0f);
+    if (component.originalSize) {
         // A whole scene brings its own ground; the built-in floor would cut through it.
-        for (SceneObject& other : objectList) {
+        for (const auto& [id, other] : modelTable) {
             if (other.model == assets.floor()) {
-                other.visible = false;
+                find(id)->visible = false;
             }
         }
     } else if (!isBuiltInModel(fileName)) {
-        int existing = static_cast<int>(std::count_if(objectList.begin(), objectList.end(), [&](const SceneObject& o) {
-            return o.model != assets.floor() && !isBuiltInModel(o.name);
+        int existing = static_cast<int>(std::count_if(modelTable.begin(), modelTable.end(), [&](const auto& entry) {
+            return entry.second.model != assets.floor() && !isBuiltInModel(find(entry.first)->name);
         }));
         int slot = (existing + 1) / 2 * (existing % 2 == 1 ? 1 : -1);
-        object.position.x = slot * objectSpacing;
+        position.x = slot * objectSpacing;
     }
 
-    object.id = ++objectsMade;
-    assets.acquire(object.model);
-    objectList.push_back(object);
-    return static_cast<int>(objectList.size() - 1);
+    Entity& entity = create(name, 0);
+    entity.local.position = position;
+    assets.acquire(component.model);
+    modelTable[entity.id] = std::move(component);
+    return entity.id;
 }
 
-int Scene::duplicateObject(int index) {
-    SceneObject copy = objectList[index];  // same model: no loading, just one more set of TLAS instances
-    copy.position.x += objectSpacing;
-    copy.id = ++objectsMade;  // a new object: no motion from the original's place
-    assets.acquire(copy.model);
-    objectList.push_back(copy);
-    return static_cast<int>(objectList.size() - 1);
+EntityId Scene::addEmpty(const std::string& name, EntityId parent) {
+    return create(name, parent).id;
 }
 
-void Scene::removeObject(int index) {
-    ModelHandle model = objectList[index].model;
-    objectList.erase(objectList.begin() + index);
-    assets.release(model);  // the last object showing it: the model is kept unused (see AssetStore.h)
-}
-
-int Scene::addPortalPair() {
+EntityId Scene::addPortalPair() {
     // 3 units ahead of the camera (level), the ends 1.5 to either side, turned to face it
     glm::vec3 forward = sceneCamera.forward();
     forward.y = 0.0f;
     forward = glm::length(forward) > 1e-4f ? glm::normalize(forward) : glm::vec3(0.0f, 0.0f, -1.0f);
-    glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
     glm::vec3 center = sceneCamera.position + forward * 3.0f;
     float yaw = glm::degrees(std::atan2(-forward.x, -forward.z)) + 0.0f;  // +Z towards the camera (+ 0: no -0)
 
     rimModel = assets.findOrLoad(portalRimModelName());
     assets.acquire(rimModel);
 
-    PortalPair pair;
-    pair.name = "Portal " + std::to_string(++portalPairsMade);
-    pair.ends[0].position = center - right * 1.5f;
-    pair.ends[1].position = center + right * 1.5f;
-    pair.ends[0].rotation = pair.ends[1].rotation = glm::vec3(0.0f, yaw, 0.0f);
-    portalList.push_back(pair);
-    return static_cast<int>(portalList.size()) - 1;
+    Entity& group = create("Portal " + std::to_string(++portalPairsMade), 0);
+    group.local.position = center;
+    group.local.rotation = eulerToQuat(glm::vec3(0.0f, yaw, 0.0f));
+    EntityId groupId = group.id;  // (group moves when the list grows)
+    EntityId a = create("End A", groupId).id;
+    EntityId b = create("End B", groupId).id;
+    find(a)->local.position = glm::vec3(-1.5f, 0.0f, 0.0f);
+    find(b)->local.position = glm::vec3(1.5f, 0.0f, 0.0f);
+
+    PortalComponent portal;
+    portal.other = b;
+    portal.endA = true;
+    portalTable[a] = portal;
+    portal.other = a;
+    portal.endA = false;
+    portalTable[b] = portal;
+    return groupId;
 }
 
-void Scene::removePortalPair(int index) {
-    portalList.erase(portalList.begin() + index);
-    assets.release(rimModel);  // the last pair: the rim model is kept unused
+EntityId Scene::duplicate(EntityId id) {
+    std::vector<EntityId> ids = subtree(id);
+    std::unordered_map<EntityId, EntityId> copyOf;
+    for (EntityId original : ids) {
+        Entity source = *find(original);  // a copy: creating moves the list
+        Entity& copy = create(source.name, original == id ? source.parent : copyOf.at(source.parent));
+        copy.local = source.local;
+        copy.visible = source.visible;
+        copy.uniformScale = source.uniformScale;
+        copyOf[original] = copy.id;
+    }
+
+    // The copy goes right after the original among its siblings, a spacing along X from it
+    EntityId top = copyOf[id];
+    std::vector<EntityId>& list = siblings(find(id)->parent);
+    list.erase(std::find(list.begin(), list.end(), top));
+    list.insert(std::find(list.begin(), list.end(), id) + 1, top);
+    find(top)->local.position.x += objectSpacing;
+
+    for (EntityId original : ids) {
+        if (auto it = modelTable.find(original); it != modelTable.end()) {
+            ModelComponent component = it->second;
+            if (component.model.valid()) {
+                assets.acquire(component.model);  // one more entity showing it: no loading
+            }
+            modelTable[copyOf[original]] = std::move(component);
+        }
+        if (auto it = portalTable.find(original); it != portalTable.end() && copyOf.count(it->second.other)) {
+            PortalComponent component = it->second;
+            component.other = copyOf[component.other];
+            if (component.endA) {
+                assets.acquire(rimModel);  // one more pair
+            }
+            portalTable[copyOf[original]] = component;
+        }
+    }
+    return top;
+}
+
+void Scene::remove(EntityId id) {
+    std::vector<EntityId> ids = subtree(id);
+    std::unordered_set<EntityId> removed(ids.begin(), ids.end());
+    // A portal end takes its other end along (a pair isn't left with one end)
+    for (size_t i = 0; i < ids.size(); i++) {  // grows while going through it
+        const PortalComponent* portal = this->portal(ids[i]);
+        if (portal != nullptr && !removed.count(portal->other)) {
+            for (EntityId other : subtree(portal->other)) {
+                if (removed.insert(other).second) {
+                    ids.push_back(other);
+                }
+            }
+        }
+    }
+
+    for (EntityId e : ids) {
+        const Entity* entity = find(e);
+        if (!removed.count(entity->parent)) {  // the top of a removed subtree: out of its parent's list
+            std::vector<EntityId>& list = siblings(entity->parent);
+            list.erase(std::find(list.begin(), list.end(), e));
+        }
+        if (auto it = modelTable.find(e); it != modelTable.end()) {
+            if (it->second.model.valid()) {
+                assets.release(it->second.model);  // the last entity showing it: kept unused (AssetStore.h)
+            }
+            modelTable.erase(it);
+        }
+        if (auto it = portalTable.find(e); it != portalTable.end()) {
+            if (it->second.endA) {
+                assets.release(rimModel);  // the last pair: the rim model is kept unused
+            }
+            portalTable.erase(it);
+        }
+    }
+    entityList.erase(std::remove_if(entityList.begin(), entityList.end(),
+                                    [&](const Entity& entity) { return removed.count(entity.id) > 0; }),
+                     entityList.end());
+    reindex();
+}
+
+bool Scene::setParent(EntityId id, EntityId parent, bool keepWorld) {
+    Entity* entity = find(id);
+    if (entity == nullptr || (parent != 0 && find(parent) == nullptr) || isUnder(parent, id)) {
+        return false;
+    }
+    glm::mat4 world = worldTransform(id);
+    std::vector<EntityId>& from = siblings(entity->parent);
+    from.erase(std::find(from.begin(), from.end(), id));
+    entity->parent = parent;
+    siblings(parent).push_back(id);
+    if (keepWorld) {
+        entity->local = toTransform(parent == 0 ? world : glm::inverse(worldTransform(parent)) * world);
+    }
+    return true;
+}
+
+Entity* Scene::find(EntityId id) {
+    auto it = entityIndex.find(id);
+    return it == entityIndex.end() ? nullptr : &entityList[it->second];
+}
+
+const Entity* Scene::find(EntityId id) const {
+    auto it = entityIndex.find(id);
+    return it == entityIndex.end() ? nullptr : &entityList[it->second];
+}
+
+bool Scene::isUnder(EntityId id, EntityId ancestor) const {
+    for (EntityId e = id; e != 0; e = find(e)->parent) {
+        if (e == ancestor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+glm::mat4 Scene::worldTransform(EntityId id) const {
+    const Entity* entity = find(id);
+    glm::mat4 world = entity->local.matrix();
+    for (EntityId p = entity->parent; p != 0; p = find(p)->parent) {
+        world = find(p)->local.matrix() * world;
+    }
+    return world;
+}
+
+bool Scene::visibleInWorld(EntityId id) const {
+    for (EntityId e = id; e != 0; e = find(e)->parent) {
+        if (!find(e)->visible) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ModelComponent* Scene::model(EntityId id) {
+    auto it = modelTable.find(id);
+    return it == modelTable.end() ? nullptr : &it->second;
+}
+
+const ModelComponent* Scene::model(EntityId id) const {
+    auto it = modelTable.find(id);
+    return it == modelTable.end() ? nullptr : &it->second;
+}
+
+PortalComponent* Scene::portal(EntityId id) {
+    auto it = portalTable.find(id);
+    return it == portalTable.end() ? nullptr : &it->second;
+}
+
+const PortalComponent* Scene::portal(EntityId id) const {
+    auto it = portalTable.find(id);
+    return it == portalTable.end() ? nullptr : &it->second;
+}
+
+void Scene::syncPortal(EntityId end) {
+    const PortalComponent* source = portal(end);
+    PortalComponent* other = source != nullptr ? portal(source->other) : nullptr;
+    if (other != nullptr) {
+        other->shape = source->shape;
+        other->size = source->size;
+        other->rim = source->rim;
+        other->rimWidth = source->rimWidth;
+        other->rimDepth = source->rimDepth;
+    }
+}
+
+std::vector<Scene::Placed> Scene::placeAll() const {
+    std::vector<Placed> placed;
+    placed.reserve(entityList.size());
+    auto visit = [&](auto&& self, EntityId id, const glm::mat4* parentWorld, bool parentVisible) -> void {
+        const Entity& entity = entityList[entityIndex.at(id)];
+        glm::mat4 world = parentWorld != nullptr ? *parentWorld * entity.local.matrix() : entity.local.matrix();
+        bool visible = parentVisible && entity.visible;
+        placed.push_back({&entity, world, visible});
+        for (EntityId child : entity.children) {
+            self(self, child, &world, visible);
+        }
+    };
+    for (EntityId root : rootList) {
+        visit(visit, root, nullptr, true);
+    }
+    return placed;
 }
 
 // A bar of a rim: the unit cube stretched to length x width x depth, its length along `along` (in the opening's
@@ -133,21 +438,22 @@ static glm::mat4 rimBar(const glm::mat4& end, glm::vec2 center, glm::vec2 along,
 // A rectangle's rim: four bars around it (top and bottom covering the corners). An ellipse's: short straight
 // bars along its edge, each touching it in its middle (so lying outside it: the tangent of a convex shape stays
 // outside), a little longer than their share of the edge so neighbors overlap on the outside.
-std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims() const {
+std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims(const std::vector<PlacedPair>& pairs) const {
     std::vector<std::pair<uint32_t, glm::mat4>> bars;
-    if (portalList.empty()) {
+    if (pairs.empty()) {
         return bars;
     }
     const SceneModel& model = assets.model(rimModel);
-    for (const PortalPair& pair : portalList) {
-        if (!pair.enabled || !pair.rim || pair.rimWidth <= 0.0f) {
+    for (const PlacedPair& pair : pairs) {
+        const PortalComponent& portal = *pair.portal;
+        if (!portal.rim || portal.rimWidth <= 0.0f) {
             continue;
         }
-        float w = pair.size.x * 0.5f, h = pair.size.y * 0.5f, r = pair.rimWidth, d = std::max(pair.rimDepth, 1e-4f);
+        float w = portal.size.x * 0.5f, h = portal.size.y * 0.5f, r = portal.rimWidth, d = std::max(portal.rimDepth, 1e-4f);
         for (int e = 0; e < 2; e++) {
             uint32_t mesh = model.parts[e].meshIndex;
-            glm::mat4 end = pair.ends[e].transform();
-            if (pair.shape == PortalShape::Rectangle) {
+            const glm::mat4& end = pair.ends[e];
+            if (portal.shape == PortalShape::Rectangle) {
                 bars.push_back({mesh, rimBar(end, {0.0f, h + r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
                 bars.push_back({mesh, rimBar(end, {0.0f, -h - r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
                 bars.push_back({mesh, rimBar(end, {-w - r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
@@ -171,13 +477,32 @@ std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims() const {
 }
 
 void Scene::buildRenderList(RenderList& list) {
+    std::vector<Placed> placed = placeAll();
+
+    // The model entities, in tree order (also the instances' order)
     std::vector<RenderList::BuiltObject> current;
-    current.reserve(objectList.size());
-    for (const SceneObject& object : objectList) {
-        current.push_back({object.id, object.model, object.visible, object.originalSize, object.transform(),
-                           object.hiddenParts});
+    // The enabled portal pairs (both ends visible), in the order of their A ends
+    std::vector<PlacedPair> pairs;
+    std::unordered_map<EntityId, size_t> placedIndex;
+    placedIndex.reserve(placed.size());
+    for (size_t i = 0; i < placed.size(); i++) {
+        placedIndex[placed[i].entity->id] = i;
     }
-    std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims();
+    for (const Placed& p : placed) {
+        EntityId id = p.entity->id;
+        if (const ModelComponent* component = model(id); component != nullptr && component->model.valid()) {
+            current.push_back({id, component->model, p.visible, component->originalSize, p.world,
+                               component->hiddenParts});
+        }
+        const PortalComponent* portal = this->portal(id);
+        if (portal != nullptr && portal->endA && p.visible) {
+            auto other = placedIndex.find(portal->other);
+            if (other != placedIndex.end() && placed[other->second].visible) {
+                pairs.push_back({{withoutScale(p.world), withoutScale(placed[other->second].world)}, portal});
+            }
+        }
+    }
+    std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims(pairs);
     list.camera = sceneCamera;
     list.environment = sceneEnvironment;
 
@@ -190,35 +515,32 @@ void Scene::buildRenderList(RenderList& list) {
     }
     list.lights.clear();
     list.portals.clear();
-    for (const PortalPair& pair : portalList) {
-        if (pair.enabled) {
-            for (const PortalEnd& end : pair.ends) {
-                list.portals.push_back({end.transform(), pair.size * 0.5f, pair.shape});
-            }
+    for (const PlacedPair& pair : pairs) {
+        for (const glm::mat4& end : pair.ends) {
+            list.portals.push_back({end, pair.portal->size * 0.5f, pair.portal->shape});
         }
     }
 
-    // Motion vectors need where each point was last frame. The objects the instances were last made from are last
-    // frame's: had any of them changed since, the instances would have been remade then. Found by id (objects come
-    // and go); a new object has no motion.
-    std::unordered_map<uint64_t, glm::mat4> previous;
+    // Motion vectors need where each point was last frame. The entities the instances were last made from are last
+    // frame's: had any of them changed since, the instances would have been remade then. Found by id (entities come
+    // and go); a new one has no motion. A child that moves with its parent has its own world transform here, so it
+    // gets its motion too.
+    std::unordered_map<EntityId, glm::mat4> previous;
     if (rebuild) {
         for (const RenderList::BuiltObject& built : list.builtObjects) {
             previous.emplace(built.id, built.transform);
         }
     }
 
-    for (size_t o = 0; o < objectList.size(); o++) {
-        const SceneObject& object = objectList[o];
-        const glm::mat4& objectTransform = current[o].transform;
+    for (const RenderList::BuiltObject& object : current) {
         if (!object.visible) {
             continue;
         }
-
+        const glm::mat4& objectTransform = object.transform;
         const SceneModel& model = assets.model(object.model);
-        glm::mat4 placed = objectTransform * (object.originalSize ? glm::mat4(1.0f) : model.fit);
+        glm::mat4 placedModel = objectTransform * (object.originalSize ? glm::mat4(1.0f) : model.fit);
         if (rebuild) {
-            // last frame's position = previous object transform * inverse(current) * this frame's position. Exactly
+            // last frame's position = previous transform * inverse(current) * this frame's position. Exactly
             // identity when it didn't move (the product can be off by rounding, which would count as motion).
             auto last = previous.find(object.id);
             glm::mat4 motion = last != previous.end() && last->second != objectTransform
@@ -234,17 +556,17 @@ void Scene::buildRenderList(RenderList& list) {
                     continue;
                 }
                 const MeshInstance& part = model.parts[p];
-                list.instances.push_back({part.meshIndex, motionIndex, placed * part.transform});
+                list.instances.push_back({part.meshIndex, motionIndex, placedModel * part.transform});
             }
         }
 
         // The file's distances (falloff, range) are scaled with the object. The file's own node scales don't
         // count (glTF: they don't affect lights).
-        float scale = std::cbrt(std::abs(glm::determinant(glm::mat3(placed))));
+        float scale = std::cbrt(std::abs(glm::determinant(glm::mat3(placedModel))));
         for (const PunctualLight& light : model.lights) {
             if (light.enabled) {
                 list.lights.push_back({light.type, light.color, light.intensity, light.range, light.innerConeAngle,
-                                       light.outerConeAngle, placed * light.transform, scale});
+                                       light.outerConeAngle, placedModel * light.transform, scale});
             }
         }
     }

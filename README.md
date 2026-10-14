@@ -45,7 +45,8 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 
 ### Portals
 - Pairs of flat openings (rectangles or ellipses) placed in the editor: a ray that enters one leaves through the
-  other. Light sampling reaches the sun and the punctual lights through them.
+  other. Light sampling reaches the sun and the punctual lights through them. Each end is an entity of its own, so
+  either can be moved, or attached to something that moves.
 - Optional rims.
 
 ### Noise reduction and real-time modes
@@ -80,6 +81,16 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 
 ## Built-in scenes and objects
 
+The scene is a tree of entities: models, portal ends and groups. Each has a position, rotation and scale relative to
+its parent, so moving a group moves everything under it; in the editor's list, drag an entity onto another to attach
+it there (it stays where it is).
+
+Scenes are saved as JSON files (one line per entity, so changes show in a diff) in the `scenes` folder next to
+the program: the entities, the camera, the sun and sky, and edits to the models' materials and lights (only what
+differs from the model file). `scenes/` in the project has Sponza, Bistro at night and Jungle Ruins; CMake copies
+them next to the program, but never over a scene already there. The JSON reader is nlohmann/json (include/nlohmann,
+MIT license).
+
 The editor can add a cube, Cornell boxes (empty, with blocks, or with a point light), a mirror maze, a fog box and
 a light orb, besides any glTF file.
 
@@ -107,8 +118,8 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
    powershell -ExecutionPolicy Bypass -File download_streamline.ps1
    ```
 3. Build with CMake. The shaders are compiled to SPIR-V with `glslc` as part of the build.
-4. Run `vulkanDemo.exe`. Options: `--no-dlss` (don't load Streamline), `--dlss-cnn` (the DLSS version that still
-   has the CNN models).
+4. Run `vulkanDemo.exe`, or `vulkanDemo.exe scenes/sponza.json` to open a scene. Options: `--no-dlss` (don't load
+   Streamline), `--dlss-cnn` (the DLSS version that still has the CNN models).
 
 Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
 for fullscreen.

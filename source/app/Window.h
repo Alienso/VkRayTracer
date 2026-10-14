@@ -7,6 +7,8 @@
 #define VULKANDEMO_WINDOW_H
 
 #include <GLFW/glfw3.h>
+#include <functional>
+#include <string>
 
 class Window {
 public:
@@ -17,6 +19,10 @@ public:
     [[nodiscard]] GLFWwindow* handle() const { return window; }
     [[nodiscard]] bool shouldClose() const { return glfwWindowShouldClose(window); }
     void requestClose() { glfwSetWindowShouldClose(window, GLFW_TRUE); }
+    // Asked when the user closes the window (its close button, Alt+F4): false keeps it open (the editor asks about
+    // unsaved changes first). requestClose doesn't ask.
+    void setCloseCheck(std::function<bool()> check) { closeCheck = std::move(check); }
+    void setTitle(const std::string& title) { glfwSetWindowTitle(window, title.c_str()); }
 
     // Borderless fullscreen on the monitor it is on; off: the windowed position and size come back
     void setFullscreen(bool on);
@@ -31,8 +37,10 @@ private:
     bool fullscreen = false;
     int windowedX = 0, windowedY = 0, windowedWidth = 0, windowedHeight = 0;
     bool windowedMaximized = false;
+    std::function<bool()> closeCheck;
 
     static void framebufferSizeCallback(GLFWwindow* window, int width, int height);
+    static void closeCallback(GLFWwindow* window);
 };
 
 #endif //VULKANDEMO_WINDOW_H

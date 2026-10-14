@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <glm/gtc/matrix_transform.hpp>
 #include "assets/BuiltInModels.h"
+#include "assets/EditableFields.h"
 #include <stb_image.h>
 
 AssetStore::AssetStore(std::string modelsDirectory, std::string environmentsDirectory)
@@ -138,6 +139,8 @@ ModelHandle AssetStore::add(SceneModel sceneModel, Model& contents) {
         textureIdList.push_back(nextId++);
     }
     sceneModel.lights = contents.lights;
+    sceneModel.fileMaterials.assign(materialList.begin() + firstMaterial, materialList.end());
+    sceneModel.fileLights = contents.lights;
     sceneModel.firstMesh = firstMesh;
     sceneModel.meshCount = static_cast<uint32_t>(contents.meshes.size());
     sceneModel.firstMaterial = firstMaterial;
@@ -182,6 +185,31 @@ void AssetStore::release(ModelHandle handle) {
         model.lastUsed = ++useClock;  // kept, unless the unused ones now take too much
         trimUnused(unusedBudget);
     }
+}
+
+void AssetStore::resetEdits() {
+    for (Slot& slot : slots) {
+        if (!slot.loaded) {
+            continue;
+        }
+        SceneModel& model = slot.model;
+        for (uint32_t i = 0; i < model.materialCount && i < model.fileMaterials.size(); i++) {
+            SceneMaterial& material = materialList[model.firstMaterial + i];
+            const SceneMaterial& file = model.fileMaterials[i];
+#define RESET_FIELD(name) material.material.name = file.material.name;
+#define RESET_SWITCH(name) material.name = file.name;
+            MATERIAL_FIELDS(RESET_FIELD)
+            MATERIAL_SWITCHES(RESET_SWITCH)
+#undef RESET_FIELD
+#undef RESET_SWITCH
+        }
+        for (size_t i = 0; i < model.lights.size() && i < model.fileLights.size(); i++) {
+#define RESET_LIGHT(name) model.lights[i].name = model.fileLights[i].name;
+            LIGHT_FIELDS(RESET_LIGHT)
+#undef RESET_LIGHT
+        }
+    }
+    materialsChanged();
 }
 
 void AssetStore::setUnusedBudget(uint64_t bytes) {

@@ -17,8 +17,10 @@ int main(int argc, char** argv) {
             app.setDlssDisabled(true);  // don't load Streamline at all (no driver vsync, no per-frame cost)
         } else if (std::strcmp(argv[i], "--dlss-cnn") == 0) {
             app.setDlssCnn(true);  // load the older DLSS RR version that still has the CNN models
+        } else if (argv[i][0] != '-') {
+            app.setStartScene(argv[i]);  // a scene file to open
         } else {
-            std::cerr << "unknown option " << argv[i] << " (known: --no-dlss, --dlss-cnn)" << std::endl;
+            std::cerr << "unknown option " << argv[i] << " (known: --no-dlss, --dlss-cnn, a scene file)" << std::endl;
         }
     }
 

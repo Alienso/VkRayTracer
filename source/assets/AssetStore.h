@@ -42,6 +42,10 @@ struct SceneModel {
     std::string name;                 // file name, or "Floor" for the built-in floor
     std::vector<MeshInstance> parts;  // meshIndex into AssetStore::meshes(), transform from the file's node tree
     std::vector<PunctualLight> lights;  // KHR_lights_punctual, placed like the parts; edited in the UI
+    // Its materials and lights as the file has them (texture indices aside: those are the live list's), for what a
+    // scene file saves (the edits) and AssetStore::resetEdits
+    std::vector<SceneMaterial> fileMaterials;
+    std::vector<PunctualLight> fileLights;
     glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0 (unless originalSize)
     // The model's meshes, materials and textures are these ranges of the store's lists (they move down when an
     // earlier model is unloaded)
@@ -136,6 +140,9 @@ public:
     // only for edits: loading and unloading move revision() on, and the renderer re-uploads everything then anyway.
     void materialsChanged() { materialRevisionCounter++; }
     [[nodiscard]] uint64_t materialRevision() const { return materialRevisionCounter; }
+    // Every loaded model's materials and lights back to the file's (the values in EditableFields.h): a scene that is
+    // opened or started anew applies its own edits on top
+    void resetEdits();
 
     // Environment maps: the .hdr files there are, and the loaded ones. Same lifetime rules as models: the last
     // release unloads the map (the renderer keeps its GPU copy until it gets another one).

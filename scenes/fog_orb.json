@@ -1,0 +1,16 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 4,
+  "portalPairsMade": 0,
+  "camera": {"position":[-0.5032988,1.6,4.082685],"yaw":-4.6499968,"pitch":-3.776246,"fov":60.0},
+  "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
+  "entities": [
+    {"id":1,"name":"Floor","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Floor"}},
+    {"id":2,"name":"Light orb","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Light orb"}},
+    {"id":3,"name":"Fog box","parent":2,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Fog box"}}
+  ],
+  "models": [
+    {"builtIn":"Fog box","materials":[{"index":0,"name":"fog","fogDensity":1.866,"fogNoise":true,"fogNoiseSize":0.54,"fogCoverage":0.49,"fogNoiseSeed":10,"fogEdge":0.31}]}
+  ]
+}

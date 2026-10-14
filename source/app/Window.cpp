@@ -12,6 +12,7 @@ void Window::create(int width, int height, const char* title) {
     window = glfwCreateWindow(width, height, title, nullptr, nullptr);
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
+    glfwSetWindowCloseCallback(window, closeCallback);
 }
 
 void Window::destroy() {
@@ -22,6 +23,13 @@ void Window::destroy() {
 
 void Window::framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     reinterpret_cast<Window*>(glfwGetWindowUserPointer(window))->resized = true;
+}
+
+void Window::closeCallback(GLFWwindow* window) {
+    Window* self = reinterpret_cast<Window*>(glfwGetWindowUserPointer(window));
+    if (self->closeCheck && !self->closeCheck()) {
+        glfwSetWindowShouldClose(window, GLFW_FALSE);
+    }
 }
 
 bool Window::takeResized() {

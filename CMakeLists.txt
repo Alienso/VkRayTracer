@@ -43,10 +43,10 @@ add_executable(vulkanDemo main.cpp
         include/vma/vk_mem_alloc.cpp include/vma/vk_mem_alloc.h
         source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
         source/app/CameraController.cpp source/app/CameraController.h
-        source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp
-        source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneEnvironment.h source/scene/Camera.cpp
+        source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp source/editor/EditorFile.cpp
+        source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneFile.cpp source/scene/SceneEnvironment.h source/scene/Camera.cpp
         source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
-        source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/ModelLoader.cpp
+        source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/EditableFields.h source/assets/ModelLoader.cpp
         source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
         source/renderer/Renderer.cpp source/renderer/Renderer.h source/renderer/GpuAssets.h
         source/renderer/RayTracer.cpp source/renderer/SceneGpu.cpp source/renderer/Materials.cpp
@@ -66,6 +66,17 @@ target_link_libraries(vulkanDemo glfw3 gdi32 Vulkan::Vulkan)
 add_custom_command(TARGET vulkanDemo PRE_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${PROJECT_SOURCE_DIR}/resource $<TARGET_FILE_DIR:vulkanDemo>)
+
+# Scene files (scenes/): the editor opens and saves them in the scenes folder next to the executable. Copied there
+# when CMake runs, and only those that aren't there yet: a build never overwrites a scene saved there. To keep a
+# saved scene in git, copy it back into scenes/.
+file(GLOB sceneFiles ${PROJECT_SOURCE_DIR}/scenes/*.json)
+foreach (sceneFile IN LISTS sceneFiles)
+    get_filename_component(sceneName ${sceneFile} NAME)
+    if (NOT EXISTS ${CMAKE_BINARY_DIR}/scenes/${sceneName})
+        file(COPY ${sceneFile} DESTINATION ${CMAKE_BINARY_DIR}/scenes)
+    endif ()
+endforeach ()
 
 # NVIDIA Streamline (DLSS Ray Reconstruction): loaded at runtime. sl.interposer.dll goes next to the executable, the
 # plugins into dlss/transformer (current DLSS RR, transformer models) and dlss/cnn (older DLSS RR that still has the

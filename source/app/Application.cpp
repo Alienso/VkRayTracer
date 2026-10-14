@@ -13,6 +13,7 @@ static const char* defaultModel = "DamagedHelmet.glb";
 
 void Application::run() {
     window.create(Configuration::wWidth, Configuration::wHeight, "Vulkan");
+    window.setCloseCheck([this]() { return editor.allowClose(); });  // asks about unsaved changes
     createDefaultScene();
     scene.buildRenderList(renderList);
     // The UI: ImGui's context and its input from the window are the program's; the renderer adds the Vulkan side
@@ -27,7 +28,8 @@ void Application::run() {
     window.destroy();
 }
 
-// The model and environment files there are, the floor, and the default model on it
+// The model and environment files there are, the floor, and the default model on it; or the scene file given on the
+// command line
 void Application::createDefaultScene() {
     assets.scanModelFiles();
     assets.scanEnvironmentFiles();
@@ -35,7 +37,7 @@ void Application::createDefaultScene() {
     scene.createDefault();
     std::string error;
     const std::vector<std::string>& files = assets.modelFiles();
-    if (std::find(files.begin(), files.end(), defaultModel) != files.end()) {
+    if (startScene.empty() && std::find(files.begin(), files.end(), defaultModel) != files.end()) {
         try {
             scene.addObject(defaultModel, false);
         } catch (const std::exception& e) {
@@ -44,6 +46,9 @@ void Application::createDefaultScene() {
         }
     }
     editor.init(defaultModel, error);
+    if (!startScene.empty()) {
+        editor.openSceneFile(startScene);  // on failure the error shows in the Scene tab, over the default scene
+    }
 }
 
 // Unused models are only a cache (adding one again is instant): they may keep what GPU memory is free beyond a reserve
