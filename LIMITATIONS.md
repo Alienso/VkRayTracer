@@ -59,6 +59,16 @@ bounces). Close-ups full of glass cost more: Bistro's glass of water with ice up
 the glass.
 - Where: `glassPasses` in `tracePath`.
 
+### DLSS guides through clear glass are approximate
+Under DLSS, pixels that see smooth glass (roughness 0, transmission 0.5 and up) get the guides of what is seen
+through it, as for mirrors (before, the glass's own: no diffuse albedo, the normals of a solid cylinder, so DLSS
+turned Bistro's glasses into grey solid shapes, worse in motion). The surface behind is placed at the whole path
+length along the camera ray (exact through panes, close through a glass), its normal is not bent, and the tint is
+the glass's color and Fresnel only, not the absorption (wine shows the guides of what is behind it). The retrace
+bends at each surface as if into air, without the media (water in a glass). The glass's own reflection now shares
+those guides, so DLSS may soften reflections on glass a little.
+- Where: `guideClear`, `storeMirrorGuides`.
+
 ### Absorption units
 glTF gives the attenuation distance in the file's world units; the shader converts mesh units using the
 glTF node's scale (`MeshInfo.unitScale`). A mesh used by several nodes with different scales takes the first

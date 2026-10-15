@@ -896,6 +896,9 @@ uint mediumMaterial(uint instance) {
 // on unchanged. (Renderers that do this exactly give each volume a priority, which glTF doesn't have.)
 // Only in the pipelines with FOG: a scene with solid glass uses those (the plain ones assume there is none).
 const uint GLASS_MASK = 0x08u;  // TLAS group of the glass volumes (mediumAt)
+// Passes through glass a path may make besides its bounces (see glassPasses in tracePath): a glass of water with ice
+// seen through takes about ten
+const uint MAX_GLASS_PASSES = 16;
 
 bool glassMaterial(uint material) {
     return FEATURE_GLASS && materials[material].transmission > 0.0 && materials[material].solid != 0;
@@ -3464,6 +3467,16 @@ bool guideMirror(Hit hit) {
     return hit.roughness <= 0.0 && hit.metallic >= 0.99 && hit.transmission <= 0.0 && luminance(hit.emissive) <= 0.0;
 }
 
+// Clear glass for the guides: smooth and mostly see-through. What it shows is mostly what is behind it, so the guides
+// are those of that (storeMirrorGuides), as RTX Remix does for glass. With the glass's own (a smooth specular surface
+// at the glass's depth, its hit distance the few mm to the glass's back), DLSS had no edges or texture to keep and
+// reprojected the view through it wrongly: glasses in Bistro turned flat grey under DLSS, worse in motion. Only the
+// guides: the image pass shades the glass itself (its reflection is a good part of what it shows at grazing angles).
+bool guideClear(Hit hit) {
+    return FEATURE_GLASS && hit.roughness <= 0.0 && hit.transmission >= 0.5 && hit.metallic < 0.5
+           && luminance(hit.emissive) <= 0.0;
+}
+
 // Mirrors and the guides (primary surface replacement, as NVIDIA recommends for DLSS RR). DLSS keeps edges and
 // texture by the guides of the surface the camera sees; a mirror's are flat and plain, so DLSS can't tell what it
 // shows from noise and smudges it. When the camera sees a mirror, this follows the reflection to the first surface
@@ -3478,6 +3491,11 @@ bool guideMirror(Hit hit) {
 // from frame to frame which pixels do; the guides stay those of what the camera sees behind the fog.
 bool guidesRetrace = false;
 
+// Clear glass (guideClear) likewise: through it, bent as it bends the light (thin panes: straight on), tinted by
+// the share that gets through. Its image isn't rigid like a mirror's: the normal stays as it is, and the surface is
+// put at the whole length along the camera ray (exact through panes, close through a glass of water). Where the
+// light can't get out (total internal reflection), on along the reflection. Without the media of tracePath: from
+// glass into glass (water in a glass) bends as into air, which only moves the guides a little.
 void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     mat3 toCamera = mat3(1.0);
     vec3 tint = vec3(1.0);
@@ -3485,7 +3503,7 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     vec3 origin = scene.cameraPosition.xyz;
     vec3 direction = cameraDirection;
     float coneSpread = scene.pixelSpreadAngle;  // the camera ray's cone, which the mirrors don't widen
-    for (uint i = 0; i <= scene.maxBounces; i++) {
+    for (uint i = 0; i <= scene.maxBounces + MAX_GLASS_PASSES; i++) {
         Intersection intersection;
         if (!intersectClosest(origin, direction, seed, intersection)) {
             if (intersection.travelled >= 0.0) {
@@ -3496,13 +3514,26 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
         Hit hit = hitFromIntersection(intersection, direction, coneSpread * distance, coneSpread);
         tiltTowardsViewer(hit, direction);
         distance += hit.t;
-        if (!guideMirror(hit)) {
+        bool clear = guideClear(hit);
+        if (!guideMirror(hit) && !clear) {
             storeSurfaceGuides(pixel, hit, direction, cameraDirection, i > 0 || intersection.travelled != 0.0,
                                distance, toCamera, tint);
             return;
         }
+        vec3 through = direction;
+        if (clear && hit.solid) {
+            through = refract(direction, hit.normal, hit.frontFace ? 1.0 / hit.ior : hit.ior);
+        }
+        if (clear && dot(through, through) > 0.0) {
+            float cosine = dot(hit.normal, -direction);
+            tint *= hit.transmission * (1.0 - fresnelDielectric(cosine, hit.frontFace || !hit.solid ? 1.0 / hit.ior : hit.ior))
+                    * (hit.frontFace || !hit.solid ? hit.albedo : vec3(1.0));
+            direction = through;
+            origin = offsetRay(hit.position, -hit.geometricNormal);
+            continue;
+        }
         toCamera = toCamera * (mat3(1.0) - 2.0 * outerProduct(hit.normal, hit.normal));
-        tint *= fresnelSchlick(hit.albedo, dot(hit.normal, -direction));
+        tint *= clear ? vec3(1.0) : fresnelSchlick(hit.albedo, dot(hit.normal, -direction));
         direction = reflect(direction, hit.normal);
         origin = offsetRay(hit.position, hit.geometricNormal);
     }
@@ -3596,9 +3627,6 @@ const float CACHE_ROUGHNESS = 0.25;     // smoother surfaces (and glass) reflect
 // Smoother glass doesn't light-sample what is behind it (see glassLit): its lobe is so narrow that bounce rays find the
 // lights about as well, and every shadow ray would be wasted
 const float GLASS_LIGHT_ROUGHNESS = 0.1;
-// Passes through glass a path may make besides its bounces (see glassPasses in tracePath): a glass of water with ice
-// seen through takes about ten
-const uint MAX_GLASS_PASSES = 16;
 const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this (rare glints of the sun)
 // A cell averages its whole area, so in a corner it holds more light than the corner itself gets (the walls
 // further out are brighter). A path that reached the cell with a short ray, i.e. from right next to it (inside
@@ -3968,7 +3996,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // Seen in mirrors through the RESTIR_PASS's stored hit: that pass wrote the guides (traceCameraRay)
         if (bounce == 0 && wantGuides && !(crossedPortal && intersection.crossings == 0) && !isFog(hit)) {
             storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, hit.t, mat3(1.0), vec3(1.0));
-            guidesRetrace = guideMirror(hit);
+            guidesRetrace = guideMirror(hit) || guideClear(hit);
         }
 
         // Glass volumes (see there). The ray just travelled hit.t through the glass it is in, losing light (Beer's law).
@@ -4289,7 +4317,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         coneSpread += 2.0 * ggxAlpha(lobeRoughness);
         previousLobeRough = !transmitted && lobeRoughness >= CACHE_ROUGHNESS;
         if (bounce == 0 && wantGuides) {
-            firstBounceSpecular = specularLobe && !guideMirror(hit);  // a mirror: storeMirrorGuides wrote it
+            // (a mirror or clear glass: storeMirrorGuides wrote it)
+            firstBounceSpecular = specularLobe && !guideMirror(hit) && !guideClear(hit);
         }
         direction = sharedBounce && bounce == 0 ? bounceHits[primaryHitIndex(pixel)].direction : toWorld(frame, l);
         // Around the smooth normal, a direction can still end up on the wrong side of the actual triangle.
