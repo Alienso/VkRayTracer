@@ -3492,10 +3492,14 @@ bool guideClear(Hit hit) {
 bool guidesRetrace = false;
 
 // Clear glass (guideClear) likewise: through it, bent as it bends the light (thin panes: straight on), tinted by
-// the share that gets through. Its image isn't rigid like a mirror's: the normal stays as it is, and the surface is
-// put at the whole length along the camera ray (exact through panes, close through a glass of water). Where the
-// light can't get out (total internal reflection), on along the reflection. Without the media of tracePath: from
-// glass into glass (water in a glass) bends as into air, which only moves the guides a little.
+// the share that gets through. Its image isn't rigid like a mirror's: the normal stays as it is. Through thin panes
+// the surface is put at the whole length along the camera ray (exact). Solid glass is a lens (a glass of water): what
+// is seen through it doesn't move like any point along the camera ray, and the whole length jumps wherever something
+// else comes into view behind it (the wall behind a glass, then a chair). Its motion vectors jumped with it, DLSS
+// took its history from elsewhere, and the view through the glass shifted while the camera moved. So the depth and
+// motion are the first solid glass surface's (smooth across the glass), the rest of the guides what is behind.
+// Where the light can't get out (total internal reflection), on along the reflection. Without the media of
+// tracePath: from glass into glass (water in a glass) bends as into air, which only moves the guides a little.
 void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     mat3 toCamera = mat3(1.0);
     vec3 tint = vec3(1.0);
@@ -3503,26 +3507,44 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
     vec3 origin = scene.cameraPosition.xyz;
     vec3 direction = cameraDirection;
     float coneSpread = scene.pixelSpreadAngle;  // the camera ray's cone, which the mirrors don't widen
+    // The first solid glass surface (lensDistance < 0: none yet): its point, seen at that length along the camera ray
+    // after mirrors, else where it is (with its object's motion)
+    float lensDistance = -1.0;
+    vec4 lensPosition = vec4(0.0);
+    vec4 lensPrevious = vec4(0.0);
     for (uint i = 0; i <= scene.maxBounces + MAX_GLASS_PASSES; i++) {
         Intersection intersection;
-        if (!intersectClosest(origin, direction, seed, intersection)) {
-            if (intersection.travelled >= 0.0) {
-                storeSkyGuides(pixel, cameraDirection);
-            }
-            return;
+        bool found = intersectClosest(origin, direction, seed, intersection);
+        Hit hit;
+        if (found) {
+            hit = hitFromIntersection(intersection, direction, coneSpread * distance, coneSpread);
+            tiltTowardsViewer(hit, direction);
+            distance += hit.t;
         }
-        Hit hit = hitFromIntersection(intersection, direction, coneSpread * distance, coneSpread);
-        tiltTowardsViewer(hit, direction);
-        distance += hit.t;
-        bool clear = guideClear(hit);
-        if (!guideMirror(hit) && !clear) {
-            storeSurfaceGuides(pixel, hit, direction, cameraDirection, i > 0 || intersection.travelled != 0.0,
-                               distance, toCamera, tint);
+        bool clear = found && guideClear(hit);
+        bool virtualPosition = i > 0 || intersection.travelled != 0.0;
+        if (!found || (!guideMirror(hit) && !clear)) {
+            if (found) {
+                storeSurfaceGuides(pixel, hit, direction, cameraDirection, virtualPosition, distance, toCamera, tint);
+            } else if (intersection.travelled >= 0.0) {
+                storeSkyGuides(pixel, cameraDirection);
+            } else {
+                return;  // lost in portals
+            }
+            if (lensDistance >= 0.0) {
+                imageStore(linearDepthImage, pixel, vec4(lensDistance * dot(cameraDirection, scene.cameraForward.xyz)));
+                imageStore(motionVectorImage, pixel, vec4(motionVector(lensPosition, lensPrevious), 0.0, 0.0));
+            }
             return;
         }
         vec3 through = direction;
         if (clear && hit.solid) {
             through = refract(direction, hit.normal, hit.frontFace ? 1.0 / hit.ior : hit.ior);
+            if (lensDistance < 0.0) {
+                lensDistance = distance;
+                lensPosition = vec4(virtualPosition ? scene.cameraPosition.xyz + cameraDirection * distance : hit.position, 1.0);
+                lensPrevious = virtualPosition ? lensPosition : instanceMotion(hit.instanceIndex) * lensPosition;
+            }
         }
         if (clear && dot(through, through) > 0.0) {
             float cosine = dot(hit.normal, -direction);

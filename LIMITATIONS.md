@@ -62,8 +62,12 @@ the glass.
 ### DLSS guides through clear glass are approximate
 Under DLSS, pixels that see smooth glass (roughness 0, transmission 0.5 and up) get the guides of what is seen
 through it, as for mirrors (before, the glass's own: no diffuse albedo, the normals of a solid cylinder, so DLSS
-turned Bistro's glasses into grey solid shapes, worse in motion). The surface behind is placed at the whole path
-length along the camera ray (exact through panes, close through a glass), its normal is not bent, and the tint is
+turned Bistro's glasses into grey solid shapes, worse in motion). Through thin panes the surface behind is placed at
+the whole path length along the camera ray (exact). Solid glass is a lens: there the depth and motion vectors are
+the glass surface's, as nothing behind it moves like one point (at the whole length, the motion vectors jumped
+wherever something else came into view behind the glass, and the view through it shifted while the camera
+moved). What is seen through a lens still moves differently from the glass, so it can lag a little in
+motion. The normal behind is not bent, and the tint is
 the glass's color and Fresnel only, not the absorption (wine shows the guides of what is behind it). The retrace
 bends at each surface as if into air, without the media (water in a glass). The glass's own reflection now shares
 those guides, so DLSS may soften reflections on glass a little.
