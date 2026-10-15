@@ -325,7 +325,7 @@ rules of glass and "Blur caustics" follow the update path's own history. Cells i
 Not a leak: without the cache, a dark corner of Sponza is still far from converged after 10 000 frames (each
 pixel ±90%), and most of its light sits in rare bright pixels that tone mapping compresses, so on screen the
 corner looks darker than it is. Its HDR average matches the cache's (see above). DLSS darkens such corners even
-more without the cache (see "DLSS RR darkens Sponza's shade a little").
+more without the cache (see "DLSS RR darkens light that comes as rare samples").
 
 ### The cache follows changes with a delay
 Old samples fade out over ~32 frames ("History"). The cache is cleared when the sun, sky (or HDR map), bounce count, light
@@ -522,16 +522,22 @@ telemetry DLLs get loaded into the process); not investigated further. Small nex
 - Workaround: start with `--no-dlss` (Streamline isn't loaded at all; no DLSS modes then).
 - Where: `initStreamline` (source/renderer/Dlss.cpp).
 
-### DLSS RR darkens Sponza's shade a little
-In Sponza DLSS RR comes out darker than the accumulated reference: ~7% on sunlit walls and ~17% under the
-arches, where the light only arrives bounced. ACES' toe makes the shade look darker still (nearly black under
-the big arch). Not changed by 4 samples per pixel, by `exposureScale` (146 vs 1), by leaving out the specular
-hit distance, or by moving everything into the diffuse albedo. The other test scenes (helmet, Cornell box,
-dragon, glass) match the reference within ~1/255. Probably DLSS's firefly suppression costing energy where the
-noisy input consists of rare bright samples.
-- Where: DLSS itself (source/renderer/Dlss.cpp only passes the inputs).
-- Workarounds to try: more light paths per pixel for that light (e.g. a firefly-free estimator for the bounce
-  from the sunlit floor), or exposure compensation in DLSS modes.
+### DLSS RR darkens light that comes as rare samples
+Where a pixel's light depends on a shadow ray that only sometimes gets through, DLSS RR loses part of it on its
+first frame (no history) and gets it back only slowly as the history grows (a still camera: ~1000 frames). Sponza's
+side aisle (scenes/sponza.json, DLSS Quality, whole image vs the accumulated reference): 93.9% on the first frame,
+96.7% after 64. It is the noise, not the guides: 4 samples per pixel 99.0%, 16 100.4%. The light there is nearly
+all sky through the arches (direct light only: 90.6%); the bounce light and the cache hardly matter. ReSTIR DI made
+it worse: one shadow ray towards the reservoir's sample gave a pixel all of the sky or none (ReSTIR DI off: 96.2%,
+99.6% after 64, but noisier). So half of the first surface's skylight now comes from the usual light sampling
+(`RESTIR_SKY_SHARE`): 96.6%, 98.6% after 64, the same error and cost; unbiased (accumulated: 100.1%).
+- Not better: 4 BRDF candidates (94.3%), the sky only through BRDF candidates, spatial or temporal reuse off,
+  a bounce ray of its own instead of ReSTIR's BRDF candidate, a 75/25 split. 8 sky candidates: 94.6% (+0.4 ms).
+- Earlier, also no change: `exposureScale` (146 vs 1), no specular hit distance, everything in the diffuse albedo.
+- Still there: Jungle Ruins 94.3%, 96.6% after 64, from sunlight through the foliage (direct light only: 93.3%;
+  4 samples per pixel: 97.4%), which this doesn't touch; scenes/bistro_night.json 96.7%, 97.7% after 64.
+- Where: DLSS itself; `RESTIR_SKY_SHARE` in the shader.
+- Fix to try: more shadow rays at the first surface for partly blocked light (two towards the sun).
 
 ### The CNN models need a restart with --dlss-cnn
 The CNN models (presets A-C) only exist in DLSS RR 310.3.0, the transformer F only in 310.9.1, and a process can
@@ -572,29 +578,38 @@ to come back quickly). Not investigated further.
 
 ### Only the sun and punctual lights are light-sampled through portals, through one portal
 Shadow rays to a light go through a portal only towards its image through that portal (light images: the sun and
-the punctual lights, through one portal). Glowing surfaces and the sky behind a portal, and the sun behind two
-or more, are only found by bounce rays that happen to go through: noisier, the sun's light as fireflies. Every
-portal end adds a plane test per light per surface (and a shadow ray where the image is seen through it).
-- Where: `portalLightImage`, `shadowTransmittance` (`throughEnd`), `portalCrossings` in `tracePath`.
-- Fix: images of glowing triangles would need the light tree to know the portals; the sky could be sampled
-  through the openings it is seen through.
+the punctual lights, through one portal), in image and cache update paths alike. Glowing surfaces and the sky
+behind a portal, and the sun behind two or more, are found by bounce rays: at rough opaque surfaces that see an
+opening, half of them aim through one (`PORTAL_BOUNCE_SHARE`; an end picked by about its solid angle, a point on it
+evenly), the pdf the mix of both strategies, so unbiased (the references with and without agree within 0.01%).
+Test scene, a closed dark room with a window to the sky and one into a lit room (Accumulation, error after one
+frame / 16): sky only 42 / 3.0 -> 17 / 1.1 (6.2 -> 7.4 ms), the lit room only 74 / 6.9 -> 40 / 4.7 (4.1 -> 5.7 ms).
+- The aim doesn't know what is in the way: an opening behind a wall, or in another room, takes its share of the
+  bounce rays for nothing. Not at the surfaces where paths end in the cache (their light comes from the cell),
+  nor in fog, glass or leaves (diffuse transmission).
+- The sun behind two portals is still found only by chance (rarely: its disc is small).
+- Where: `portalLightImage`, `samplePortalDirection`, `portalDirectionPdf`, `shadowTransmittance` (`throughEnd`),
+  `portalCrossings` in `tracePath`.
+- Fix to try: aim by the solid angle of the whole opening (spherical rectangles, Urena et al. 2013) instead of
+  points spread evenly over its area; images of glowing triangles through the light tree from the moved point.
 
-### The radiance cache's update paths have no light images
-With a second shadow-ray part, the update paths took 168 registers instead of 128 (10-25% slower cache pass in
-every scene). They find the sun through a portal by bouncing into it (fully counted, averaged by the cache), and
-don't find punctual lights through portals at all: light from a lamp that reached a surface through a portal is
-missing from the indirect light the cache holds (a little darker there).
-- Where: `CACHE_UPDATE_PASS` in `shadowTransmittance` and the light loop of `tracePath`.
+### The radiance cache's update paths had no light images (fixed 2026-10-15)
+They found the sun through a portal only when a bounce ray hit its disc, a sample far above the cache's limit of
+256 (see "One sample's light is clamped"), and the punctual lights not at all: the test room lit by the sun through
+a window came out 41% too dark (59%), lit by a point light in the room next door 18% (82%). With the light images
+(the shadow ray's second part in update paths too): 100% and 98%, the update pass still at 128 registers. It costs
+~0.1 ms of the cache pass in scenes without portals (Sponza: 0.69 -> 0.82 ms; the image pass unchanged).
 
 ### No ReSTIR for pixels seen through a portal
 A pixel whose camera ray went through a portal samples its lights as without ReSTIR, and a bounce through a
 portal gives no ReSTIR GI sample: both reuse samples along straight lines between surfaces.
 - Where: `PRIMARY_THROUGH_PORTAL`, `BOUNCE_RETRACE`, `crossedPortal` (shaders/raytrace.comp).
 
-### Lost after 8 crossings
-A ray that goes through portals more than 8 times (two ends facing each other) brings back no light: the deep
-end of such a tunnel is black.
-- Where: `MAX_PORTAL_CROSSINGS`.
+### Lost after "Max portal crossings"
+A ray that goes through portals more often than "Max portal crossings" (8 by default; two ends facing each other)
+brings back no light: the deep end of such a tunnel is black. The camera moving through portals takes at most 8 in
+one frame's step.
+- Where: `scene.maxPortalCrossings` in `intersectClosest`, `Scene::moveCameraThroughPortals`.
 
 ### Geometry within 1 mm of an opening's plane is skipped there
 So that a portal set into a wall shows its view, not the wall, rays stop 1 mm before an opening and start 1 mm

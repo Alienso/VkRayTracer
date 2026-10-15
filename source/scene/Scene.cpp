@@ -687,7 +687,7 @@ void Scene::moveCameraThroughPortals(const glm::vec3& from) {
     std::vector<PlacedPair> pairs = placePairs(placeAll());
     glm::vec3 a = from;
     int cameOutOf = -1;  // the end it just came out of (2 * pair + end): the line starts on its plane
-    // As many times as the shader lets a ray through (MAX_PORTAL_CROSSINGS): a step that long is rare anyway
+    // As many times as the shader lets a ray through by default ("Max portal crossings"): a step that long is rare
     for (int crossing = 0; crossing < 8; crossing++) {
         int nearest = -1;
         float nearestAlong = 2.0f;

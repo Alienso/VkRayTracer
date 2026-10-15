@@ -67,6 +67,12 @@ void Renderer::buildRenderingUi() {
     }
     ImGui::SliderInt("Max bounces", &settings.maxBounces, 1, 64);
     ImGui::TextDisabled("1 = direct light only (sun, sky, lamps, glowing surfaces), more = light bouncing between surfaces");
+    ImGui::SliderInt("Max portal crossings", &settings.maxPortalCrossings, 1, 64);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("How many portals one ray may go through. Two ends facing each other pass a ray back and\n"
+                          "forth forever: beyond this many it is lost, and the deep end of such a tunnel is black.\n"
+                          "Higher shows the tunnel deeper; it costs only where rays go that deep.");
+    }
     ImGui::Combo("Emissive light", &settings.emissiveSampling,
                  "Bounces only (old)\0Light sampling only\0Both, weighted (MIS)\0");
     ImGui::TextDisabled("how light from glowing surfaces is found; compare with Accumulate off");

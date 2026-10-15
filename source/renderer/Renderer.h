@@ -107,6 +107,7 @@ struct SceneUniforms {
     float fogTime;                   // seconds of fog drift (Material::fogDrift); 0 while no fog drifts
     uint32_t lightCandidates;        // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
     uint32_t cacheFog;               // 1 = scatter points in fog have radiance cache cells too
+    uint32_t maxPortalCrossings;     // portals a ray may go through; at least 1
 };
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
@@ -471,6 +472,9 @@ struct RenderSettings {
     // or evenly over its area (then a large panel close by gets most samples in its far parts)
     bool emissiveSolidAngle = true;
     int maxBounces = 8;  // passes through glass don't count (see glassPasses); Russian roulette ends matte paths early
+    // Portals one ray may go through: two ends facing each other would pass a ray back and forth forever. Beyond this
+    // it is lost (no light: the deep end of such a tunnel is black). Costs only where rays go that deep.
+    int maxPortalCrossings = 8;
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
     bool normalMapFiltering = true;  // Toksvig: distant bumpy surfaces keep their blurrier reflection

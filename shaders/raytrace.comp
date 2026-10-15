@@ -133,6 +133,7 @@ layout(binding = 3) uniform SceneUniforms {
     float fogTime;                  // seconds of fog drift (Material.fogDrift); 0 while no fog drifts
     uint lightCandidates;           // glowing triangles picked by power to keep one of (sampleEmissiveLight); 1 = tree
     uint cacheFog;                  // 1 = scatter points in fog have cache cells too (see "Radiance cache")
+    uint maxPortalCrossings;        // portals a ray may go through (see "Portals"); at least 1
 } scene;
 
 // (0 in a pipeline without the feature, so its code drops out)
@@ -1183,12 +1184,13 @@ float varyingTransmittance(vec3 origin, vec3 direction, float end, uvec2 media, 
 // the whole bent ray is the sum of its parts.
 // They are not in the TLAS: a ray is traced up to the nearest opening it crosses (tested here; there are only a
 // few), and if it hits nothing before that, on from the partner. Two portals facing each other (or one that sees
-// itself through the other) would send a ray back and forth forever: after MAX_PORTAL_CROSSINGS crossings it is
-// lost, and no light comes back along it (black).
+// itself through the other) would send a ray back and forth forever: after scene.maxPortalCrossings crossings
+// ("Max portal crossings") it is lost, and no light comes back along it (black).
 // Rays that must go in a straight line to a point (shadow rays, ReSTIR's visibility and reconnections) count an
 // opening as blocking. The sun and the punctual lights also shine through portals: light sampling aims at their
 // images, where they appear through each end (portalLightImage). Other light through a portal (glowing surfaces,
-// the sky, the sun after two portals or more) is only found by bounce rays that happen to go through.
+// the sky, the sun after two portals or more) is found by bounce rays, part of which aim through the openings
+// (PORTAL_BOUNCE_SHARE).
 struct Portal {
     vec3 center;
     float halfWidth;
@@ -1200,7 +1202,6 @@ struct Portal {
 };
 layout(binding = 31, scalar) readonly buffer Portals { Portal portals[]; };
 const uint PORTAL_ELLIPSE = 1;
-const uint MAX_PORTAL_CROSSINGS = 8;
 // A ray stops this far before an opening and starts this far after its partner: geometry in the opening's plane
 // is left out, so a portal set flush into a wall shows what is behind its partner, not the wall.
 const float PORTAL_GAP = 1e-3;
@@ -1267,7 +1268,7 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
     // shadow rays to a light inside crossed no fog surface.)
     float passedT = -1.0;
     uvec2 mediaBefore = media;
-    for (uint part = 0; part <= MAX_PORTAL_CROSSINGS + MAX_VOLUME_CROSSINGS; part++) {
+    for (uint part = 0; part <= scene.maxPortalCrossings + MAX_VOLUME_CROSSINGS; part++) {
         float portalT = RAY_FAR;
         int portal = portalCount() > 0 ? nearestPortal(origin, direction, RAY_FAR, skip, portalT) : -1;
         float tMax = portal >= 0 ? max(portalT - PORTAL_GAP, tMin) : RAY_FAR;
@@ -1358,6 +1359,9 @@ bool intersectClosest(inout vec3 origin, inout vec3 direction, inout uint seed, 
         }
         if (portal < 0) {
             return false;
+        }
+        if (hit.crossings >= scene.maxPortalCrossings) {
+            break;  // lost (see "Portals")
         }
         hit.travelled += portalT;
         hit.crossings++;
@@ -2054,9 +2058,9 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
         uint material = mediumMaterial(firstMedium(rest));
         fogInside += fogVaries(material) ? 0.0 : materials[material].fogDensity;
     }
-    // (One part without portals. Cache update paths have no light images: a second part made them take 168 registers
-    // instead of 128)
-    [[dont_unroll]] for (uint part = 0; part < (CACHE_UPDATE_PASS != 0 || !FEATURE_PORTALS ? 1u : 2u); part++) {
+    // (One part without portals. Cache update paths too have light images: once they made them take 168 registers
+    // instead of 128, no more since; the cache pass is ~0.1 ms slower for them in Sponza, which has no portals)
+    [[dont_unroll]] for (uint part = 0; part < (!FEATURE_PORTALS ? 1u : 2u); part++) {
         // Up to the opening it must go through (part 0 of a light image), or to the end; any other opening blocks
         float portalT = maxDistance;
         int portal = portalCount() > 0 ? nearestPortal(origin, direction, maxDistance, skip, portalT) : -1;
@@ -2801,6 +2805,85 @@ LightSample portalLightImage(uint end, uint which, vec3 position, inout uint see
     return s;
 }
 
+// Bounce rays through portals. Light sampling finds only the sun's and the punctual lights' images through a portal;
+// the sky, glowing surfaces and lit rooms behind one were found only by bounce rays that happened to go through: a
+// small window into a dark room lit it with fireflies. So at a rough surface that sees openings, PORTAL_BOUNCE_SHARE
+// of the bounce rays aim through one (an end picked by about the solid angle it covers, a point on it picked evenly),
+// the others are picked by the surface's reflection as usual. Either way the ray's pdf is the mix of both
+// strategies' (one-sample MIS, Veach 1997), so the result stays unbiased, and its weight is at most 1 / (1 -
+// PORTAL_BOUNCE_SHARE) times the usual one: no new fireflies. The aim doesn't know what is in the way: an opening
+// behind a wall, or in another room, costs its share of the bounce rays for nothing.
+const float PORTAL_BOUNCE_SHARE = 0.5;
+
+float portalArea(uint end) {
+    return portals[end].halfWidth * portals[end].halfHeight * (portals[end].shape == PORTAL_ELLIPSE ? PI : 4.0);
+}
+
+// How much an end is worth aiming at from a surface: about the solid angle it covers (its center's), 0 where it is
+// all behind the surface or the surface is in its plane
+float portalAimWeight(uint end, vec3 position, vec3 normal) {
+    vec3 toCenter = portals[end].center - position;
+    float distanceSquared = dot(toCenter, toCenter);
+    float facing = abs(dot(toCenter, portals[end].normal));  // cos * distance
+    vec3 across = portals[end].right * portals[end].halfWidth;
+    vec3 up = cross(portals[end].normal, portals[end].right) * portals[end].halfHeight;
+    float above = max(max(dot(toCenter + across + up, normal), dot(toCenter + across - up, normal)),
+                      max(dot(toCenter - across + up, normal), dot(toCenter - across - up, normal)));
+    if (facing < 1e-4 || above <= 0.0) {
+        return 0.0;
+    }
+    return min(portalArea(end) * facing / (distanceSquared * sqrt(distanceSquared)), 2.0 * PI);
+}
+
+float portalAimTotal(vec3 position, vec3 normal) {
+    float total = 0.0;
+    for (uint i = 0; i < portalCount(); i++) {
+        total += portalAimWeight(i, position, normal);
+    }
+    return total;
+}
+
+// A direction through an opening (portalAimTotal > 0): random.x picks the end, yz the point on it
+vec3 samplePortalDirection(vec3 position, vec3 normal, vec3 random) {
+    float pick = random.x * portalAimTotal(position, normal);
+    uint end = 0;
+    for (uint i = 0; i < portalCount(); i++) {
+        float weight = portalAimWeight(i, position, normal);
+        if (weight > 0.0) {
+            end = i;  // (the last one with a weight, should rounding leave pick above them all)
+            if (pick < weight) {
+                break;
+            }
+            pick -= weight;
+        }
+    }
+    vec2 p = 2.0 * random.yz - 1.0;
+    if (portals[end].shape == PORTAL_ELLIPSE) {
+        float angle = 2.0 * PI * random.z;
+        p = sqrt(random.y) * vec2(cos(angle), sin(angle));
+    }
+    vec3 up = cross(portals[end].normal, portals[end].right);
+    vec3 point = portals[end].center + portals[end].right * (portals[end].halfWidth * p.x)
+                 + up * (portals[end].halfHeight * p.y);
+    return normalize(point - position);
+}
+
+// How likely samplePortalDirection is to pick a direction, per solid angle: over every end whose opening the line
+// crosses (whichever comes first: the pick doesn't look)
+float portalDirectionPdf(vec3 position, vec3 normal, vec3 direction) {
+    float pdf = 0.0;
+    float total = 0.0;
+    for (uint i = 0; i < portalCount(); i++) {
+        float weight = portalAimWeight(i, position, normal);
+        float t;
+        if (weight > 0.0 && portalOpeningHit(i, position, direction, RAY_FAR, t)) {
+            pdf += weight * t * t / (portalArea(i) * abs(dot(direction, portals[i].normal)));
+        }
+        total += weight;
+    }
+    return total > 0.0 ? pdf / total : 0.0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // ReSTIR DI (Bitterli et al. 2020; its shortcuts and measurements: LIMITATIONS.md)
 //
@@ -3313,7 +3396,15 @@ Reservoir restirCandidates(Hit hit, vec3 v, inout uint seed) {
     return r;
 }
 
-// The image pass's light sample at a ReSTIR surface: the reservoir's, its light times W
+// The skylight at a ReSTIR surface: this share from the reservoir, the rest by the usual light sampling (the sky's
+// shadow ray and the bounce ray's MIS share). Both are unbiased, so is their mix. With the reservoir alone, a pixel
+// in light that comes through openings (Sponza's side aisle) was either fully lit or black, with one shadow ray
+// deciding, and DLSS RR takes much of such light for noise: the aisle 6% too dark on DLSS's first frame, still 3%
+// after 64. Half and half: 3.4% and 1.4%, the error and the cost (one shadow ray) about the same. 75/25 was no better.
+const float RESTIR_SKY_SHARE = 0.5;
+
+// The image pass's light sample at a ReSTIR surface: the reservoir's, its light times W (the sky's times
+// RESTIR_SKY_SHARE)
 LightSample restirReservoirSample(ivec2 pixel, vec3 surfacePoint) {
     Reservoir r = reservoirs[restirIndex(pixel, false)];
     if (!(r.W > 0.0)) {
@@ -3321,7 +3412,7 @@ LightSample restirReservoirSample(ivec2 pixel, vec3 surfacePoint) {
     }
     float toSolidAngle;
     LightSample s = restirLightSample(r.light, r.point, surfacePoint, toSolidAngle);
-    s.light *= r.W;
+    s.light *= r.W * ((r.light >> 30) == LIGHT_KIND_SKY ? RESTIR_SKY_SHARE : 1.0);
     return s;
 }
 
@@ -3856,9 +3947,10 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // shadow ray already counted the light behind the glass (see above), so glass doesn't.
     bool glassLit = false;  // the last light sampling was at rough glass (no reflection yet)
     // Portals gone through since the last reflection. Light sampling reaches the sun and the punctual lights through
-    // one of them (light images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing surface, the
-    // sky, the sun after two) counts fully, and isn't that surface's direct light for the radiance cache either
-    // (paths that end in the cache rely on shadow rays for that).
+    // one of them (light images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing
+    // surface, the sky, the sun after two) counts fully (the bounce rays aimed through openings are part of the bounce
+    // sampling, see PORTAL_BOUNCE_SHARE), and isn't that surface's direct light for the radiance cache either (paths
+    // that end in the cache rely on shadow rays for that).
     uint portalCrossings = 0;
     float reflectionPdf = 0.0;       // bouncePdf of the last reflection (glass passes don't change it)
     // Where the last reflection was: the light tree's chance of picking a glowing triangle depends on the point
@@ -3866,8 +3958,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     vec3 reflectionNormal = vec3(0.0, 0.0, 1.0);
     bool reflectionTwoSided = false;
     // The last reflection was the first surface with ReSTIR DI: its reservoir counted all the light that light
-    // sampling can find (glowing triangles, punctual lights, the sampled sky), behind glass or not. Its bounce ray
-    // then counts only what light sampling can't pick.
+    // sampling can find (glowing triangles, punctual lights, its share of the sampled sky), behind glass or not. Its
+    // bounce ray then counts only what light sampling can't pick, and the sky's MIS share of the rest.
     bool restirReflection = false;
     // The first bounce was picked and traced by the RESTIR_PASS (its BRDF candidate, see BounceHit)
     bool sharedBounce = false;
@@ -3988,13 +4080,14 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             bool lightSampled = reflectedOnce || (glassLit && !throughGlass);  // where this ray started, or before
             if (scene.environmentSampling == 0 || !lightSampled || portalCrossings > 0) {
                 ADD_LIGHT(skyLight);  // nothing else finds it (the camera sees the sky, maybe through glass)
-            } else if (!throughSolidGlass && !restirReflection) {
+            } else if (!throughSolidGlass) {
                 // The bounce-sampling share of the last surface's direct skylight, also through thin panes. Unlike
                 // the sun's, it goes into that surface's cache cell as well: a path ending there takes it from the
                 // cache (see the shadow ray below). A smooth sky is mostly found this way, so its light comes
                 // averaged; a bright spot (a map's sun) is almost entirely the shadow rays' share, so its shadows
-                // stay sharp.
-                ADD_LIGHT(skyLight * misWeight(reflectionPdf, environmentPdf(direction)));
+                // stay sharp. After a ReSTIR surface: of the part its reservoir leaves (RESTIR_SKY_SHARE).
+                float share = restirReflection ? 1.0 - RESTIR_SKY_SHARE : 1.0;
+                ADD_LIGHT(skyLight * misWeight(reflectionPdf, environmentPdf(direction)) * share);
             }
             // The sun's disc: always visible to the camera; for bounce rays, the MIS share of the bounce method
             if (scene.sunOn != 0 && dot(direction, scene.sunDirection.xyz) >= scene.sunDirection.w) {
@@ -4003,10 +4096,6 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 bool sunImaged = portalCrossings == 1 && scene.shadowsEnabled != 0;
                 if (!lightSampled || (portalCrossings > 0 && !sunImaged)) {
                     ADD_LIGHT(throughput * sunRadiance);  // the camera sees it (maybe through glass), or portals
-                } else if (sunImaged && CACHE_UPDATE_PASS != 0) {
-                    // Update paths sample no light images: the bounce counts it fully, as the last surface's direct
-                    // light (which image paths ending in its cell get from the image)
-                    ADD_LIGHT_EXCEPT(throughput * sunRadiance, previousVertex);
                 } else if (!throughGlass && scene.sunMis != 0) {
                     // the bounce-sampling share of the last surface's direct sunlight
                     ADD_LIGHT_EXCEPT(throughput * sunRadiance * misWeight(bouncePdf, scene.sunPdf), previousVertex);
@@ -4170,6 +4259,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 && intersection.crossings == 0) {  // through portals no, in mirrors yes (see "Mirrors and ReSTIR")
             giState = 1;
         }
+        // Some of the bounce rays aim through portals (see PORTAL_BOUNCE_SHARE): at rough opaque surfaces that see an
+        // opening, and go on (not ending in the cache)
+        float portalShare = CACHE_UPDATE_PASS == 0 && FEATURE_PORTALS && portalCount() > 0 && !isFog(hit)
+                            && !endInCache && !finalRay && hit.transmission <= 0.0 && hit.diffuseTransmission <= 0.0
+                            && hit.roughness >= CACHE_ROUGHNESS && portalAimTotal(hit.position, hit.normal) > 0.0
+                            ? PORTAL_BOUNCE_SHARE : 0.0;
         if ((!leavingGlass || hit.lightThrough) && !finalRay) {
             // Direct light: one shadow ray per kind of light (see LightSample). Slot 0: the sun, 1: the sky, 2: the
             // glowing triangles, 3 and up: the punctual lights, then the sun's and the punctual lights' images through
@@ -4182,7 +4277,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // (none at a scatter point in the fog: the stretches before take the lamps' light, see fogLampLight)
             uint lightSlots = (restirVertex && scene.restirPunctualCandidates > 0) || (isFog(hit) && CACHE_UPDATE_PASS == 0)
                               ? 3 : 3 + punctualLightSamples();
-            uint imageSlots = CACHE_UPDATE_PASS != 0 ? 0 : portalCount() * (1 + punctualLightSamples());
+            uint imageSlots = portalCount() * (1 + punctualLightSamples());
             [[dont_unroll]] for (uint slot = 0; slot < lightSlots + imageSlots; slot++) {
                 LightSample s = noLightSample();
                 int imageEnd = -1;  // the portal end this slot's light is seen through
@@ -4203,13 +4298,15 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 } else if (slot == 1) {
                     // A direction picked by the sky's brightness. Behind solid glass no bounce ray counts it (as for
                     // the sun); behind thin panes they do. Ending in the cache, the cache has the bounce rays' share
-                    // (see the miss above), so this stays the MIS share.
-                    if (scene.environmentSampling != 0 && !restirVertex) {
+                    // (see the miss above), so this stays the MIS share. At a ReSTIR surface, of the part its
+                    // reservoir leaves (RESTIR_SKY_SHARE).
+                    if (scene.environmentSampling != 0) {
                         float skyPdf;
                         s.direction = sampleEnvironment(pathSample(bounce, SAMPLE_SKY, seed), skyPdf);
                         if (skyPdf > 0.0) {
                             s.distance = SKY_DISTANCE;
-                            s.light = environmentLight(s.direction) / skyPdf;
+                            s.light = environmentLight(s.direction) / skyPdf
+                                      * (restirVertex ? 1.0 - RESTIR_SKY_SHARE : 1.0);
                             s.pdf = skyPdf;
                             s.mis = MIS_UNLESS_SOLID;
                             s.shadowed = true;
@@ -4270,7 +4367,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     }
                 }
                 // Behind glass, bounce rays don't find the light (they are bent), so the shadow ray counts it fully.
-                // Ending in the cache, no bounce ray looks for it either.
+                // Ending in the cache, no bounce ray looks for it either. Bounce rays partly aimed through portals:
+                // their pdf the mix (here, past the shadow ray: most lights it reaches only after it got through).
+                if (portalShare > 0.0 && s.mis != MIS_NONE && any(greaterThan(transmittance, vec3(0.0)))) {
+                    pdfBounce = mix(pdfBounce, portalDirectionPdf(hit.position, hit.normal, s.direction), portalShare);
+                }
                 float lightWeight = 1.0;
                 if (s.mis == MIS_UNLESS_GLASS && !crossedGlass && !endInCache) {
                     lightWeight = misWeight(s.pdf, pdfBounce);
@@ -4309,7 +4410,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 break;
             }
             transmitted = true;  // in or out, the path stays "through glass" for the light rules above
-        } else if (restirVertex && scene.restirBrdfCandidates > 0 && scene.accumulate == 0 && FOG == 0) {
+        } else if (restirVertex && scene.restirBrdfCandidates > 0 && scene.accumulate == 0 && FOG == 0
+                   && portalShare == 0.0) {
             // Picked and traced already: the ReSTIR pass's BRDF candidate (same sampling, its own random numbers).
             // Not when accumulating: the bounce then shares its direction with the light choice, which changes how
             // the noise averages out over frames (Sponza: the same single-frame error, but 29% more after 8 frames,
@@ -4328,8 +4430,31 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         } else {
             // Indirect light: continue the path in a direction picked by the surface's reflection (mostly where
             // it reflects the most light), or through it. The throughput is multiplied by BRDF * cos / pdf.
-            if (!sampleBrdf(hit, v, bounceRandom.xyz, l, weight, bouncePdf, lobeRoughness, transmitted, specularLobe)) {
-                break;
+            // Or through a portal (portalShare), the pdf then the mix of both (see PORTAL_BOUNCE_SHARE).
+            if (portalShare > 0.0 && randomFloat(seed) < portalShare) {
+                vec3 aimed = samplePortalDirection(hit.position, hit.normal,
+                                                   vec3(randomFloat(seed), randomFloat(seed), randomFloat(seed)));
+                l = toLocal(frame, aimed);
+                if (l.z <= 0.0) {
+                    break;  // behind the surface (part of the opening is): nothing is reflected that way
+                }
+                float brdfPdf;
+                vec3 brdf = evaluateBrdfWorld(hit, hit.normal, -direction, aimed, brdfPdf);
+                bouncePdf = mix(brdfPdf, portalDirectionPdf(hit.position, hit.normal, aimed), portalShare);
+                weight = brdf * l.z / bouncePdf;
+                lobeRoughness = 1.0;  // spread out as a diffuse bounce
+                transmitted = false;
+                specularLobe = false;
+            } else {
+                if (!sampleBrdf(hit, v, bounceRandom.xyz, l, weight, bouncePdf, lobeRoughness, transmitted, specularLobe)) {
+                    break;
+                }
+                if (portalShare > 0.0) {
+                    float mixed = mix(bouncePdf, portalDirectionPdf(hit.position, hit.normal, toWorld(frame, l)),
+                                      portalShare);
+                    weight *= bouncePdf / mixed;
+                    bouncePdf = mixed;
+                }
             }
         }
         pathRoughness = max(pathRoughness, lobeRoughness);

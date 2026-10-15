@@ -974,6 +974,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.fogTime = fogDrifts ? fogTime : 0.0f;
     uniforms.samplesPerPixel = static_cast<uint32_t>(std::max(settings.samplesPerPixel, 1));
     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
+    uniforms.maxPortalCrossings = static_cast<uint32_t>(std::max(settings.maxPortalCrossings, 1));
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
     uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
@@ -1054,6 +1055,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
             std::memcmp(&uniforms.sunDirection, &previousUniforms.sunDirection,
                         offsetof(SceneUniforms, samplesPerPixel) - offsetof(SceneUniforms, sunDirection)) != 0 ||
             uniforms.maxBounces != previousUniforms.maxBounces || uniforms.shadowsEnabled != previousUniforms.shadowsEnabled ||
+            uniforms.maxPortalCrossings != previousUniforms.maxPortalCrossings ||
             uniforms.emissiveSampling != previousUniforms.emissiveSampling ||
             uniforms.blurCaustics != previousUniforms.blurCaustics ||
             uniforms.cacheCellScale != previousUniforms.cacheCellScale || uniforms.cacheFog != previousUniforms.cacheFog;
