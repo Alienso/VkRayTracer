@@ -66,6 +66,8 @@ add_executable(vulkanDemo main.cpp
         source/renderer/Dlss.cpp source/renderer/Exposure.cpp source/renderer/Capture.cpp source/renderer/Noise.cpp
         source/renderer/RadianceCache.cpp source/renderer/BlueNoise.cpp source/renderer/Volumes.cpp source/renderer/ImGuiInit.cpp
         source/renderer/VulkanExtensions.cpp source/renderer/VulkanExtensions.h source/renderer/VulkanInitHelper.cpp
+        source/renderer/GpuContext.cpp source/renderer/GpuContext.h
+        source/renderer/GpuScene.h source/renderer/AccelerationStructures.cpp source/renderer/RendererTypes.h
         source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h
         source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
         include/cgltf/cgltf.h)

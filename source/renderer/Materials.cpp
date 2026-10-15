@@ -23,7 +23,7 @@ static VkSamplerAddressMode toVulkan(TextureWrap wrap) {
 }
 
 // Textures with the same filter and wrap modes share a sampler.
-VkSampler Renderer::getSampler(const TextureData& texture) {
+VkSampler GpuScene::getSampler(const TextureData& texture) {
     uint32_t key = (texture.nearest ? 1u : 0u) | (static_cast<uint32_t>(texture.wrapU) << 1) | (static_cast<uint32_t>(texture.wrapV) << 3);
     auto it = gpuAssets.samplers.find(key);
     if (it != gpuAssets.samplers.end()) {
@@ -46,7 +46,7 @@ VkSampler Renderer::getSampler(const TextureData& texture) {
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
     VkSampler sampler;
-    if (vkCreateSampler(device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) {
+    if (vkCreateSampler(gpu.device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) {
         throw std::runtime_error("failed to create texture sampler!");
     }
     gpuAssets.samplers[key] = sampler;
@@ -79,7 +79,7 @@ static size_t levelSize(const TextureData& texture, uint32_t level) {
 
 // Matches the GPU textures to the store's, by id: uploaded ones are kept (their index may change), new ones are
 // uploaded, and the ones whose model was unloaded are released. The caller rewrites the descriptor set.
-void Renderer::syncTextures() {
+void GpuScene::syncTextures() {
     const std::vector<uint64_t>& ids = assets.textureIds();
     if (ids.size() > maxTextures) {
         throw std::runtime_error("too many textures for the descriptor array!");
@@ -117,32 +117,32 @@ void Renderer::syncTextures() {
 
 // Creates the image, copies the pixels (with their mip levels, made by the loader) and frees them on the CPU. Returns
 // the size in bytes.
-VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
+VkDeviceSize GpuScene::uploadTexture(TextureData& texture, GpuTexture& uploaded) {
     {
         VkFormat format = toVulkan(texture);
-        createImage(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    gpu.image, gpu.memory, gpu.view, texture.mipLevels);
-        gpu.sampler = getSampler(texture);
+        gpu.createImage(texture.width, texture.height, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        uploaded.image, uploaded.memory, uploaded.view, texture.mipLevels);
+        uploaded.sampler = getSampler(texture);
 
         VkDeviceSize size = texture.pixels.size();
         VkBuffer stagingBuffer;
         VmaAllocation stagingMemory;
-        createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     stagingBuffer, stagingMemory);
+        gpu.createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         stagingBuffer, stagingMemory);
         void* mapped;
-        vmaMapMemory(allocator, stagingMemory, &mapped);
+        vmaMapMemory(gpu.allocator, stagingMemory, &mapped);
         std::memcpy(mapped, texture.pixels.data(), size);
-        vmaUnmapMemory(allocator, stagingMemory);
+        vmaUnmapMemory(gpu.allocator, stagingMemory);
 
-        immediateSubmit([&](VkCommandBuffer cmd) {
+        gpu.immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = gpu.image;
+            barrier.image = uploaded.image;
             barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, texture.mipLevels, 0, 1};
             barrier.srcAccessMask = 0;
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -157,7 +157,7 @@ VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
                 regions[level].imageExtent = {std::max(texture.width >> level, 1u), std::max(texture.height >> level, 1u), 1};
                 offset += levelSize(texture, level);
             }
-            vkCmdCopyBufferToImage(cmd, stagingBuffer, gpu.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            vkCmdCopyBufferToImage(cmd, stagingBuffer, uploaded.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                    static_cast<uint32_t>(regions.size()), regions.data());
 
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -168,8 +168,8 @@ VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
                                  0, 0, nullptr, 0, nullptr, 1, &barrier);
         });
 
-        vkDestroyBuffer(device, stagingBuffer, nullptr);
-        vmaFreeMemory(allocator, stagingMemory);
+        vkDestroyBuffer(gpu.device, stagingBuffer, nullptr);
+        vmaFreeMemory(gpu.allocator, stagingMemory);
 
         texture.pixels.clear();
         texture.pixels.shrink_to_fit();  // the GPU has its copy now
@@ -177,22 +177,22 @@ VkDeviceSize Renderer::uploadTexture(TextureData& texture, GpuTexture& gpu) {
     }
 }
 
-void Renderer::destroyTextures() {
+void GpuScene::destroyTextures() {
     for (GpuTexture& texture : gpuAssets.textures) {
-        vkDestroyImageView(device, texture.view, nullptr);
-        vkDestroyImage(device, texture.image, nullptr);
-        vmaFreeMemory(allocator, texture.memory);
+        vkDestroyImageView(gpu.device, texture.view, nullptr);
+        vkDestroyImage(gpu.device, texture.image, nullptr);
+        vmaFreeMemory(gpu.allocator, texture.memory);
     }
     gpuAssets.textures.clear();
     gpuAssets.textureIds.clear();
     gpuAssets.textureSizes.clear();
     for (auto& [key, sampler] : gpuAssets.samplers) {
-        vkDestroySampler(device, sampler, nullptr);
+        vkDestroySampler(gpu.device, sampler, nullptr);
     }
     gpuAssets.samplers.clear();
 }
 
-std::vector<GpuMaterial> Renderer::packMaterials() const {
+std::vector<GpuMaterial> GpuScene::packMaterials() const {
     std::vector<GpuMaterial> packed;
     packed.reserve(assets.materials().size());
     for (const SceneMaterial& sceneMaterial : assets.materials()) {
@@ -252,25 +252,25 @@ std::vector<GpuMaterial> Renderer::packMaterials() const {
 }
 
 // Recreated whenever a model is loaded (the material count changes). TRANSFER_DST: edits are written into it later.
-void Renderer::createMaterialBuffer() {
+void GpuScene::createMaterialBuffer() {
     std::vector<GpuMaterial> packed = packMaterials();
-    createDeviceLocalBuffer(packed.data(), sizeof(GpuMaterial) * packed.size(),
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                            gpuAssets.materialBuffer, gpuAssets.materialBufferMemory);
+    gpu.createDeviceLocalBuffer(packed.data(), sizeof(GpuMaterial) * packed.size(),
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                gpuAssets.materialBuffer, gpuAssets.materialBufferMemory);
     gpuAssets.materialBufferCreated = true;
     gpuAssets.materialsDirty = false;
 }
 
-void Renderer::destroyMaterialBuffer() {
-    vkDestroyBuffer(device, gpuAssets.materialBuffer, nullptr);
-    vmaFreeMemory(allocator, gpuAssets.materialBufferMemory);
+void GpuScene::destroyMaterialBuffer() {
+    vkDestroyBuffer(gpu.device, gpuAssets.materialBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, gpuAssets.materialBufferMemory);
     gpuAssets.materialBufferCreated = false;
 }
 
 // A material was edited in the UI: copy all materials into the buffer, inside this frame's command buffer
 // (like the uniforms), so editing never has to wait for the GPU.
-void Renderer::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
-    cacheClearPending = true;  // the cached light came from the old materials
+void GpuScene::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
+    changes.clearCache = true;  // the cached light came from the old materials
     std::vector<GpuMaterial> packed = packMaterials();
     VkDeviceSize size = sizeof(GpuMaterial) * packed.size();
 
@@ -301,7 +301,7 @@ void Renderer::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
                          0, 0, nullptr, 1, &barrier, 0, nullptr);
 
     gpuAssets.materialsDirty = false;
-    resetAccumulation = true;
+    changes.resetAccumulation = true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -375,11 +375,11 @@ void Renderer::createSpecularAlbedoTable() {
         }
     }
 
-    createDeviceLocalBuffer(table.data(), sizeof(glm::vec2) * table.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            specularAlbedoBuffer, specularAlbedoMemory);
+    gpu.createDeviceLocalBuffer(table.data(), sizeof(glm::vec2) * table.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                specularAlbedoBuffer, specularAlbedoMemory);
 }
 
 void Renderer::destroySpecularAlbedoTable() {
-    vkDestroyBuffer(device, specularAlbedoBuffer, nullptr);
-    vmaFreeMemory(allocator, specularAlbedoMemory);
+    vkDestroyBuffer(gpu.device, specularAlbedoBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, specularAlbedoMemory);
 }

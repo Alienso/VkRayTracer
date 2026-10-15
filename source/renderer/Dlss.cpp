@@ -263,9 +263,9 @@ void Renderer::addStreamlineDeviceRequirements(std::vector<const char*>& extensi
         return;
     }
     uint32_t count = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+    vkEnumerateDeviceExtensionProperties(gpu.physicalDevice, nullptr, &count, nullptr);
     std::vector<VkExtensionProperties> available(count);
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, available.data());
+    vkEnumerateDeviceExtensionProperties(gpu.physicalDevice, nullptr, &count, available.data());
     auto has = [&](const std::vector<const char*>& list, const std::string& name) {
         return std::any_of(list.begin(), list.end(), [&](const char* e) { return name == e; });
     };
@@ -297,17 +297,17 @@ void Renderer::addStreamlineDeviceRequirements(std::vector<const char*>& extensi
 }
 
 // After vkCreateDevice: hand the device to Streamline and ask whether DLSS RR runs on it.
-void Renderer::connectStreamline(uint32_t graphicsQueueFamily) {
+void Renderer::connectStreamline() {
     if (!streamlineInitialized) {
         return;
     }
     sl::VulkanInfo info;
-    info.device = device;
-    info.instance = instance;
-    info.physicalDevice = physicalDevice;
-    info.graphicsQueueFamily = graphicsQueueFamily;
+    info.device = gpu.device;
+    info.instance = gpu.instance;
+    info.physicalDevice = gpu.physicalDevice;
+    info.graphicsQueueFamily = gpu.graphicsQueueFamily;
     info.graphicsQueueIndex = 1;  // Streamline's own queues (if any) would start after our queue 0
-    info.computeQueueFamily = graphicsQueueFamily;
+    info.computeQueueFamily = gpu.graphicsQueueFamily;
     info.computeQueueIndex = 1;
     sl::Result result = sl_.setVulkanInfo(info);
     std::cout << "DLSS: slSetVulkanInfo -> " << resultName(result) << std::endl;
@@ -323,7 +323,7 @@ void Renderer::connectStreamline(uint32_t graphicsQueueFamily) {
     PresentationFunctions proxies;
     bool allFound = getDeviceProcAddr != nullptr;
     auto proxy = [&](auto& function, const char* name) {
-        auto address = allFound ? getDeviceProcAddr(device, name) : nullptr;
+        auto address = allFound ? getDeviceProcAddr(gpu.device, name) : nullptr;
         function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(address);
         allFound = allFound && address != nullptr;
     };
@@ -341,7 +341,7 @@ void Renderer::connectStreamline(uint32_t graphicsQueueFamily) {
     vkp = proxies;
 
     sl::AdapterInfo adapter;
-    adapter.vkPhysicalDevice = physicalDevice;
+    adapter.vkPhysicalDevice = gpu.physicalDevice;
     result = sl_.isFeatureSupported(sl::kFeatureDLSS_RR, adapter);
     std::cout << "DLSS: slIsFeatureSupported(DLSS RR) -> " << resultName(result) << std::endl;
     if (result != sl::Result::eOk) {
@@ -429,7 +429,7 @@ void Renderer::applyRenderMode() {
         settings.dlssModel = static_cast<int>(dlssCnnVersion ? DlssModel::TransformerE : DlssModel::TransformerF);
     }
     if (settings.dlssModel != activeDlssModel) {
-        vkp.deviceWaitIdle(device);
+        vkp.deviceWaitIdle(gpu.device);
         freeDlssResources();
         activeDlssModel = settings.dlssModel;
         dlssReset = true;
@@ -437,7 +437,7 @@ void Renderer::applyRenderMode() {
     if (settings.renderMode == activeRenderMode) {
         return;
     }
-    vkp.deviceWaitIdle(device);
+    vkp.deviceWaitIdle(gpu.device);
     freeDlssResources();
     activeRenderMode = settings.renderMode;
     recreateRenderImages();
@@ -527,9 +527,9 @@ void Renderer::recordDlss(VkCommandBuffer commandBuffer) {
     // them to SHADER_READ_ONLY_OPTIMAL while reading and back, hence the sampled usage.)
     const VkImageUsageFlags storage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     auto describe = [&](const RenderImage& image, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage) {
-        return describeImage(image.image, deviceMemoryOf(image.memory), image.view, extent, format, usage);
+        return describeImage(image.image, gpu.deviceMemoryOf(image.memory), image.view, extent, format, usage);
     };
-    sl::Resource color = describeImage(radianceImage, deviceMemoryOf(radianceImageMemory), radianceImageView,
+    sl::Resource color = describeImage(radianceImage, gpu.deviceMemoryOf(radianceImageMemory), radianceImageView,
                                        renderExtent, radianceFormat, storage);
     sl::Resource output = describe(dlssOutputImage, outputExtent, dlssOutputFormat, storage);
     sl::Resource depth = describe(linearDepthImage, renderExtent, linearDepthFormat, storage);

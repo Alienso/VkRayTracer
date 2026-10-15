@@ -21,16 +21,16 @@ std::vector<char> readFile(const std::string& filename);
 
 void Renderer::createRadianceCache() {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheKeyBuffer, cacheKeyMemory,
-                 VK_NULL_HANDLE, true);
-    createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 cacheAccumulatorBuffer, cacheAccumulatorMemory, VK_NULL_HANDLE, true);
-    createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheValueBuffer, cacheValueMemory,
-                 VK_NULL_HANDLE, true);
-    createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheAgeBuffer, cacheAgeMemory,
-                 VK_NULL_HANDLE, true);
-    createBuffer(sizeof(uint32_t), usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 cacheStatsBuffer, cacheStatsMemory);
+    gpu.createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheKeyBuffer, cacheKeyMemory,
+                     VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     cacheAccumulatorBuffer, cacheAccumulatorMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(glm::vec4) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheValueBuffer, cacheValueMemory,
+                     VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheAgeBuffer, cacheAgeMemory,
+                     VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(uint32_t), usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     cacheStatsBuffer, cacheStatsMemory);
     cacheClearPending = true;  // emptied by the first frame
 
     // The number of cells in use comes back to the CPU for the UI, like the exposure (one copy per frame in flight)
@@ -38,10 +38,10 @@ void Renderer::createRadianceCache() {
     cacheStatsReadbackMemories.resize(Configuration::maxFramesInFlight);
     cacheStatsReadbackMapped.resize(Configuration::maxFramesInFlight);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        createBuffer(sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     cacheStatsReadbackBuffers[i], cacheStatsReadbackMemories[i]);
-        vmaMapMemory(allocator, cacheStatsReadbackMemories[i], &cacheStatsReadbackMapped[i]);
+        gpu.createBuffer(sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         cacheStatsReadbackBuffers[i], cacheStatsReadbackMemories[i]);
+        vmaMapMemory(gpu.allocator, cacheStatsReadbackMemories[i], &cacheStatsReadbackMapped[i]);
         std::memset(cacheStatsReadbackMapped[i], 0, sizeof(uint32_t));
     }
 
@@ -54,7 +54,7 @@ void Renderer::createRadianceCache() {
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = 5;
     layoutInfo.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &cacheDescriptorSetLayout) != VK_SUCCESS) {
+    if (vkCreateDescriptorSetLayout(gpu.device, &layoutInfo, nullptr, &cacheDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache descriptor set layout!");
     }
     VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
@@ -63,7 +63,7 @@ void Renderer::createRadianceCache() {
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &cacheDescriptorPool) != VK_SUCCESS) {
+    if (vkCreateDescriptorPool(gpu.device, &poolInfo, nullptr, &cacheDescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache descriptor pool!");
     }
     VkDescriptorSetAllocateInfo allocInfo{};
@@ -71,7 +71,7 @@ void Renderer::createRadianceCache() {
     allocInfo.descriptorPool = cacheDescriptorPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &cacheDescriptorSetLayout;
-    if (vkAllocateDescriptorSets(device, &allocInfo, &cacheDescriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(gpu.device, &allocInfo, &cacheDescriptorSet) != VK_SUCCESS) {
         throw std::runtime_error("failed to allocate radiance cache descriptor set!");
     }
     VkBuffer buffers[5] = {cacheKeyBuffer, cacheAccumulatorBuffer, cacheValueBuffer, cacheAgeBuffer, cacheStatsBuffer};
@@ -86,7 +86,7 @@ void Renderer::createRadianceCache() {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufferInfos[i];
     }
-    vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+    vkUpdateDescriptorSets(gpu.device, 5, writes, 0, nullptr);
 
     VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CacheResolvePushConstants)};
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
@@ -95,10 +95,10 @@ void Renderer::createRadianceCache() {
     pipelineLayoutInfo.pSetLayouts = &cacheDescriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount = 1;
     pipelineLayoutInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &cachePipelineLayout) != VK_SUCCESS) {
+    if (vkCreatePipelineLayout(gpu.device, &pipelineLayoutInfo, nullptr, &cachePipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache pipeline layout!");
     }
-    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("cache_resolve.comp.spv")));
+    VkShaderModule shaderModule = gpu.createShaderModule(readFile(Configuration::shaderPath("cache_resolve.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -106,10 +106,10 @@ void Renderer::createRadianceCache() {
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
     pipelineInfo.layout = cachePipelineLayout;
-    if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &cachePipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(gpu.device, gpu.pipelineCache, 1, &pipelineInfo, nullptr, &cachePipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache pipeline!");
     }
-    vkDestroyShaderModule(device, shaderModule, nullptr);
+    vkDestroyShaderModule(gpu.device, shaderModule, nullptr);
 }
 
 // Recorded before the image paths are traced, after the barrier that waits for the previous frame's shaders.
@@ -182,20 +182,20 @@ void Renderer::recordRadianceCache(VkCommandBuffer commandBuffer) {
 }
 
 void Renderer::destroyRadianceCache() {
-    vkDestroyPipeline(device, cachePipeline, nullptr);
-    vkDestroyPipelineLayout(device, cachePipelineLayout, nullptr);
-    vkDestroyDescriptorPool(device, cacheDescriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, cacheDescriptorSetLayout, nullptr);
+    vkDestroyPipeline(gpu.device, cachePipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, cachePipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, cacheDescriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, cacheDescriptorSetLayout, nullptr);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        vmaUnmapMemory(allocator, cacheStatsReadbackMemories[i]);
-        vkDestroyBuffer(device, cacheStatsReadbackBuffers[i], nullptr);
-        vmaFreeMemory(allocator, cacheStatsReadbackMemories[i]);
+        vmaUnmapMemory(gpu.allocator, cacheStatsReadbackMemories[i]);
+        vkDestroyBuffer(gpu.device, cacheStatsReadbackBuffers[i], nullptr);
+        vmaFreeMemory(gpu.allocator, cacheStatsReadbackMemories[i]);
     }
     VkBuffer buffers[] = {cacheKeyBuffer, cacheAccumulatorBuffer, cacheValueBuffer, cacheAgeBuffer, cacheStatsBuffer};
     VmaAllocation memories[] = {cacheKeyMemory, cacheAccumulatorMemory, cacheValueMemory, cacheAgeMemory, cacheStatsMemory};
     for (int i = 0; i < 5; i++) {
-        vkDestroyBuffer(device, buffers[i], nullptr);
-        vmaFreeMemory(allocator, memories[i]);
+        vkDestroyBuffer(gpu.device, buffers[i], nullptr);
+        vmaFreeMemory(gpu.allocator, memories[i]);
     }
 }
 

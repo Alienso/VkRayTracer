@@ -33,404 +33,8 @@ static float halton(uint32_t index, uint32_t base) {
 }
 
 void Renderer::createUniformBuffer() {
-    createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, uniformBuffer, uniformBufferMemory);
-}
-
-// An empty acceleration structure of the given size, living inside a buffer we own. Filled by a build or a copy.
-AccelerationStructure Renderer::createAccelerationStructure(VkAccelerationStructureTypeKHR type, VkDeviceSize size,
-                                                            VmaPool pool, bool ownMemory) {
-    AccelerationStructure as;
-    createBuffer(size,
-                 VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, as.buffer, as.memory, pool, ownMemory);
-
-    VkAccelerationStructureCreateInfoKHR createInfo{};
-    createInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-    createInfo.buffer = as.buffer;
-    createInfo.size = size;
-    createInfo.type = type;
-    if (vkext::vkCreateAccelerationStructureKHR(device, &createInfo, nullptr, &as.handle) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create acceleration structure!");
-    }
-
-    VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
-    addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    addressInfo.accelerationStructure = as.handle;
-    as.address = vkext::vkGetAccelerationStructureDeviceAddressKHR(device, &addressInfo);
-    return as;
-}
-
-// Scratch memory is only used during a build. Returns its (aligned) device address.
-VkDeviceAddress Renderer::createScratchBuffer(VkDeviceSize size, VkBuffer& buffer, VmaAllocation& memory, VmaPool pool,
-                                              bool ownMemory) {
-    VkPhysicalDeviceAccelerationStructurePropertiesKHR asProperties{};
-    asProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
-    VkPhysicalDeviceProperties2 properties2{};
-    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    properties2.pNext = &asProperties;
-    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
-    VkDeviceSize alignment = asProperties.minAccelerationStructureScratchOffsetAlignment;
-
-    createBuffer(size + alignment,
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory, pool, ownMemory);
-    VkDeviceAddress address = getBufferDeviceAddress(buffer);
-    return (address + alignment - 1) / alignment * alignment;
-}
-
-void Renderer::destroyAccelerationStructure(AccelerationStructure& as) {
-    vkext::vkDestroyAccelerationStructureKHR(device, as.handle, nullptr);
-    vkDestroyBuffer(device, as.buffer, nullptr);
-    vmaFreeMemory(allocator, as.memory);
-    as = {};
-}
-
-// Bottom level: one per mesh, the triangles in the mesh's own coordinate system.
-//
-// The driver has to reserve memory for the worst case before it builds. After the build it knows the
-// real size, so we ask for it ("compacted size"), copy each BLAS into a buffer of exactly that size and
-// free the original. That usually saves a good part of the memory.
-//
-// A BLAS holds its own copy of the triangles, so it doesn't care where the mesh sits in the packed buffers: when the
-// asset store changes, the BLASes of meshes still there are kept, only the new meshes' are built.
-void Renderer::syncBottomLevelAccelerationStructures() {
-    const std::vector<uint64_t>& ids = assets.meshIds();
-    std::unordered_map<uint64_t, size_t> previous;
-    for (size_t i = 0; i < gpuAssets.meshIds.size(); i++) {
-        previous[gpuAssets.meshIds[i]] = i;
-    }
-    std::vector<bool> kept(gpuAssets.blases.size(), false);
-    std::vector<AccelerationStructure> blases(ids.size());
-    std::vector<VkDeviceSize> buildSizes(ids.size(), 0);
-    std::vector<VkDeviceSize> sizes(ids.size(), 0);
-    std::vector<uint32_t> toBuild;
-    for (size_t i = 0; i < ids.size(); i++) {
-        auto it = previous.find(ids[i]);
-        if (it != previous.end()) {
-            blases[i] = gpuAssets.blases[it->second];
-            buildSizes[i] = gpuAssets.blasBuildSizes[it->second];
-            sizes[i] = gpuAssets.blasSizes[it->second];
-            kept[it->second] = true;
-        } else {
-            toBuild.push_back(static_cast<uint32_t>(i));
-        }
-    }
-    for (size_t i = 0; i < kept.size(); i++) {
-        if (!kept[i]) {
-            releaseBlas(gpuAssets.blases[i]);
-        }
-    }
-    gpuAssets.blases = std::move(blases);
-    gpuAssets.meshIds = ids;
-    gpuAssets.blasBuildSizes = std::move(buildSizes);
-    gpuAssets.blasSizes = std::move(sizes);
-
-    createBottomLevelAccelerationStructures(toBuild);
-
-    gpuAssets.blasSizeBeforeCompaction = 0;
-    gpuAssets.blasSizeAfterCompaction = 0;
-    for (size_t i = 0; i < gpuAssets.blases.size(); i++) {
-        gpuAssets.blasSizeBeforeCompaction += gpuAssets.blasBuildSizes[i];
-        gpuAssets.blasSizeAfterCompaction += gpuAssets.blasSizes[i];
-    }
-}
-
-void Renderer::destroyBottomLevelAccelerationStructures() {
-    for (AccelerationStructure& blas : gpuAssets.blases) {
-        destroyAccelerationStructure(blas);
-    }
-    gpuAssets.blases.clear();
-    gpuAssets.meshIds.clear();
-    gpuAssets.blasBuildSizes.clear();
-    gpuAssets.blasSizes.clear();
-}
-
-// Builds the BLASes of these meshes (indices into meshInfos), into gpuAssets.blases at the same indices.
-//
-// In batches of at most blasBatchBytes of uncompacted structures: each batch is built, compacted and its uncompacted
-// structures freed before the next one starts. All at once, a big load would need every uncompacted structure next to
-// its compacted copy (Jungle Ruins: 729 MB next to 269 MB). Each batch waits for the GPU twice, so a load with many
-// batches takes a little longer.
-void Renderer::createBottomLevelAccelerationStructures(const std::vector<uint32_t>& meshes) {
-    size_t count = meshes.size();
-    if (count == 0) {
-        return;
-    }
-    const VkDeviceSize blasBatchBytes = 256ull << 20;
-    VkDeviceAddress vertexAddress = getBufferDeviceAddress(gpuAssets.vertexBuffer);
-    VkDeviceAddress indexAddress = getBufferDeviceAddress(gpuAssets.indexBuffer);
-
-    std::vector<VkAccelerationStructureGeometryKHR> geometries(count);
-    std::vector<VkAccelerationStructureBuildGeometryInfoKHR> buildInfos(count);
-    std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges(count);
-    VkDeviceSize maxScratchSize = 0;
-
-    // 1: describe every mesh, ask for sizes
-    for (size_t i = 0; i < count; i++) {
-        const MeshInfo& mesh = gpuAssets.meshInfos[meshes[i]];
-
-        VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
-        triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-        triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        triangles.vertexData.deviceAddress = vertexAddress + mesh.vertexOffset * sizeof(GpuVertex);  // this mesh's part
-        triangles.vertexStride = sizeof(GpuVertex);  // position is the first member, the rest is skipped
-        triangles.maxVertex = mesh.vertexCount - 1;    // highest vertex index used
-        triangles.indexType = VK_INDEX_TYPE_UINT32;
-        triangles.indexData.deviceAddress = indexAddress + mesh.indexOffset * sizeof(uint32_t);
-
-        geometries[i].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-        geometries[i].geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        geometries[i].geometry.triangles = triangles;
-        geometries[i].flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
-
-        buildInfos[i].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-        buildInfos[i].type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        buildInfos[i].flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                              VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
-        buildInfos[i].mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-        buildInfos[i].geometryCount = 1;
-        buildInfos[i].pGeometries = &geometries[i];
-
-        ranges[i].primitiveCount = mesh.indexCount / 3;
-
-        VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
-        sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-        vkext::vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                       &buildInfos[i], &ranges[i].primitiveCount, &sizeInfo);
-        maxScratchSize = std::max(maxScratchSize, sizeInfo.buildScratchSize);
-        gpuAssets.blasBuildSizes[meshes[i]] = sizeInfo.accelerationStructureSize;
-    }
-
-    // The build's short-lived memory (the uncompacted structures and the scratch buffer) comes from a pool of its own,
-    // destroyed at the end. Taken from the shared blocks, it would leave holes between the compacted structures and
-    // the textures once freed (Jungle Ruins: ~130 MB).
-    VkBufferCreateInfo typicalBuffer{};
-    typicalBuffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    typicalBuffer.size = 65536;
-    typicalBuffer.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    VmaAllocationCreateInfo typicalAllocation{};
-    typicalAllocation.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    VmaPoolCreateInfo poolInfo{};  // block size 0: VMA's (64 MB, see createAllocator), big ones get their own memory
-    VmaPool buildPool;
-    if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &typicalBuffer, &typicalAllocation, &poolInfo.memoryTypeIndex) !=
-        VK_SUCCESS || vmaCreatePool(allocator, &poolInfo, &buildPool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create the BLAS build memory pool!");
-    }
-
-    // The builds run one after another, so they can all share one scratch buffer.
-    VkBuffer scratchBuffer;
-    VmaAllocation scratchMemory;
-    VkDeviceAddress scratchAddress = createScratchBuffer(maxScratchSize, scratchBuffer, scratchMemory, buildPool);
-
-    VkQueryPoolCreateInfo queryPoolInfo{};
-    queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    queryPoolInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
-    queryPoolInfo.queryCount = static_cast<uint32_t>(count);
-    VkQueryPool queryPool;
-    if (vkCreateQueryPool(device, &queryPoolInfo, nullptr, &queryPool) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create acceleration structure query pool!");
-    }
-
-    for (size_t first = 0; first < count;) {
-        // This batch: [first, end), at least one mesh (a bigger one gets a batch of its own)
-        size_t end = first;
-        VkDeviceSize batchBytes = 0;
-        while (end < count && (end == first || batchBytes + gpuAssets.blasBuildSizes[meshes[end]] <= blasBatchBytes)) {
-            batchBytes += gpuAssets.blasBuildSizes[meshes[end]];
-            end++;
-        }
-        uint32_t batchCount = static_cast<uint32_t>(end - first);
-
-        // 2: create the (oversized) structures, build them, then ask for their compacted sizes
-        std::vector<AccelerationStructure> uncompacted(batchCount);
-        std::vector<VkAccelerationStructureKHR> handles(batchCount);
-        for (uint32_t b = 0; b < batchCount; b++) {
-            uncompacted[b] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-                                                         gpuAssets.blasBuildSizes[meshes[first + b]], buildPool);
-            handles[b] = uncompacted[b].handle;
-            buildInfos[first + b].dstAccelerationStructure = uncompacted[b].handle;
-        }
-        immediateSubmit([&](VkCommandBuffer cmd) {
-            vkCmdResetQueryPool(cmd, queryPool, static_cast<uint32_t>(first), batchCount);
-
-            // Between builds: the next build reuses the scratch memory, so the previous one must be done with it.
-            // After the last one this also makes the results visible to the size query.
-            VkMemoryBarrier barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-            barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-
-            for (size_t i = first; i < end; i++) {
-                buildInfos[i].scratchData.deviceAddress = scratchAddress;
-                const VkAccelerationStructureBuildRangeInfoKHR* pRange = &ranges[i];
-                vkext::vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfos[i], &pRange);
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                                     0, 1, &barrier, 0, nullptr, 0, nullptr);
-            }
-            vkext::vkCmdWriteAccelerationStructuresPropertiesKHR(cmd, batchCount, handles.data(),
-                                                                 VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
-                                                                 queryPool, static_cast<uint32_t>(first));
-        });
-
-        std::vector<VkDeviceSize> compactedSizes(batchCount);
-        vkGetQueryPoolResults(device, queryPool, static_cast<uint32_t>(first), batchCount,
-                              sizeof(VkDeviceSize) * batchCount, compactedSizes.data(), sizeof(VkDeviceSize),
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-
-        // 3: copy into right-sized structures, free the oversized ones
-        for (uint32_t b = 0; b < batchCount; b++) {
-            gpuAssets.blases[meshes[first + b]] = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-                                                                              compactedSizes[b]);
-            gpuAssets.blasSizes[meshes[first + b]] = compactedSizes[b];
-        }
-        immediateSubmit([&](VkCommandBuffer cmd) {
-            for (uint32_t b = 0; b < batchCount; b++) {
-                VkCopyAccelerationStructureInfoKHR copyInfo{};
-                copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
-                copyInfo.src = uncompacted[b].handle;
-                copyInfo.dst = gpuAssets.blases[meshes[first + b]].handle;
-                copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
-                vkext::vkCmdCopyAccelerationStructureKHR(cmd, &copyInfo);
-            }
-        });
-        for (AccelerationStructure& as : uncompacted) {
-            destroyAccelerationStructure(as);
-        }
-        first = end;
-    }
-
-    vkDestroyQueryPool(device, queryPool, nullptr);
-    vkDestroyBuffer(device, scratchBuffer, nullptr);
-    vmaFreeMemory(allocator, scratchMemory);
-    vmaDestroyPool(allocator, buildPool);  // empty by now
-}
-
-// Top level: placed copies (instances) of bottom level structures, each with a transform. It can be updated in place
-// (refit) while only the instances' transforms change (recordTopLevelBuild).
-// Both describing calls (size query and build) must use the same geometry type and flags.
-static void describeTopLevel(VkDeviceAddress instanceData, VkAccelerationStructureGeometryKHR& geometry,
-                             VkAccelerationStructureBuildGeometryInfoKHR& buildInfo) {
-    geometry = {};
-    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-    geometry.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-    geometry.geometry.instances.arrayOfPointers = VK_FALSE;
-    geometry.geometry.instances.data.deviceAddress = instanceData;
-
-    buildInfo = {};
-    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                      VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    buildInfo.geometryCount = 1;
-    buildInfo.pGeometries = &geometry;
-}
-
-// Creates an (unbuilt) TLAS with room for `capacity` instances, plus everything needed to rebuild it each frame.
-void Renderer::createTopLevelAccelerationStructure(uint32_t capacity) {
-    tlasCapacity = capacity;
-
-    // Per instance: its matrix and the index of its motion for the shader, uploaded when they change
-    createStreamedBuffer(instanceData, sizeof(GpuInstance) * capacity);
-    // The instances the TLAS is built from
-    createStreamedBuffer(tlasInstanceData, sizeof(VkAccelerationStructureInstanceKHR) * capacity,
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-    instanceDataPending.addAll();  // the new buffers are empty
-    tlasInstancePending.addAll();
-
-    // Sizes for the worst case (full capacity). Builds with fewer instances fit as well.
-    VkAccelerationStructureGeometryKHR geometry;
-    VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
-    describeTopLevel(0, geometry, buildInfo);  // addresses are ignored when only asking for sizes
-    VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
-    sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-    vkext::vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                   &buildInfo, &capacity, &sizeInfo);
-
-    tlas = createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizeInfo.accelerationStructureSize,
-                                       VK_NULL_HANDLE, true);
-    tlasScratchAddress = createScratchBuffer(std::max(sizeInfo.buildScratchSize, sizeInfo.updateScratchSize),
-                                             tlasScratchBuffer, tlasScratchMemory, VK_NULL_HANDLE, true);
-    tlasDirty = true;  // nothing built yet
-    tlasRebuildNeeded = true;
-}
-
-void Renderer::destroyTopLevelAccelerationStructure() {
-    destroyAccelerationStructure(tlas);
-    destroyStreamedBuffer(instanceData);
-    destroyStreamedBuffer(tlasInstanceData);
-    vkDestroyBuffer(device, tlasScratchBuffer, nullptr);
-    vmaFreeMemory(allocator, tlasScratchMemory);
-    tlasCapacity = 0;
-}
-
-// Builds the TLAS from frameInstances, on the GPU, before this frame's ray tracing (the instances that changed are
-// copied first).
-//
-// While only transforms change (things move), the TLAS is updated in place instead of built anew: its tree stays,
-// only the boxes are refit around the instances' new places. In Jungle Ruins (2.9 million instances) with one object
-// moving, the GPU work before tracing took ~15 ms per frame with builds, ~5 ms with updates. The tree gets worse the
-// further things move from where it was built, so it is built again once nothing moves (updateScene), or after
-// maxTlasUpdates updates in a row.
-void Renderer::recordTopLevelBuild(VkCommandBuffer commandBuffer) {
-    uint32_t instanceCount = static_cast<uint32_t>(frameInstances.size());
-    if (tlasInstancePending.all) {
-        recordStreamedUpload(commandBuffer, tlasInstanceData, frameInstances.data(),
-                             sizeof(VkAccelerationStructureInstanceKHR) * instanceCount);
-    } else {
-        recordStreamedUpload(commandBuffer, tlasInstanceData, frameInstances.data(),
-                             sizeof(VkAccelerationStructureInstanceKHR), tlasInstancePending.ranges);
-    }
-    tlasInstancePending.clear();
-
-    VkAccelerationStructureGeometryKHR geometry;
-    VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
-    describeTopLevel(getBufferDeviceAddress(tlasInstanceData.buffer), geometry, buildInfo);
-    buildInfo.dstAccelerationStructure = tlas.handle;
-    buildInfo.scratchData.deviceAddress = tlasScratchAddress;
-    if (!tlasRebuildNeeded && tlasUpdates < maxTlasUpdates) {
-        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
-        buildInfo.srcAccelerationStructure = tlas.handle;  // in place
-        tlasUpdates++;
-    } else {
-        tlasUpdates = 0;
-    }
-
-    // The previous frame may still be tracing rays through the TLAS (compute shader) or building it
-    // (scratch memory). Both must finish before we overwrite them.
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    vkCmdPipelineBarrier(commandBuffer,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                         0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-    VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
-    rangeInfo.primitiveCount = instanceCount;
-    const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
-    vkext::vkCmdBuildAccelerationStructuresKHR(commandBuffer, 1, &buildInfo, &pRangeInfo);
-
-    // This frame's rays must wait for the finished TLAS.
-    barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-    tlasDirty = false;
-    tlasRebuildNeeded = false;
-    if (!tlasTidyOnly) {
-        resetAccumulation = true;  // the scene changed, the accumulated image is outdated
-    }
-    tlasTidyOnly = false;
+    gpu.createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, uniformBuffer, uniformBufferMemory);
 }
 
 // The images the trace shader writes, at render size (the display image is in Display.cpp)
@@ -445,35 +49,35 @@ void Renderer::createRayTracingImages() {
 
     // Everything DLSS reads is also "sampled": DLSS switches the images to SHADER_READ_ONLY_OPTIMAL while reading.
     const VkImageUsageFlags dlssInput = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    createImage(renderExtent.width, renderExtent.height, radianceFormat, dlssInput,
-                radianceImage, radianceImageMemory, radianceImageView, 1, true);
+    gpu.createImage(renderExtent.width, renderExtent.height, radianceFormat, dlssInput,
+                    radianceImage, radianceImageMemory, radianceImageView, 1, true);
     // The DLSS inputs. The diffuse albedo is copied into the history image for the reprojection error view.
-    createImage(guideExtent, linearDepthFormat, dlssInput, linearDepthImage);
-    createImage(guideExtent, motionVectorFormat, dlssInput, motionVectorImage);
-    createImage(guideExtent, guideColorFormat, dlssInput | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, diffuseAlbedoImage);
-    createImage(guideExtent, guideColorFormat, dlssInput, specularAlbedoImage);
-    createImage(guideExtent, guideColorFormat, dlssInput, normalRoughnessImage);
-    createImage(guideExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
-    createImage(historyExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                guideHistoryImage);
+    gpu.createImage(guideExtent, linearDepthFormat, dlssInput, linearDepthImage);
+    gpu.createImage(guideExtent, motionVectorFormat, dlssInput, motionVectorImage);
+    gpu.createImage(guideExtent, guideColorFormat, dlssInput | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, diffuseAlbedoImage);
+    gpu.createImage(guideExtent, guideColorFormat, dlssInput, specularAlbedoImage);
+    gpu.createImage(guideExtent, guideColorFormat, dlssInput, normalRoughnessImage);
+    gpu.createImage(guideExtent, hitDistanceFormat, dlssInput, specularHitDistanceImage);
+    gpu.createImage(historyExtent, guideColorFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    guideHistoryImage);
     // Written before it is read in every frame that uses it, so it needs no clearing
-    createBuffer(sizeof(GpuPrimaryHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory, VK_NULL_HANDLE, true);
-    createBuffer(sizeof(GpuBounceHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bounceHitBuffer, bounceHitMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(GpuPrimaryHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, primaryHitBuffer, primaryHitMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(GpuBounceHit) * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bounceHitBuffer, bounceHitMemory, VK_NULL_HANDLE, true);
     // this frame's, last frame's, and the ReSTIR pass's result for the spatial pass
-    createBuffer(sizeof(GpuReservoir) * 3 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory, VK_NULL_HANDLE, true);
-    createBuffer(sizeof(GpuRestirSurface) * 2 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(GpuReservoir) * 3 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, reservoirBuffer, reservoirMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(GpuRestirSurface) * 2 * restirPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, restirSurfaceBuffer, restirSurfaceMemory, VK_NULL_HANDLE, true);
     // ReSTIR GI: this frame's, last frame's, and the image pass's fresh samples
-    createBuffer(sizeof(GpuGiReservoir) * 3 * restirGiPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, giReservoirBuffer, giReservoirMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(sizeof(GpuGiReservoir) * 3 * restirGiPixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, giReservoirBuffer, giReservoirMemory, VK_NULL_HANDLE, true);
     restirHistoryAvailable = false;  // new buffers: nothing to reuse yet
     restirGiHistoryAvailable = false;
 
     // All stay in GENERAL forever
-    immediateSubmit([&](VkCommandBuffer cmd) {
+    gpu.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImage images[] = {radianceImage, linearDepthImage.image, motionVectorImage.image, diffuseAlbedoImage.image,
                             specularAlbedoImage.image, normalRoughnessImage.image, specularHitDistanceImage.image,
                             guideHistoryImage.image};
@@ -514,21 +118,21 @@ void Renderer::createRayTracingImages() {
 void Renderer::destroyRayTracingImages() {
     for (RenderImage* image : {&linearDepthImage, &motionVectorImage, &diffuseAlbedoImage, &specularAlbedoImage,
                                &normalRoughnessImage, &specularHitDistanceImage, &guideHistoryImage}) {
-        destroyImage(*image);
+        gpu.destroyImage(*image);
     }
-    vkDestroyImageView(device, radianceImageView, nullptr);
-    vkDestroyImage(device, radianceImage, nullptr);
-    vmaFreeMemory(allocator, radianceImageMemory);
-    vkDestroyBuffer(device, primaryHitBuffer, nullptr);
-    vmaFreeMemory(allocator, primaryHitMemory);
-    vkDestroyBuffer(device, bounceHitBuffer, nullptr);
-    vmaFreeMemory(allocator, bounceHitMemory);
-    vkDestroyBuffer(device, reservoirBuffer, nullptr);
-    vmaFreeMemory(allocator, reservoirMemory);
-    vkDestroyBuffer(device, restirSurfaceBuffer, nullptr);
-    vmaFreeMemory(allocator, restirSurfaceMemory);
-    vkDestroyBuffer(device, giReservoirBuffer, nullptr);
-    vmaFreeMemory(allocator, giReservoirMemory);
+    vkDestroyImageView(gpu.device, radianceImageView, nullptr);
+    vkDestroyImage(gpu.device, radianceImage, nullptr);
+    vmaFreeMemory(gpu.allocator, radianceImageMemory);
+    vkDestroyBuffer(gpu.device, primaryHitBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, primaryHitMemory);
+    vkDestroyBuffer(gpu.device, bounceHitBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, bounceHitMemory);
+    vkDestroyBuffer(gpu.device, reservoirBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, reservoirMemory);
+    vkDestroyBuffer(gpu.device, restirSurfaceBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, restirSurfaceMemory);
+    vkDestroyBuffer(gpu.device, giReservoirBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, giReservoirMemory);
 }
 
 void Renderer::createRayTracingDescriptors() {
@@ -571,7 +175,7 @@ void Renderer::createRayTracingDescriptors() {
     bindings[29] = {29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[30] = {30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GpuScene::maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
@@ -589,7 +193,7 @@ void Renderer::createRayTracingDescriptors() {
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     layoutInfo.pNext = &bindingFlagsInfo;
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &rtDescriptorSetLayout) != VK_SUCCESS) {
+    if (vkCreateDescriptorSetLayout(gpu.device, &layoutInfo, nullptr, &rtDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create ray tracing descriptor set layout!");
     }
 
@@ -598,14 +202,14 @@ void Renderer::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + maxVolumeTextures}
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + GpuScene::maxVolumeTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = (uint32_t)std::size(poolSizes);
     poolInfo.pPoolSizes = poolSizes;
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &rtDescriptorPool) != VK_SUCCESS) {
+    if (vkCreateDescriptorPool(gpu.device, &poolInfo, nullptr, &rtDescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create ray tracing descriptor pool!");
     }
 
@@ -614,7 +218,7 @@ void Renderer::createRayTracingDescriptors() {
     allocInfo.descriptorPool = rtDescriptorPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &rtDescriptorSetLayout;
-    if (vkAllocateDescriptorSets(device, &allocInfo, &rtDescriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(gpu.device, &allocInfo, &rtDescriptorSet) != VK_SUCCESS) {
         throw std::runtime_error("failed to allocate ray tracing descriptor set!");
     }
 
@@ -626,19 +230,19 @@ void Renderer::updateRayTracingDescriptorSet() {
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
     asInfo.accelerationStructureCount = 1;
-    asInfo.pAccelerationStructures = &tlas.handle;
+    asInfo.pAccelerationStructures = &scene.tlas.handle;
 
     VkDescriptorImageInfo radianceInfo{VK_NULL_HANDLE, radianceImageView, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo depthInfo{VK_NULL_HANDLE, linearDepthImage.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo uniformInfo{uniformBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo vertexInfo{gpuAssets.vertexBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo indexInfo{gpuAssets.indexBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo meshInfo{gpuAssets.meshInfoBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo materialInfo{gpuAssets.materialBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo emissiveTriangleInfo{emissiveTriangleBuffer.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo instanceLightInfo{instanceLightBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo vertexInfo{scene.gpuAssets.vertexBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo indexInfo{scene.gpuAssets.indexBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo meshInfo{scene.gpuAssets.meshInfoBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo materialInfo{scene.gpuAssets.materialBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo emissiveTriangleInfo{scene.emissiveTriangleBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo instanceLightInfo{scene.instanceLightBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo specularAlbedoInfo{specularAlbedoBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo instanceDataInfo{instanceData.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo instanceDataInfo{scene.instanceData.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo guideInfos[5] = {
             {VK_NULL_HANDLE, motionVectorImage.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, diffuseAlbedoImage.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -651,28 +255,28 @@ void Renderer::updateRayTracingDescriptorSet() {
             {cacheAccumulatorBuffer, 0, VK_WHOLE_SIZE},
             {cacheValueBuffer, 0, VK_WHOLE_SIZE},
     };
-    VkDescriptorImageInfo environmentInfo{environmentSampler, environmentTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkDescriptorBufferInfo environmentDistributionInfo{environmentDistributionBuffer.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo punctualLightInfo{punctualLightBuffer.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo lightTreeInfo{lightTreeBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorImageInfo environmentInfo{scene.environmentSampler, scene.environmentTexture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorBufferInfo environmentDistributionInfo{scene.environmentDistributionBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo punctualLightInfo{scene.punctualLightBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo lightTreeInfo{scene.lightTreeBuffer.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo primaryHitInfo{primaryHitBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo reservoirInfo{reservoirBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo restirSurfaceInfo{restirSurfaceBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bounceHitInfo{bounceHitBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo giReservoirInfo{giReservoirBuffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo blueNoiseInfo{blueNoiseBuffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo portalInfo{portalBuffer.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo portalInfo{scene.portalBuffer.buffer, 0, VK_WHOLE_SIZE};
     std::vector<VkDescriptorImageInfo> textureInfos;
-    for (const GpuTexture& texture : gpuAssets.textures) {
+    for (const GpuTexture& texture : scene.gpuAssets.textures) {
         textureInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
     std::vector<VkDescriptorImageInfo> volumeInfos;
-    for (const GpuTexture& texture : gpuAssets.volumeTextures) {
+    for (const GpuTexture& texture : scene.gpuAssets.volumeTextures) {
         volumeInfos.push_back({texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     }
 
-    VkDescriptorBufferInfo motionInfo{motionData.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo motionInfo{scene.motionData.buffer, 0, VK_WHOLE_SIZE};
     std::vector<VkWriteDescriptorSet> writes(34);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -746,7 +350,7 @@ void Renderer::updateRayTracingDescriptorSet() {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }
 
-    vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(gpu.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
 void Renderer::createRayTracingPipeline() {
@@ -754,14 +358,14 @@ void Renderer::createRayTracingPipeline() {
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &rtDescriptorSetLayout;
-    if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &rtPipelineLayout) != VK_SUCCESS) {
+    if (vkCreatePipelineLayout(gpu.device, &layoutInfo, nullptr, &rtPipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create ray tracing pipeline layout!");
     }
     createTracePipelines(settings.basicShader);
 }
 
 void Renderer::createTracePipelines(bool basic) {
-    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("raytrace.comp.spv")));
+    VkShaderModule shaderModule = gpu.createShaderModule(readFile(Configuration::shaderPath("raytrace.comp.spv")));
 
     // Seven pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
     // (CACHE_UPDATE_PASS = 1), ReSTIR's camera rays and DI candidates (RESTIR_PASS = 1), DI's spatial reuse
@@ -793,10 +397,10 @@ void Renderer::createTracePipelines(bool basic) {
             pipelineInfo.stage.pName = "main";
             pipelineInfo.stage.pSpecializationInfo = &specialization;
             pipelineInfo.layout = rtPipelineLayout;
-            if (pipelineStatisticsSupported) {
+            if (gpu.pipelineStatisticsSupported) {
                 pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
             }
-            if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, pipeline) != VK_SUCCESS) {
+            if (vkCreateComputePipelines(gpu.device, gpu.pipelineCache, 1, &pipelineInfo, nullptr, pipeline) != VK_SUCCESS) {
                 failed = true;
             }
         });
@@ -808,10 +412,10 @@ void Renderer::createTracePipelines(bool basic) {
         throw std::runtime_error("failed to create ray tracing pipeline!");
     }
 
-    vkDestroyShaderModule(device, shaderModule, nullptr);
+    vkDestroyShaderModule(gpu.device, shaderModule, nullptr);
     basicTraceShader = basic;
 
-    if (pipelineStatisticsSupported) {
+    if (gpu.pipelineStatisticsSupported) {
         std::pair<const char*, VkPipeline> pipelines[] = {
             {"Image paths", rtPipeline},
             {"Cache update paths", rtCacheUpdatePipeline},
@@ -841,12 +445,12 @@ void Renderer::createTracePipelines(bool basic) {
 void Renderer::destroyTracePipelines() {
     for (VkPipeline* pipeline : {&rtPipeline, &rtCacheUpdatePipeline, &rtRestirPipeline, &rtRestirSpatialPipeline,
                                  &rtRestirGiShadePipeline, &rtRestirGiTemporalPipeline, &rtRestirGiSpatialPipeline}) {
-        vkDestroyPipeline(device, *pipeline, nullptr);
+        vkDestroyPipeline(gpu.device, *pipeline, nullptr);
         *pipeline = VK_NULL_HANDLE;
     }
     for (auto& level : rtFogPipelines) {
         for (VkPipeline& pipeline : level) {
-            vkDestroyPipeline(device, pipeline, nullptr);
+            vkDestroyPipeline(gpu.device, pipeline, nullptr);
             pipeline = VK_NULL_HANDLE;
         }
     }
@@ -858,10 +462,10 @@ void Renderer::updateTracePipelines() {
     if (settings.basicShader == basicTraceShader) {
         return;
     }
-    vkp.deviceWaitIdle(device);  // the pipelines are replaced, no frame may use them
+    vkp.deviceWaitIdle(gpu.device);  // the pipelines are replaced, no frame may use them
     destroyTracePipelines();
     createTracePipelines(settings.basicShader);
-    savePipelineCache();  // the newly compiled ones, for the next switch (or run)
+    gpu.savePipelineCache();  // the newly compiled ones, for the next switch (or run)
     resetAccumulation = true;  // a different shader: a different image where the scene has the features
 }
 
@@ -885,13 +489,13 @@ std::vector<std::pair<std::string, std::string>> Renderer::readPipelineStatistic
     }
     VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
     uint32_t executableCount = 0;
-    vkext::vkGetPipelineExecutablePropertiesKHR(device, &pipelineInfo, &executableCount, nullptr);
+    vkext::vkGetPipelineExecutablePropertiesKHR(gpu.device, &pipelineInfo, &executableCount, nullptr);
     for (uint32_t executable = 0; executable < executableCount; executable++) {
         VkPipelineExecutableInfoKHR executableInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, executable};
         uint32_t statisticCount = 0;
-        vkext::vkGetPipelineExecutableStatisticsKHR(device, &executableInfo, &statisticCount, nullptr);
+        vkext::vkGetPipelineExecutableStatisticsKHR(gpu.device, &executableInfo, &statisticCount, nullptr);
         std::vector<VkPipelineExecutableStatisticKHR> statistics(statisticCount, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
-        vkext::vkGetPipelineExecutableStatisticsKHR(device, &executableInfo, &statisticCount, statistics.data());
+        vkext::vkGetPipelineExecutableStatisticsKHR(gpu.device, &executableInfo, &statisticCount, statistics.data());
         for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
             std::string value;
             switch (statistic.format) {
@@ -958,14 +562,14 @@ SceneUniforms Renderer::buildSceneUniforms() {
     if (environment.background == static_cast<int>(Background::White)) {
         uniforms.skyZenithColor = uniforms.skyHorizonColor = uniforms.groundColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
     }
-    uniforms.environmentMap = environmentMapReady() ? 1 : 0;
-    uniforms.environmentSampling = environmentCells.x > 0 ? 1 : 0;
-    uniforms.environmentWidth = environmentCells.x;
-    uniforms.environmentHeight = environmentCells.y;
+    uniforms.environmentMap = scene.environmentMapReady() ? 1 : 0;
+    uniforms.environmentSampling = scene.environmentCells.x > 0 ? 1 : 0;
+    uniforms.environmentWidth = scene.environmentCells.x;
+    uniforms.environmentHeight = scene.environmentCells.y;
     uniforms.environmentRotation = glm::radians(environment.mapRotation);
     uniforms.environmentIntensity = environment.mapIntensity;
-    uniforms.punctualLightCount = static_cast<uint32_t>(uploadedPunctualLights.size());
-    uniforms.portalCount = static_cast<uint32_t>(uploadedPortals.size());
+    uniforms.punctualLightCount = static_cast<uint32_t>(scene.uploadedPunctualLights.size());
+    uniforms.portalCount = static_cast<uint32_t>(scene.uploadedPortals.size());
     fogLevel = 0;
     bool fogDrifts = false;
     for (const SceneMaterial& material : assets.materials()) {
@@ -989,9 +593,9 @@ SceneUniforms Renderer::buildSceneUniforms() {
     uniforms.maxBounces = static_cast<uint32_t>(std::max(settings.maxBounces, 1));
     uniforms.maxPortalCrossings = static_cast<uint32_t>(std::max(settings.maxPortalCrossings, 1));
     uniforms.shadowsEnabled = settings.shadowsEnabled ? 1 : 0;
-    uniforms.emissiveTriangleCount = static_cast<uint32_t>(emissiveTriangles.size());
+    uniforms.emissiveTriangleCount = static_cast<uint32_t>(scene.emissiveTriangles.size());
     uniforms.emissiveSampling = static_cast<uint32_t>(settings.emissiveSampling);
-    uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !lightTree.empty() ? 1 : 0;
+    uniforms.lightTree = settings.lightPicking == static_cast<int>(LightPicking::Tree) && !scene.lightTree.empty() ? 1 : 0;
     // Only for picking by power: the tree already weighs distance and angle, candidates only added time there
     uniforms.lightCandidates = uniforms.lightTree != 0
                                ? 1u : static_cast<uint32_t>(std::clamp(settings.lightCandidates, 1, 16));
@@ -1009,7 +613,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
     // applyPerPixelBuffers has seen these settings)
     uniforms.restirDi = settings.restirDi(settings.renderMode) && perPixelBuffers.restir &&
                         (uniforms.debugView == 0 || restirView) ? 1 : 0;
-    bool sampleTriangles = !emissiveTriangles.empty() && settings.emissiveSampling != static_cast<int>(EmissiveSampling::BouncesOnly);
+    bool sampleTriangles = !scene.emissiveTriangles.empty() && settings.emissiveSampling != static_cast<int>(EmissiveSampling::BouncesOnly);
     uint32_t lightCandidates = static_cast<uint32_t>(std::max(settings.restirLightCandidates, 1));
     uniforms.restirTriangleCandidates = sampleTriangles ? lightCandidates : 0;
     // A few punctual lights keep a shadow ray each (exact, MAX_PUNCTUAL_LIGHTS_PER_HIT in the shader); ReSTIR is
@@ -1149,29 +753,13 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     // Lights uploaded this frame may have new indices: ReSTIR can't reuse last frame's samples then. Glowing
     // triangles only when their indices changed (lightIndicesChanged): moved ones keep theirs, and a reused sample is
     // evaluated where its triangle is now.
-    restirLightsChanged = lightIndicesChanged || environmentUploadPending || punctualLightsUploadPending;
-    lightIndicesChanged = false;
+    restirLightsChanged = scene.lightIndicesChanged || scene.environmentUploadPending || scene.punctualLightsUploadPending;
+    scene.lightIndicesChanged = false;
 
-    // Objects moved (or the scene changed): rebuild the TLAS first. Sets resetAccumulation,
+    // Objects moved (or the scene changed): rebuild the TLAS first, then the other uploads. May set resetAccumulation,
     // so it has to happen before the uniforms are built.
-    if (tlasDirty) {
-        recordTopLevelBuild(commandBuffer);
-    }
-    if (gpuAssets.materialsDirty) {
-        recordMaterialUpdate(commandBuffer);
-    }
-    if (lightsUploadPending) {
-        recordLightUpload(commandBuffer);
-    }
-    if (environmentUploadPending) {
-        recordEnvironmentUpload(commandBuffer);
-    }
-    if (punctualLightsUploadPending) {
-        recordPunctualLightUpload(commandBuffer);
-    }
-    if (portalsUploadPending) {
-        recordPortalUpload(commandBuffer);
-    }
+    scene.recordUploads(commandBuffer);
+    applySceneChanges();
 
     // 0: upload this frame's uniforms. vkCmdUpdateBuffer copies the data into the command buffer
     //    itself, so a single uniform buffer is enough even with several frames in flight.
@@ -1191,7 +779,7 @@ void Renderer::recordRayTracing(VkCommandBuffer commandBuffer, uint32_t imageInd
     SceneUniforms uniforms = buildSceneUniforms();
     vkCmdUpdateBuffer(commandBuffer, uniformBuffer, 0, sizeof(uniforms), &uniforms);
     frameIndex++;
-    recordInstanceUpload(commandBuffer);
+    scene.recordInstanceUpload(commandBuffer);
 
     uniformBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     uniformBarrier.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
@@ -1333,7 +921,7 @@ void Renderer::createTimestampQueries() {
     info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     info.queryType = VK_QUERY_TYPE_TIMESTAMP;
     info.queryCount = timestampsPerFrame * Configuration::maxFramesInFlight;
-    if (vkCreateQueryPool(device, &info, nullptr, &timestampQueryPool) != VK_SUCCESS) {
+    if (vkCreateQueryPool(gpu.device, &info, nullptr, &timestampQueryPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create timestamp query pool!");
     }
     timestampsWritten.assign(Configuration::maxFramesInFlight, false);
@@ -1345,11 +933,11 @@ void Renderer::readTimestamps() {
         return;
     }
     uint64_t ticks[timestampsPerFrame];
-    if (vkGetQueryPoolResults(device, timestampQueryPool, currentFrame * timestampsPerFrame, timestampsPerFrame,
+    if (vkGetQueryPoolResults(gpu.device, timestampQueryPool, currentFrame * timestampsPerFrame, timestampsPerFrame,
                               sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
         return;
     }
-    float msPerTick = physicalDeviceProperties.limits.timestampPeriod * 1e-6f;  // the period is in nanoseconds
+    float msPerTick = gpu.physicalDeviceProperties.limits.timestampPeriod * 1e-6f;  // the period is in nanoseconds
     for (uint32_t i = 0; i + 1 < timestampsPerFrame; i++) {
         float ms = static_cast<float>(ticks[i + 1] - ticks[i]) * msPerTick;
         lastPassTimes[i] = ms;
@@ -1364,49 +952,21 @@ void Renderer::writeTimestamp(VkCommandBuffer commandBuffer, uint32_t index) {
                         currentFrame * timestampsPerFrame + index);
 }
 
-// What updateScene changed of frameGpuInstances -> instanceData, and frameMotions -> motionData (after the previous
-// frame's shader is done reading)
-void Renderer::recordInstanceUpload(VkCommandBuffer commandBuffer) {
-    if (instanceDataPending.all) {
-        recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(),
-                             sizeof(GpuInstance) * frameGpuInstances.size());
-    } else {
-        recordStreamedUpload(commandBuffer, instanceData, frameGpuInstances.data(), sizeof(GpuInstance),
-                             instanceDataPending.ranges);
-    }
-    instanceDataPending.clear();
-    if (motionUploadPending) {
-        recordStreamedUpload(commandBuffer, motionData, frameMotions.data(), sizeof(glm::mat4) * frameMotions.size());
-        motionUploadPending = false;
-    }
-}
-
 void Renderer::cleanupRayTracing() {
     destroyTracePipelines();
-    destroyVolumeTextures();
     destroyRadianceCache();
-    vkDestroyPipelineLayout(device, rtPipelineLayout, nullptr);
-    vkDestroyDescriptorPool(device, rtDescriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, rtDescriptorSetLayout, nullptr);
+    vkDestroyPipelineLayout(gpu.device, rtPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, rtDescriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, rtDescriptorSetLayout, nullptr);
 
-    deferredDeletion.flush();  // the device is idle
-    destroyTopLevelAccelerationStructure();
-    destroyBottomLevelAccelerationStructures();
-    destroySceneGeometry();
-    destroyMaterialBuffer();
+    scene.destroy();
     destroySpecularAlbedoTable();
     destroyBlueNoiseTexture();
     destroyExposureResources();
     destroyNoiseResources();
     destroyDisplayResources();
-    vkDestroyQueryPool(device, timestampQueryPool, nullptr);
-    destroyTextures();
-    destroyLightBuffers();
-    destroyPortalBuffer();
-    destroyStreamedBuffer(motionData);
-    destroyEnvironment();
-    destroyUploadRings();
+    vkDestroyQueryPool(gpu.device, timestampQueryPool, nullptr);
 
-    vkDestroyBuffer(device, uniformBuffer, nullptr);
-    vmaFreeMemory(allocator, uniformBufferMemory);
+    vkDestroyBuffer(gpu.device, uniformBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, uniformBufferMemory);
 }

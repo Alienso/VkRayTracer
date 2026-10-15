@@ -124,11 +124,11 @@ void Renderer::createBlueNoiseTexture() {
         packed[i * 2] = v[0] | (v[1] << 16);
         packed[i * 2 + 1] = v[2] | (v[3] << 16);
     }
-    createDeviceLocalBuffer(packed.data(), sizeof(uint32_t) * packed.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            blueNoiseBuffer, blueNoiseMemory);
+    gpu.createDeviceLocalBuffer(packed.data(), sizeof(uint32_t) * packed.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                blueNoiseBuffer, blueNoiseMemory);
 }
 
 void Renderer::destroyBlueNoiseTexture() {
-    vkDestroyBuffer(device, blueNoiseBuffer, nullptr);
-    vmaFreeMemory(allocator, blueNoiseMemory);
+    vkDestroyBuffer(gpu.device, blueNoiseBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, blueNoiseMemory);
 }

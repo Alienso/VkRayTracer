@@ -39,8 +39,8 @@ void Renderer::recordCapture(VkCommandBuffer commandBuffer) {
     captureFile = captureFileRequested.empty() ? captureFileName() : captureFileRequested;
     captureExtent = outputExtent;
     captureFrame = currentFrame;
-    createBuffer(static_cast<VkDeviceSize>(captureExtent.width) * captureExtent.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, captureBuffer, captureMemory);
+    gpu.createBuffer(static_cast<VkDeviceSize>(captureExtent.width) * captureExtent.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, captureBuffer, captureMemory);
 
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -67,7 +67,7 @@ void Renderer::finishCapture() {
         return;
     }
     // The fence of the frame that recorded the copy: not reset again before that slot's next drawFrame
-    vkWaitForFences(device, 1, &inFlightFences[captureFrame], VK_TRUE, UINT64_MAX);
+    vkWaitForFences(gpu.device, 1, &inFlightFences[captureFrame], VK_TRUE, UINT64_MAX);
 
     // The display image holds linear values (the blit to the sRGB swapchain encodes them): encode the same way, so the
     // file looks like the screen
@@ -80,7 +80,7 @@ void Renderer::finishCapture() {
     size_t pixelCount = static_cast<size_t>(captureExtent.width) * captureExtent.height;
     std::vector<uint8_t> pixels(pixelCount * 4);
     void* mapped = nullptr;
-    vmaMapMemory(allocator, captureMemory, &mapped);
+    vmaMapMemory(gpu.allocator, captureMemory, &mapped);
     const uint8_t* source = static_cast<const uint8_t*>(mapped);
     for (size_t i = 0; i < pixelCount; i++) {
         pixels[i * 4] = toSrgb[source[i * 4]];
@@ -88,9 +88,9 @@ void Renderer::finishCapture() {
         pixels[i * 4 + 2] = toSrgb[source[i * 4 + 2]];
         pixels[i * 4 + 3] = 255;
     }
-    vmaUnmapMemory(allocator, captureMemory);
-    vkDestroyBuffer(device, captureBuffer, nullptr);
-    vmaFreeMemory(allocator, captureMemory);
+    vmaUnmapMemory(gpu.allocator, captureMemory);
+    vkDestroyBuffer(gpu.device, captureBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, captureMemory);
     captureBuffer = VK_NULL_HANDLE;
 
     const std::string& name = captureFile;

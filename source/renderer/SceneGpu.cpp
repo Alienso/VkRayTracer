@@ -67,7 +67,7 @@ static VkTransformMatrixKHR toVkTransform(const glm::mat4& m) {
     return transform;
 }
 
-VkAccelerationStructureInstanceKHR Renderer::makeTlasInstance(const RenderInstance& renderInstance) const {
+VkAccelerationStructureInstanceKHR GpuScene::makeTlasInstance(const RenderInstance& renderInstance) const {
     VkAccelerationStructureInstanceKHR instance{};
     instance.transform = toVkTransform(renderInstance.world);
     instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
@@ -88,8 +88,70 @@ VkAccelerationStructureInstanceKHR Renderer::makeTlasInstance(const RenderInstan
     return instance;
 }
 
-// Called every frame before drawFrame: applies UI changes to the GPU-side scene.
-void Renderer::updateScene() {
+void GpuScene::create() {
+    createVolumeTextures();
+    createUploadRings();  // the staging for the streamed buffers below
+    createTopLevelAccelerationStructure(16);  // grows when more instances are needed
+    createStreamedBuffer(motionData, sizeof(glm::mat4) * 16);  // and this with the objects (updateScene)
+    createLightBuffers();
+    createPortalBuffer();
+    createEnvironment();
+}
+
+void GpuScene::destroy() {
+    deferredDeletion.flush();  // the device is idle
+    destroyVolumeTextures();
+    destroyTopLevelAccelerationStructure();
+    destroyBottomLevelAccelerationStructures();
+    destroySceneGeometry();
+    destroyMaterialBuffer();
+    destroyTextures();
+    destroyLightBuffers();
+    destroyPortalBuffer();
+    destroyStreamedBuffer(motionData);
+    destroyEnvironment();
+    destroyUploadRings();
+}
+
+void GpuScene::beginFrame(uint32_t frameSlot, uint64_t frameNumber) {
+    currentFrame = frameSlot;
+    this->frameNumber = frameNumber;
+    deferredDeletion.collect(frameNumber);  // the frame that last used this slot is done: its releases can go
+    uploadRingUsed = 0;  // and so is its upload ring
+}
+
+void GpuScene::update(const RenderList& list, uint64_t frameNumber) {
+    renderList = &list;
+    this->frameNumber = frameNumber;
+    updateScene();  // the render list's changes on the GPU (new models, instances, lights)
+    updateEnvironment();  // a new HDR map, or new sky colors to sample by
+}
+
+// Objects moved (or the scene changed): the TLAS first. It may outdate the accumulated image (changes), which the
+// uniforms recorded after this have to know.
+void GpuScene::recordUploads(VkCommandBuffer commandBuffer) {
+    if (tlasDirty) {
+        recordTopLevelBuild(commandBuffer);
+    }
+    if (gpuAssets.materialsDirty) {
+        recordMaterialUpdate(commandBuffer);
+    }
+    if (lightsUploadPending) {
+        recordLightUpload(commandBuffer);
+    }
+    if (environmentUploadPending) {
+        recordEnvironmentUpload(commandBuffer);
+    }
+    if (punctualLightsUploadPending) {
+        recordPunctualLightUpload(commandBuffer);
+    }
+    if (portalsUploadPending) {
+        recordPortalUpload(commandBuffer);
+    }
+}
+
+// Called every frame before drawFrame (update): applies UI changes to the GPU-side scene.
+void GpuScene::updateScene() {
     // 1: a model was loaded or unloaded (the asset store's revision moved on) -> the new meshes' geometry and BLASes,
     //    uploads of new textures; what went is released. Rare, so simply wait for the GPU.
     // 0: a material was edited -> uploaded in this frame's command buffer (unless step 1 re-creates the buffer)
@@ -100,7 +162,7 @@ void Renderer::updateScene() {
 
     bool geometryReuploaded = false;
     if (assets.revision() != gpuAssets.uploadedRevision) {
-        vkp.deviceWaitIdle(device);
+        waitIdle();
         if (gpuAssets.materialBufferCreated) {
             destroyMaterialBuffer();
         }
@@ -113,15 +175,13 @@ void Renderer::updateScene() {
         // The TLAS points at the old BLASes (some now released): it must be rebuilt, even when there are no instances
         tlasDirty = true;
         geometryReuploaded = true;  // and the instances remade (new mesh infos), below
-        dlssReset = true;        // a different scene: DLSS's history is useless
-        if (rtDescriptorSet != VK_NULL_HANDLE) {
-            updateRayTracingDescriptorSet();
-        }
+        changes.resetDlss = true;        // a different scene: DLSS's history is useless
+        changes.descriptors = true;
     }
 
     // 1b: varying fog needs its mesh's distance field (Volumes.cpp); baked when a mesh first needs it
-    if ((geometryReuploaded || gpuAssets.materialsDirty) && syncDistanceFields() && rtDescriptorSet != VK_NULL_HANDLE) {
-        updateRayTracingDescriptorSet();
+    if ((geometryReuploaded || gpuAssets.materialsDirty) && syncDistanceFields()) {
+        changes.descriptors = true;
     }
 
     // 2: the scene's render list -> TLAS instances, one per list instance. All of them when the list was remade (or
@@ -213,23 +273,19 @@ void Renderer::updateScene() {
     // 3: not enough room in the TLAS -> make a bigger one. Its handle changes, so the descriptor set
     //    must be updated, which is only allowed while no frame uses it.
     if (frameInstances.size() > tlasCapacity) {
-        vkp.deviceWaitIdle(device);
+        waitIdle();
         uint32_t newCapacity = std::max(static_cast<uint32_t>(frameInstances.size()), tlasCapacity * 2);
         destroyTopLevelAccelerationStructure();
         createTopLevelAccelerationStructure(newCapacity);
-        if (rtDescriptorSet != VK_NULL_HANDLE) {
-            updateRayTracingDescriptorSet();
-        }
+        changes.descriptors = true;
     }
 
     // 3b: the same for the motions (one per object)
     if (sizeof(glm::mat4) * frameMotions.size() > motionData.capacity) {
-        vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+        waitIdle();  // the buffer is replaced, no frame may use it
         ensureStreamedCapacity(motionData, sizeof(glm::mat4) * frameMotions.size());
         motionUploadPending = true;
-        if (rtDescriptorSet != VK_NULL_HANDLE) {
-            updateRayTracingDescriptorSet();
-        }
+        changes.descriptors = true;
     }
 
     // 5: punctual lights, every frame (a handful). Uploaded in this frame's command buffer when they changed; the
@@ -240,15 +296,13 @@ void Renderer::updateScene() {
                     framePunctualLights.size() * sizeof(GpuPunctualLight)) != 0) {
         uploadedPunctualLights = framePunctualLights;
         punctualLightsUploadPending = true;
-        resetAccumulation = true;
-        cacheClearPending = true;
+        changes.resetAccumulation = true;
+        changes.clearCache = true;
         VkDeviceSize size = sizeof(GpuPunctualLight) * uploadedPunctualLights.size();
         if (size > punctualLightBuffer.capacity) {
-            vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+            waitIdle();  // the buffer is replaced, no frame may use it
             ensureStreamedCapacity(punctualLightBuffer, size);
-            if (rtDescriptorSet != VK_NULL_HANDLE) {
-                updateRayTracingDescriptorSet();
-            }
+            changes.descriptors = true;
         }
     }
 
@@ -258,15 +312,13 @@ void Renderer::updateScene() {
         std::memcmp(framePortals.data(), uploadedPortals.data(), framePortals.size() * sizeof(GpuPortal)) != 0) {
         uploadedPortals = framePortals;
         portalsUploadPending = true;
-        resetAccumulation = true;
-        cacheClearPending = true;
+        changes.resetAccumulation = true;
+        changes.clearCache = true;
         VkDeviceSize size = sizeof(GpuPortal) * uploadedPortals.size();
         if (size > portalBuffer.capacity) {
-            vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+            waitIdle();  // the buffer is replaced, no frame may use it
             ensureStreamedCapacity(portalBuffer, size);
-            if (rtDescriptorSet != VK_NULL_HANDLE) {
-                updateRayTracingDescriptorSet();
-            }
+            changes.descriptors = true;
         }
     }
 
@@ -280,15 +332,13 @@ void Renderer::updateScene() {
         VkDeviceSize treeSize = sizeof(LightTreeNode) * lightTree.size();
         if (trianglesSize > emissiveTriangleBuffer.capacity || offsetsSize > instanceLightBuffer.capacity ||
             treeSize > lightTreeBuffer.capacity) {
-            vkp.deviceWaitIdle(device);  // the buffers are replaced, no frame may use them
+            waitIdle();  // the buffers are replaced, no frame may use them
             ensureStreamedCapacity(emissiveTriangleBuffer, trianglesSize);
             if (ensureStreamedCapacity(instanceLightBuffer, offsetsSize)) {
                 instanceLightsUploadPending = true;  // a new, empty buffer
             }
             ensureStreamedCapacity(lightTreeBuffer, treeSize);
-            if (rtDescriptorSet != VK_NULL_HANDLE) {
-                updateRayTracingDescriptorSet();
-            }
+            changes.descriptors = true;
         }
     }
 }
@@ -303,8 +353,8 @@ static constexpr uint32_t minGeometryCapacity = 1u << 16;  // vertices / indices
 // Matches the shared vertex and index buffers to the store's meshes, by id (like the BLASes): a mesh keeps its range
 // while it is loaded, so only new meshes are copied, and the ranges of the ones that went are free for the next.
 // Indices stay relative to their mesh; MeshInfo tells the shader where each mesh starts. The GPU must be idle.
-void Renderer::syncSceneGeometry() {
-    cacheClearPending = true;  // the radiance cache's cells belong to the old geometry
+void GpuScene::syncSceneGeometry() {
+    changes.clearCache = true;  // the radiance cache's cells belong to the old geometry
     const std::vector<Mesh>& meshes = assets.meshes();
     const std::vector<uint64_t>& ids = assets.meshIds();
 
@@ -393,10 +443,10 @@ void Renderer::syncSceneGeometry() {
         const VkDeviceSize stagingBytes = std::min<VkDeviceSize>(totalBytes, 64ull << 20);
         VkBuffer stagingBuffer;
         VmaAllocation stagingMemory;
-        createBuffer(stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
+        gpu.createBuffer(stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
         uint8_t* mapped;
-        vmaMapMemory(allocator, stagingMemory, reinterpret_cast<void**>(&mapped));
+        vmaMapMemory(gpu.allocator, stagingMemory, reinterpret_cast<void**>(&mapped));
         std::vector<VkBufferCopy> vertexCopies;
         std::vector<VkBufferCopy> indexCopies;
         VkDeviceSize used = 0;
@@ -404,7 +454,7 @@ void Renderer::syncSceneGeometry() {
             if (used == 0) {
                 return;
             }
-            immediateSubmit([&](VkCommandBuffer cmd) {
+            gpu.immediateSubmit([&](VkCommandBuffer cmd) {
                 if (!vertexCopies.empty()) {
                     vkCmdCopyBuffer(cmd, stagingBuffer, gpuAssets.vertexBuffer, static_cast<uint32_t>(vertexCopies.size()),
                                     vertexCopies.data());
@@ -449,9 +499,9 @@ void Renderer::syncSceneGeometry() {
                    });
         }
         flush();
-        vmaUnmapMemory(allocator, stagingMemory);
-        vkDestroyBuffer(device, stagingBuffer, nullptr);
-        vmaFreeMemory(allocator, stagingMemory);
+        vmaUnmapMemory(gpu.allocator, stagingMemory);
+        vkDestroyBuffer(gpu.device, stagingBuffer, nullptr);
+        vmaFreeMemory(gpu.allocator, stagingMemory);
     }
 
     // 4: the mesh infos, all of them (mesh indices and material indices move when a model is unloaded)
@@ -486,38 +536,38 @@ void Renderer::syncSceneGeometry() {
         gpuAssets.meshInfos.push_back(info);
     }
     if (gpuAssets.meshInfoBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, gpuAssets.meshInfoBuffer, nullptr);
-        vmaFreeMemory(allocator, gpuAssets.meshInfoBufferMemory);
+        vkDestroyBuffer(gpu.device, gpuAssets.meshInfoBuffer, nullptr);
+        vmaFreeMemory(gpu.allocator, gpuAssets.meshInfoBufferMemory);
     }
-    createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
+    gpu.createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
 }
 
 // A bigger buffer in place of a full one, with its contents (the first oldSize bytes) copied over on the GPU. The GPU
 // must be idle: the old buffer goes at once. BLASes keep their own copy of the triangles, so they don't mind.
-void Renderer::growGeometryBuffer(VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize oldSize, VkDeviceSize newSize) {
+void GpuScene::growGeometryBuffer(VkBuffer& buffer, VmaAllocation& memory, VkDeviceSize oldSize, VkDeviceSize newSize) {
     VkBuffer bigger;
     VmaAllocation biggerMemory;
-    createBuffer(newSize, geometryUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bigger, biggerMemory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(newSize, geometryUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bigger, biggerMemory, VK_NULL_HANDLE, true);
     if (buffer != VK_NULL_HANDLE) {
         if (oldSize > 0) {
-            copyBuffer(buffer, bigger, oldSize);
+            gpu.copyBuffer(buffer, bigger, oldSize);
         }
-        vkDestroyBuffer(device, buffer, nullptr);
-        vmaFreeMemory(allocator, memory);
+        vkDestroyBuffer(gpu.device, buffer, nullptr);
+        vmaFreeMemory(gpu.allocator, memory);
     }
     buffer = bigger;
     memory = biggerMemory;
 }
 
 // The shared buffers and the mesh infos (at shutdown); the BLASes stay (destroyBottomLevelAccelerationStructures)
-void Renderer::destroySceneGeometry() {
+void GpuScene::destroySceneGeometry() {
     for (auto [buffer, memory] : {std::pair{&gpuAssets.meshInfoBuffer, &gpuAssets.meshInfoBufferMemory},
                                   std::pair{&gpuAssets.indexBuffer, &gpuAssets.indexBufferMemory},
                                   std::pair{&gpuAssets.vertexBuffer, &gpuAssets.vertexBufferMemory}}) {
         if (*buffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(device, *buffer, nullptr);
-            vmaFreeMemory(allocator, *memory);
+            vkDestroyBuffer(gpu.device, *buffer, nullptr);
+            vmaFreeMemory(gpu.allocator, *memory);
             *buffer = VK_NULL_HANDLE;
             *memory = VK_NULL_HANDLE;
         }
@@ -530,14 +580,14 @@ void Renderer::destroySceneGeometry() {
 
 // The asset store unloaded what this belonged to. Nothing reads it after this frame's commands (updateScene waits
 // for the GPU before changing assets anyway), but the queue keeps that true if the wait goes away.
-void Renderer::releaseBlas(const AccelerationStructure& blas) {
+void GpuScene::releaseBlas(const AccelerationStructure& blas) {
     deferredDeletion.defer(frameNumber, [this, copy = blas]() mutable { destroyAccelerationStructure(copy); });
 }
 
-void Renderer::releaseTexture(const GpuTexture& texture) {
+void GpuScene::releaseTexture(const GpuTexture& texture) {
     deferredDeletion.defer(frameNumber, [this, texture] {
-        vkDestroyImageView(device, texture.view, nullptr);
-        vkDestroyImage(device, texture.image, nullptr);
-        vmaFreeMemory(allocator, texture.memory);  // the sampler is shared: it stays
+        vkDestroyImageView(gpu.device, texture.view, nullptr);
+        vkDestroyImage(gpu.device, texture.image, nullptr);
+        vmaFreeMemory(gpu.allocator, texture.memory);  // the sampler is shared: it stays
     });
 }

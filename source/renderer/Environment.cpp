@@ -87,19 +87,19 @@ static bool buildDistribution(const std::vector<float>& brightness, uint32_t col
 }
 
 // environmentTexture <- a new RGBA32F image of these pixels (sampler excluded: environmentSampler)
-void Renderer::uploadEnvironmentImage(uint32_t width, uint32_t height, const float* rgba) {
-    createImage(width, height, environmentFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                environmentTexture.image, environmentTexture.memory, environmentTexture.view);
+void GpuScene::uploadEnvironmentImage(uint32_t width, uint32_t height, const float* rgba) {
+    gpu.createImage(width, height, environmentFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    environmentTexture.image, environmentTexture.memory, environmentTexture.view);
     VkDeviceSize size = static_cast<VkDeviceSize>(width) * height * 4 * sizeof(float);
     VkBuffer stagingBuffer;
     VmaAllocation stagingMemory;
-    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
+    gpu.createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
     void* mapped;
-    vmaMapMemory(allocator, stagingMemory, &mapped);
+    vmaMapMemory(gpu.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, rgba, size);
-    vmaUnmapMemory(allocator, stagingMemory);
-    immediateSubmit([&](VkCommandBuffer cmd) {
+    vmaUnmapMemory(gpu.allocator, stagingMemory);
+    gpu.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -122,21 +122,21 @@ void Renderer::uploadEnvironmentImage(uint32_t width, uint32_t height, const flo
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
     });
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vmaFreeMemory(allocator, stagingMemory);
+    vkDestroyBuffer(gpu.device, stagingBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, stagingMemory);
 }
 
-void Renderer::destroyEnvironmentImage() {
-    vkDestroyImageView(device, environmentTexture.view, nullptr);
-    vkDestroyImage(device, environmentTexture.image, nullptr);
-    vmaFreeMemory(allocator, environmentTexture.memory);
+void GpuScene::destroyEnvironmentImage() {
+    vkDestroyImageView(gpu.device, environmentTexture.view, nullptr);
+    vkDestroyImage(gpu.device, environmentTexture.image, nullptr);
+    vmaFreeMemory(gpu.allocator, environmentTexture.memory);
     environmentTexture = {};
 }
 
-void Renderer::createEnvironment() {
+void GpuScene::createEnvironment() {
     // Wraps around horizontally, not over the poles. Linear filtering of 32-bit floats is optional in Vulkan.
     VkFormatProperties properties;
-    vkGetPhysicalDeviceFormatProperties(physicalDevice, environmentFormat, &properties);
+    vkGetPhysicalDeviceFormatProperties(gpu.physicalDevice, environmentFormat, &properties);
     bool linear = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -147,7 +147,7 @@ void Renderer::createEnvironment() {
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.maxLod = 0.0f;
-    if (vkCreateSampler(device, &samplerInfo, nullptr, &environmentSampler) != VK_SUCCESS) {
+    if (vkCreateSampler(gpu.device, &samplerInfo, nullptr, &environmentSampler) != VK_SUCCESS) {
         throw std::runtime_error("failed to create environment sampler!");
     }
 
@@ -157,15 +157,15 @@ void Renderer::createEnvironment() {
     createStreamedBuffer(environmentDistributionBuffer, 16 * 1024 * sizeof(float));  // grows for a map
 }
 
-void Renderer::destroyEnvironment() {
+void GpuScene::destroyEnvironment() {
     destroyEnvironmentImage();
-    vkDestroySampler(device, environmentSampler, nullptr);
+    vkDestroySampler(gpu.device, environmentSampler, nullptr);
     destroyStreamedBuffer(environmentDistributionBuffer);
 }
 
 // The scene's map (from the asset store) into environmentTexture, and its brightness per cell. Once per map: the
 // pixels are freed on the CPU afterwards.
-void Renderer::uploadEnvironmentMap(EnvironmentMap& map) {
+void GpuScene::uploadEnvironmentMap(EnvironmentMap& map) {
     uploadedEnvironmentId = map.id;
     environmentMapSize = glm::uvec2(0);
     environmentMapLuminance.clear();
@@ -194,22 +194,20 @@ void Renderer::uploadEnvironmentMap(EnvironmentMap& map) {
     }
 
     // Replace the image. Rare (picked in the UI), so simply wait for the GPU.
-    vkp.deviceWaitIdle(device);
+    waitIdle();
     destroyEnvironmentImage();
     uploadEnvironmentImage(width, height, pixels);
     map.pixels.clear();
     map.pixels.shrink_to_fit();  // the GPU has its copy now
 
     environmentMapSize = {width, height};
-    if (rtDescriptorSet != VK_NULL_HANDLE) {
-        updateRayTracingDescriptorSet();
-    }
-    cacheClearPending = true;  // the cached light came from the old sky
-    resetAccumulation = true;  // the uniforms may not change (same size, same settings)
+    changes.descriptors = true;
+    changes.clearCache = true;  // the cached light came from the old sky
+    changes.resetAccumulation = true;  // the uniforms may not change (same size, same settings)
 }
 
 // The scene shows a map and it is the one on the GPU
-bool Renderer::environmentMapReady() const {
+bool GpuScene::environmentMapReady() const {
     const SceneEnvironment& environment = renderList->environment;
     return environment.background == static_cast<int>(Background::Map) && assets.isLoaded(environment.map) &&
            assets.environmentMap(environment.map).id == uploadedEnvironmentId && environmentMapSize.x > 0;
@@ -218,7 +216,7 @@ bool Renderer::environmentMapReady() const {
 // Called every frame before drawFrame (after updateScene: it reads the render list's environment): uploads the
 // scene's map when it is a new one, and rebuilds the sampling table when what it depends on changed (not for
 // intensity or rotation: the table is relative and in the map's own directions).
-void Renderer::updateEnvironment() {
+void GpuScene::updateEnvironment() {
     const SceneEnvironment& environment = renderList->environment;
     Background mode = static_cast<Background>(environment.background);
     if (mode == Background::Map && assets.isLoaded(environment.map)) {
@@ -282,16 +280,14 @@ void Renderer::updateEnvironment() {
 
     VkDeviceSize size = sizeof(float) * environmentDistribution.size();
     if (size > environmentDistributionBuffer.capacity) {
-        vkp.deviceWaitIdle(device);  // the buffer is replaced, no frame may use it
+        waitIdle();  // the buffer is replaced, no frame may use it
         ensureStreamedCapacity(environmentDistributionBuffer, size);
-        if (rtDescriptorSet != VK_NULL_HANDLE) {
-            updateRayTracingDescriptorSet();
-        }
+        changes.descriptors = true;
     }
     environmentUploadPending = true;
 }
 
-void Renderer::recordEnvironmentUpload(VkCommandBuffer commandBuffer) {
+void GpuScene::recordEnvironmentUpload(VkCommandBuffer commandBuffer) {
     if (environmentCells.x > 0) {
         recordStreamedUpload(commandBuffer, environmentDistributionBuffer, environmentDistribution.data(),
                              sizeof(float) * environmentDistribution.size());

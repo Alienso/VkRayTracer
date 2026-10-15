@@ -16,11 +16,11 @@ void Renderer::initImGui(){
     // the UI over the image in the render pass
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.ApiVersion = VK_API_VERSION_1_3;  // as the instance's
-    init_info.Instance = instance;
-    init_info.PhysicalDevice = physicalDevice;
-    init_info.Device = device;
-    init_info.QueueFamily = graphicsQueueFamily;
-    init_info.Queue = graphicsQueue;
+    init_info.Instance = gpu.instance;
+    init_info.PhysicalDevice = gpu.physicalDevice;
+    init_info.Device = gpu.device;
+    init_info.QueueFamily = gpu.graphicsQueueFamily;
+    init_info.Queue = gpu.graphicsQueue;
     // ImGui makes its own descriptor pool, room for its font texture and textures we may show in the UI later
     init_info.DescriptorPoolSize = 100;
     init_info.MinImageCount = static_cast<uint32_t>(swapChainImages.size());
@@ -98,11 +98,11 @@ void Renderer::buildRenderingUi() {
                               "(The light tree weighs distance and angle itself.)");
         }
     }
-    if (lightTree.empty()) {
-        ImGui::TextDisabled("%zu glowing triangles", sampledEmissiveTriangles);
+    if (scene.lightTree.empty()) {
+        ImGui::TextDisabled("%zu glowing triangles", scene.sampledEmissiveTriangles);
     } else {
-        ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", sampledEmissiveTriangles,
-                            lightTree.size(), lightTreeDepth);
+        ImGui::TextDisabled("%zu glowing triangles, tree: %zu nodes, %u levels", scene.sampledEmissiveTriangles,
+                            scene.lightTree.size(), scene.lightTreeDepth);
     }
     ImGui::Checkbox("Texture mipmaps", &settings.textureMipmaps);
     if (ImGui::IsItemHovered()) {
@@ -319,37 +319,6 @@ void Renderer::buildDebugUi() {
     }
 }
 
-// Records commands with `function`, submits them and waits until the GPU is done.
-// Only meant for one-off setup work (uploads), not for per-frame rendering.
-void Renderer::immediateSubmit(std::function<void(VkCommandBuffer cmd)>&& function)
-{
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = commandPool;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    vkBeginCommandBuffer(cmd, &beginInfo);
-    function(cmd);
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-
-    vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(graphicsQueue);
-
-    vkFreeCommandBuffers(device, commandPool, 1, &cmd);
-}
 
 
 void Renderer::cleanupImGui(){

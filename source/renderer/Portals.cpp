@@ -8,18 +8,18 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include "renderer/Renderer.h"
 
-void Renderer::createPortalBuffer() {
+void GpuScene::createPortalBuffer() {
     createStreamedBuffer(portalBuffer, 16 * sizeof(GpuPortal));  // never empty: descriptors can't point at nothing
 }
 
-void Renderer::destroyPortalBuffer() {
+void GpuScene::destroyPortalBuffer() {
     destroyStreamedBuffer(portalBuffer);
 }
 
 // This frame's portal ends in world space, each with the way to its partner. Cheap, so every frame; uploaded only on
 // changes. A ray into one end comes out of the other with the same position and direction relative to it, turned
 // half around the vertical: in at the front, out at the front (and back to back).
-void Renderer::buildPortalList() {
+void GpuScene::buildPortalList() {
     framePortals.clear();
     const std::vector<RenderPortal>& portals = renderList->portals;
     for (size_t i = 0; i < portals.size(); i++) {
@@ -37,7 +37,7 @@ void Renderer::buildPortalList() {
     }
 }
 
-void Renderer::recordPortalUpload(VkCommandBuffer commandBuffer) {
+void GpuScene::recordPortalUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, portalBuffer, uploadedPortals.data(), sizeof(GpuPortal) * uploadedPortals.size());
     portalsUploadPending = false;
 }

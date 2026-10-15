@@ -340,7 +340,7 @@ glm::uvec3 distanceFieldSize(glm::vec3 lower, glm::vec3 upper) {
 
 }  // namespace
 
-GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32_t depth, VkFormat format,
+GpuTexture GpuScene::uploadVolumeTexture(uint32_t width, uint32_t height, uint32_t depth, VkFormat format,
                                          const void* data, size_t size, VkSampler sampler) {
     GpuTexture texture;
     texture.sampler = sampler;
@@ -358,7 +358,7 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    if (vmaCreateImage(allocator, &imageInfo, &allocationInfo, &texture.image, &texture.memory, nullptr) != VK_SUCCESS) {
+    if (vmaCreateImage(gpu.allocator, &imageInfo, &allocationInfo, &texture.image, &texture.memory, nullptr) != VK_SUCCESS) {
         throw std::runtime_error("failed to create volume texture!");
     }
     VkImageViewCreateInfo viewInfo{};
@@ -367,19 +367,19 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
     viewInfo.format = format;
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(device, &viewInfo, nullptr, &texture.view) != VK_SUCCESS) {
+    if (vkCreateImageView(gpu.device, &viewInfo, nullptr, &texture.view) != VK_SUCCESS) {
         throw std::runtime_error("failed to create volume texture view!");
     }
 
     VkBuffer stagingBuffer;
     VmaAllocation stagingMemory;
-    createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
+    gpu.createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingMemory);
     void* mapped;
-    vmaMapMemory(allocator, stagingMemory, &mapped);
+    vmaMapMemory(gpu.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, data, size);
-    vmaUnmapMemory(allocator, stagingMemory);
-    immediateSubmit([&](VkCommandBuffer cmd) {
+    vmaUnmapMemory(gpu.allocator, stagingMemory);
+    gpu.immediateSubmit([&](VkCommandBuffer cmd) {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -402,12 +402,12 @@ GpuTexture Renderer::uploadVolumeTexture(uint32_t width, uint32_t height, uint32
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
     });
-    vkDestroyBuffer(device, stagingBuffer, nullptr);
-    vmaFreeMemory(allocator, stagingMemory);
+    vkDestroyBuffer(gpu.device, stagingBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, stagingMemory);
     return texture;
 }
 
-void Renderer::createVolumeTextures() {
+void GpuScene::createVolumeTextures() {
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -415,11 +415,11 @@ void Renderer::createVolumeTextures() {
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.maxLod = 0.0f;
-    if (vkCreateSampler(device, &samplerInfo, nullptr, &volumeRepeatSampler) != VK_SUCCESS) {
+    if (vkCreateSampler(gpu.device, &samplerInfo, nullptr, &volumeRepeatSampler) != VK_SUCCESS) {
         throw std::runtime_error("failed to create volume sampler!");
     }
     samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    if (vkCreateSampler(device, &samplerInfo, nullptr, &volumeClampSampler) != VK_SUCCESS) {
+    if (vkCreateSampler(gpu.device, &samplerInfo, nullptr, &volumeClampSampler) != VK_SUCCESS) {
         throw std::runtime_error("failed to create volume sampler!");
     }
 
@@ -430,11 +430,11 @@ void Renderer::createVolumeTextures() {
     gpuAssets.volumeTextures = {gpuAssets.fogNoise};
 }
 
-void Renderer::destroyVolumeTextures() {
+void GpuScene::destroyVolumeTextures() {
     auto destroy = [&](GpuTexture& texture) {
-        vkDestroyImageView(device, texture.view, nullptr);
-        vkDestroyImage(device, texture.image, nullptr);
-        vmaFreeMemory(allocator, texture.memory);
+        vkDestroyImageView(gpu.device, texture.view, nullptr);
+        vkDestroyImage(gpu.device, texture.image, nullptr);
+        vmaFreeMemory(gpu.allocator, texture.memory);
     };
     destroy(gpuAssets.fogNoise);
     for (auto& entry : gpuAssets.distanceFields) {
@@ -442,13 +442,13 @@ void Renderer::destroyVolumeTextures() {
     }
     gpuAssets.distanceFields.clear();
     gpuAssets.volumeTextures.clear();
-    vkDestroySampler(device, volumeRepeatSampler, nullptr);
-    vkDestroySampler(device, volumeClampSampler, nullptr);
+    vkDestroySampler(gpu.device, volumeRepeatSampler, nullptr);
+    vkDestroySampler(gpu.device, volumeClampSampler, nullptr);
 }
 
 // The distance fields the meshes with varying fog need: baked if missing, released when the mesh went, and their
 // slots in the descriptor array written into the mesh infos. true: the descriptor set must be updated (the caller).
-bool Renderer::syncDistanceFields() {
+bool GpuScene::syncDistanceFields() {
     const std::vector<Mesh>& meshes = assets.meshes();
     const std::vector<uint64_t>& ids = assets.meshIds();
     std::map<uint64_t, GpuTexture> kept;
@@ -474,7 +474,7 @@ bool Renderer::syncDistanceFields() {
                 const MeshInfo& info = gpuAssets.meshInfos[m];  // its box, as the shader has it
                 glm::uvec3 dims = distanceFieldSize(info.boundsMin, info.boundsMax);
                 std::vector<uint16_t> texels = bakeDistanceField(meshes[m], info.boundsMin, info.boundsMax, dims);
-                vkp.deviceWaitIdle(device);  // (uploads wait anyway)
+                waitIdle();  // (uploads wait anyway)
                 it = kept.emplace(ids[m], uploadVolumeTexture(dims.x, dims.y, dims.z, VK_FORMAT_R16_SFLOAT, texels.data(),
                                                               texels.size() * sizeof(uint16_t), volumeClampSampler)).first;
                 changed = true;
@@ -497,14 +497,14 @@ bool Renderer::syncDistanceFields() {
         gpuAssets.meshInfos[m].distanceField = slots[m];
     }
     if (changed || slotsChanged) {
-        vkp.deviceWaitIdle(device);  // the descriptor set gets rewritten: no frame may use it
+        waitIdle();  // the descriptor set gets rewritten: no frame may use it
     }
     if (slotsChanged && gpuAssets.geometryUploaded) {
         // The mesh infos are small: a new buffer
-        vkDestroyBuffer(device, gpuAssets.meshInfoBuffer, nullptr);
-        vmaFreeMemory(allocator, gpuAssets.meshInfoBufferMemory);
-        createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(),
-                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
+        vkDestroyBuffer(gpu.device, gpuAssets.meshInfoBuffer, nullptr);
+        vmaFreeMemory(gpu.allocator, gpuAssets.meshInfoBufferMemory);
+        gpu.createDeviceLocalBuffer(gpuAssets.meshInfos.data(), sizeof(gpuAssets.meshInfos[0]) * gpuAssets.meshInfos.size(),
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gpuAssets.meshInfoBuffer, gpuAssets.meshInfoBufferMemory);
     }
     return changed || slotsChanged;
 }

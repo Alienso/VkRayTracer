@@ -38,7 +38,7 @@ void Renderer::applyOutputSize() {
     if (settings.outputSize == activeOutputSize) {
         return;
     }
-    vkp.deviceWaitIdle(device);
+    vkp.deviceWaitIdle(gpu.device);
     freeDlssResources();  // made for the old size
     activeOutputSize = settings.outputSize;
     recreateRenderImages();
@@ -78,7 +78,7 @@ void Renderer::applyPerPixelBuffers() {
     if (wantedPerPixelBuffers() == perPixelBuffers) {
         return;
     }
-    vkp.deviceWaitIdle(device);
+    vkp.deviceWaitIdle(gpu.device);
     recreateRenderImages();
 }
 
@@ -89,21 +89,21 @@ VkImageView Renderer::displayedHdrView() const {
 void Renderer::createDisplayImages() {
     // The display image gets blitted into the swapchain, which converts the format (RGBA -> BGRA, linear -> sRGB).
     VkFormatProperties swapchainFormatProperties;
-    vkGetPhysicalDeviceFormatProperties(physicalDevice, swapChainImageFormat, &swapchainFormatProperties);
+    vkGetPhysicalDeviceFormatProperties(gpu.physicalDevice, swapChainImageFormat, &swapchainFormatProperties);
     if (!(swapchainFormatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
         throw std::runtime_error("swap chain format does not support blitting into it!");
     }
 
     // Transitioned every frame (written here, then read by the blit), so no initial layout change is needed
-    createImage(outputExtent.width, outputExtent.height, displayFormat,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                displayImage, displayImageMemory, displayImageView, 1, true);
+    gpu.createImage(outputExtent.width, outputExtent.height, displayFormat,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    displayImage, displayImageMemory, displayImageView, 1, true);
 
     // DLSS modes: where DLSS writes the denoised, upscaled frame. Stays in GENERAL.
     if (dlssActive()) {
-        createImage(outputExtent, dlssOutputFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    dlssOutputImage);
-        immediateSubmit([&](VkCommandBuffer cmd) {
+        gpu.createImage(outputExtent, dlssOutputFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        dlssOutputImage);
+        gpu.immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -120,11 +120,11 @@ void Renderer::createDisplayImages() {
 }
 
 void Renderer::destroyDisplayImages() {
-    vkDestroyImageView(device, displayImageView, nullptr);
-    vkDestroyImage(device, displayImage, nullptr);
-    vmaFreeMemory(allocator, displayImageMemory);
+    vkDestroyImageView(gpu.device, displayImageView, nullptr);
+    vkDestroyImage(gpu.device, displayImage, nullptr);
+    vmaFreeMemory(gpu.allocator, displayImageMemory);
     if (dlssOutputImage.image != VK_NULL_HANDLE) {
-        destroyImage(dlssOutputImage);
+        gpu.destroyImage(dlssOutputImage);
     }
 }
 
@@ -144,7 +144,7 @@ void Renderer::createDisplayResources() {
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = displayBindingCount;
     layoutInfo.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &displayDescriptorSetLayout) != VK_SUCCESS) {
+    if (vkCreateDescriptorSetLayout(gpu.device, &layoutInfo, nullptr, &displayDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display descriptor set layout!");
     }
 
@@ -155,7 +155,7 @@ void Renderer::createDisplayResources() {
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &displayDescriptorPool) != VK_SUCCESS) {
+    if (vkCreateDescriptorPool(gpu.device, &poolInfo, nullptr, &displayDescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display descriptor pool!");
     }
 
@@ -164,7 +164,7 @@ void Renderer::createDisplayResources() {
     allocInfo.descriptorPool = displayDescriptorPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &displayDescriptorSetLayout;
-    if (vkAllocateDescriptorSets(device, &allocInfo, &displayDescriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(gpu.device, &allocInfo, &displayDescriptorSet) != VK_SUCCESS) {
         throw std::runtime_error("failed to allocate display descriptor set!");
     }
     updateDisplayDescriptorSet();
@@ -176,11 +176,11 @@ void Renderer::createDisplayResources() {
     pipelineLayoutInfo.pSetLayouts = &displayDescriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount = 1;
     pipelineLayoutInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &displayPipelineLayout) != VK_SUCCESS) {
+    if (vkCreatePipelineLayout(gpu.device, &pipelineLayoutInfo, nullptr, &displayPipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display pipeline layout!");
     }
 
-    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("display.comp.spv")));
+    VkShaderModule shaderModule = gpu.createShaderModule(readFile(Configuration::shaderPath("display.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -188,10 +188,10 @@ void Renderer::createDisplayResources() {
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
     pipelineInfo.layout = displayPipelineLayout;
-    if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &displayPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(gpu.device, gpu.pipelineCache, 1, &pipelineInfo, nullptr, &displayPipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display pipeline!");
     }
-    vkDestroyShaderModule(device, shaderModule, nullptr);
+    vkDestroyShaderModule(gpu.device, shaderModule, nullptr);
 }
 
 // The images are recreated with the swapchain, the output size and the render mode; called from recreateRenderImages.
@@ -219,7 +219,7 @@ void Renderer::updateDisplayDescriptorSet() {
             writes[i].pImageInfo = &imageInfos[i];
         }
     }
-    vkUpdateDescriptorSets(device, displayBindingCount, writes, 0, nullptr);
+    vkUpdateDescriptorSets(gpu.device, displayBindingCount, writes, 0, nullptr);
 }
 
 // Recorded after the trace and the exposure measurement. displayImage is already in GENERAL (transitioned at the
@@ -285,8 +285,8 @@ void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
 }
 
 void Renderer::destroyDisplayResources() {
-    vkDestroyPipeline(device, displayPipeline, nullptr);
-    vkDestroyPipelineLayout(device, displayPipelineLayout, nullptr);
-    vkDestroyDescriptorPool(device, displayDescriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, displayDescriptorSetLayout, nullptr);
+    vkDestroyPipeline(gpu.device, displayPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, displayPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, displayDescriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, displayDescriptorSetLayout, nullptr);
 }

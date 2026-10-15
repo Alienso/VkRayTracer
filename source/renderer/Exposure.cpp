@@ -27,10 +27,10 @@ static const float histogramLog2Range = 28.0f;
 
 void Renderer::createExposureResources() {
     // State buffer: histogram counters start at 0, the exposure at 1 (used by the very first frame)
-    createBuffer(sizeof(ExposureState),
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, exposureBuffer, exposureMemory);
-    immediateSubmit([&](VkCommandBuffer cmd) {
+    gpu.createBuffer(sizeof(ExposureState),
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, exposureBuffer, exposureMemory);
+    gpu.immediateSubmit([&](VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, exposureBuffer, 0, VK_WHOLE_SIZE, 0);
         // The second fill overwrites part of the first: in order
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -49,10 +49,10 @@ void Renderer::createExposureResources() {
     exposureReadbackMemories.resize(Configuration::maxFramesInFlight);
     exposureReadbackMapped.resize(Configuration::maxFramesInFlight);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        createBuffer(sizeof(ExposureState), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     exposureReadbackBuffers[i], exposureReadbackMemories[i]);
-        vmaMapMemory(allocator, exposureReadbackMemories[i], &exposureReadbackMapped[i]);
+        gpu.createBuffer(sizeof(ExposureState), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         exposureReadbackBuffers[i], exposureReadbackMemories[i]);
+        vmaMapMemory(gpu.allocator, exposureReadbackMemories[i], &exposureReadbackMapped[i]);
         std::memset(exposureReadbackMapped[i], 0, sizeof(ExposureState));
     }
 
@@ -65,7 +65,7 @@ void Renderer::createExposureResources() {
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layoutInfo.bindingCount = 2;
     layoutInfo.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &exposureDescriptorSetLayout) != VK_SUCCESS) {
+    if (vkCreateDescriptorSetLayout(gpu.device, &layoutInfo, nullptr, &exposureDescriptorSetLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create exposure descriptor set layout!");
     }
 
@@ -75,7 +75,7 @@ void Renderer::createExposureResources() {
     poolInfo.maxSets = 1;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &exposureDescriptorPool) != VK_SUCCESS) {
+    if (vkCreateDescriptorPool(gpu.device, &poolInfo, nullptr, &exposureDescriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("failed to create exposure descriptor pool!");
     }
 
@@ -84,7 +84,7 @@ void Renderer::createExposureResources() {
     allocInfo.descriptorPool = exposureDescriptorPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &exposureDescriptorSetLayout;
-    if (vkAllocateDescriptorSets(device, &allocInfo, &exposureDescriptorSet) != VK_SUCCESS) {
+    if (vkAllocateDescriptorSets(gpu.device, &allocInfo, &exposureDescriptorSet) != VK_SUCCESS) {
         throw std::runtime_error("failed to allocate exposure descriptor set!");
     }
     updateExposureDescriptorSet();
@@ -97,11 +97,11 @@ void Renderer::createExposureResources() {
     pipelineLayoutInfo.pSetLayouts = &exposureDescriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount = 1;
     pipelineLayoutInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &exposurePipelineLayout) != VK_SUCCESS) {
+    if (vkCreatePipelineLayout(gpu.device, &pipelineLayoutInfo, nullptr, &exposurePipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create exposure pipeline layout!");
     }
 
-    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("exposure.comp.spv")));
+    VkShaderModule shaderModule = gpu.createShaderModule(readFile(Configuration::shaderPath("exposure.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -109,10 +109,10 @@ void Renderer::createExposureResources() {
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
     pipelineInfo.layout = exposurePipelineLayout;
-    if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &exposurePipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(gpu.device, gpu.pipelineCache, 1, &pipelineInfo, nullptr, &exposurePipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create exposure pipeline!");
     }
-    vkDestroyShaderModule(device, shaderModule, nullptr);
+    vkDestroyShaderModule(gpu.device, shaderModule, nullptr);
 }
 
 // The HDR image is recreated with the swapchain and the render mode; called from recreateRenderImages.
@@ -130,7 +130,7 @@ void Renderer::updateExposureDescriptorSet() {
     writes[0].pImageInfo = &imageInfo;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[1].pBufferInfo = &bufferInfo;
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
 }
 
 // Recorded right after the trace dispatch. Skipped (no cost) while exposure is manual or a debug view other than the
@@ -209,17 +209,17 @@ void Renderer::recordExposure(VkCommandBuffer commandBuffer) {
 }
 
 void Renderer::destroyExposureResources() {
-    vkDestroyPipeline(device, exposurePipeline, nullptr);
-    vkDestroyPipelineLayout(device, exposurePipelineLayout, nullptr);
-    vkDestroyDescriptorPool(device, exposureDescriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, exposureDescriptorSetLayout, nullptr);
+    vkDestroyPipeline(gpu.device, exposurePipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, exposurePipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, exposureDescriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, exposureDescriptorSetLayout, nullptr);
     for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        vmaUnmapMemory(allocator, exposureReadbackMemories[i]);
-        vkDestroyBuffer(device, exposureReadbackBuffers[i], nullptr);
-        vmaFreeMemory(allocator, exposureReadbackMemories[i]);
+        vmaUnmapMemory(gpu.allocator, exposureReadbackMemories[i]);
+        vkDestroyBuffer(gpu.device, exposureReadbackBuffers[i], nullptr);
+        vmaFreeMemory(gpu.allocator, exposureReadbackMemories[i]);
     }
-    vkDestroyBuffer(device, exposureBuffer, nullptr);
-    vmaFreeMemory(allocator, exposureMemory);
+    vkDestroyBuffer(gpu.device, exposureBuffer, nullptr);
+    vmaFreeMemory(gpu.allocator, exposureMemory);
 }
 
 // Part of the "Rendering" section

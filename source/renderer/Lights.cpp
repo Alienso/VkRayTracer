@@ -21,44 +21,44 @@
 
 // Staging for all streamed buffers: a fixed size, however big they get (a staging copy of each, per frame in flight,
 // took ~700 MB of pinned system memory for Jungle Ruins' instances)
-void Renderer::createUploadRings() {
+void GpuScene::createUploadRings() {
     uploadRings.resize(Configuration::maxFramesInFlight);
     for (UploadRing& ring : uploadRings) {
-        createBuffer(uploadRingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     ring.buffer, ring.memory, VK_NULL_HANDLE, true);
-        vmaMapMemory(allocator, ring.memory, &ring.mapped);
+        gpu.createBuffer(uploadRingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         ring.buffer, ring.memory, VK_NULL_HANDLE, true);
+        vmaMapMemory(gpu.allocator, ring.memory, &ring.mapped);
     }
     uploadRingUsed = 0;
 }
 
-void Renderer::destroyUploadRings() {
+void GpuScene::destroyUploadRings() {
     for (UploadRing& ring : uploadRings) {
-        vmaUnmapMemory(allocator, ring.memory);
-        vkDestroyBuffer(device, ring.buffer, nullptr);
-        vmaFreeMemory(allocator, ring.memory);
+        vmaUnmapMemory(gpu.allocator, ring.memory);
+        vkDestroyBuffer(gpu.device, ring.buffer, nullptr);
+        vmaFreeMemory(gpu.allocator, ring.memory);
     }
     uploadRings.clear();
 }
 
-void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity, VkBufferUsageFlags usage,
+void GpuScene::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity, VkBufferUsageFlags usage,
                                     VkPipelineStageFlags readers) {
     streamed.capacity = capacity;
     streamed.usage = usage;
     streamed.readers = readers;
-    createBuffer(capacity, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
+    gpu.createBuffer(capacity, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                     streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
 }
 
-void Renderer::destroyStreamedBuffer(StreamedBuffer& streamed) {
-    vkDestroyBuffer(device, streamed.buffer, nullptr);
-    vmaFreeMemory(allocator, streamed.memory);
+void GpuScene::destroyStreamedBuffer(StreamedBuffer& streamed) {
+    vkDestroyBuffer(gpu.device, streamed.buffer, nullptr);
+    vmaFreeMemory(gpu.allocator, streamed.memory);
     streamed = {};
 }
 
 // Grows the buffer if `size` doesn't fit. Returns true if it was recreated (the descriptor set must then be
 // updated). Only call while no frame is in flight that uses it.
-bool Renderer::ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize size) {
+bool GpuScene::ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize size) {
     if (size <= streamed.capacity) {
         return false;
     }
@@ -72,7 +72,7 @@ bool Renderer::ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize siz
 
 // The pieces into the buffer: packed into this frame's part of the upload ring and copied over, after the buffer's
 // readers in the previous frame are done with the old contents, before its readers in this one
-void Renderer::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
+void GpuScene::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
                                     const std::vector<StreamedPiece>& pieces) {
     auto aligned = [](VkDeviceSize size) { return (size + 15) & ~VkDeviceSize(15); };
     VkDeviceSize total = 0;
@@ -117,8 +117,8 @@ void Renderer::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffe
 // a temporary staging buffer of the ring's size, a ring's worth at a time, the CPU waiting for each. The frames
 // still in flight are done with the buffer first. This frame's command buffer isn't submitted yet, so its readers
 // see the new contents. Rare, and a few dozen milliseconds for Jungle Ruins' instances.
-void Renderer::uploadStreamedNow(StreamedBuffer& streamed, const std::vector<StreamedPiece>& pieces) {
-    vkQueueWaitIdle(graphicsQueue);
+void GpuScene::uploadStreamedNow(StreamedBuffer& streamed, const std::vector<StreamedPiece>& pieces) {
+    vkQueueWaitIdle(gpu.graphicsQueue);
     VkDeviceSize total = 0;
     for (const StreamedPiece& piece : pieces) {
         total += piece.size;
@@ -127,15 +127,15 @@ void Renderer::uploadStreamedNow(StreamedBuffer& streamed, const std::vector<Str
     VkBuffer staging;
     VmaAllocation stagingMemory;
     void* mapped;
-    createBuffer(chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 staging, stagingMemory, VK_NULL_HANDLE, true);
-    vmaMapMemory(allocator, stagingMemory, &mapped);
+    gpu.createBuffer(chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     staging, stagingMemory, VK_NULL_HANDLE, true);
+    vmaMapMemory(gpu.allocator, stagingMemory, &mapped);
 
     std::vector<VkBufferCopy> copies;
     VkDeviceSize used = 0;
     auto flush = [&]() {
-        immediateSubmit([&](VkCommandBuffer cmd) {
+        gpu.immediateSubmit([&](VkCommandBuffer cmd) {
             vkCmdCopyBuffer(cmd, staging, streamed.buffer, static_cast<uint32_t>(copies.size()), copies.data());
         });
         copies.clear();
@@ -157,12 +157,12 @@ void Renderer::uploadStreamedNow(StreamedBuffer& streamed, const std::vector<Str
         flush();
     }
 
-    vmaUnmapMemory(allocator, stagingMemory);
-    vkDestroyBuffer(device, staging, nullptr);
-    vmaFreeMemory(allocator, stagingMemory);
+    vmaUnmapMemory(gpu.allocator, stagingMemory);
+    vkDestroyBuffer(gpu.device, staging, nullptr);
+    vmaFreeMemory(gpu.allocator, stagingMemory);
 }
 
-void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size) {
+void GpuScene::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size) {
     if (size == 0) {
         return;
     }
@@ -170,7 +170,7 @@ void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffe
 }
 
 // The same for some ranges of elements: each goes to the same place in the buffer
-void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
+void GpuScene::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
                                     VkDeviceSize elementSize, const std::vector<InstanceRange>& ranges) {
     if (ranges.empty()) {
         return;
@@ -199,7 +199,7 @@ void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffe
     recordStreamedCopies(commandBuffer, streamed, pieces);
 }
 
-void Renderer::createLightBuffers() {
+void GpuScene::createLightBuffers() {
     // Start small, they grow when needed. Never empty: descriptors can't point at nothing.
     createStreamedBuffer(emissiveTriangleBuffer, 1024 * sizeof(EmissiveTriangle));
     createStreamedBuffer(instanceLightBuffer, 256 * sizeof(int32_t));
@@ -207,7 +207,7 @@ void Renderer::createLightBuffers() {
     createStreamedBuffer(lightTreeBuffer, 2048 * sizeof(LightTreeNode));
 }
 
-void Renderer::destroyLightBuffers() {
+void GpuScene::destroyLightBuffers() {
     destroyStreamedBuffer(emissiveTriangleBuffer);
     destroyStreamedBuffer(instanceLightBuffer);
     destroyStreamedBuffer(punctualLightBuffer);
@@ -220,7 +220,7 @@ static float luminance(glm::vec3 color) {
 
 // Collects the emissive triangles of this frame's instances (renderList's, one to one with the TLAS's) in world
 // space.
-void Renderer::buildLightList(bool instancesChanged) {
+void GpuScene::buildLightList(bool instancesChanged) {
     lightListPicking = settings.lightPicking;
     auto emissionOf = [&](const Mesh& mesh) {
         const Material& material = assets.materials()[mesh.materialIndex].material;
@@ -331,7 +331,7 @@ void Renderer::buildLightList(bool instancesChanged) {
 // how much light it could send to the shading point (see pickFromLightTree). Built by splitting the triangles at
 // the median of their centers along the box's longest axis, down to one triangle per leaf, so the depth is
 // log2(triangles) rounded up, and the 32 bits of treeTrail are plenty.
-void Renderer::buildLightTree() {
+void GpuScene::buildLightTree() {
     lightTree.clear();
     lightTreeDepth = 0;
 
@@ -401,7 +401,7 @@ void Renderer::buildLightTree() {
     build(build, 0, 0, triangles.size(), 0, 0);
 }
 
-void Renderer::recordLightUpload(VkCommandBuffer commandBuffer) {
+void GpuScene::recordLightUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, emissiveTriangleBuffer, emissiveTriangles.data(),
                          sizeof(EmissiveTriangle) * emissiveTriangles.size());
     if (instanceLightsUploadPending) {
@@ -420,7 +420,7 @@ void Renderer::recordLightUpload(VkCommandBuffer commandBuffer) {
 // for them.
 
 // This frame's lights in world space, from the render list. Cheap, so every frame; uploaded only on changes.
-void Renderer::buildPunctualLightList() {
+void GpuScene::buildPunctualLightList() {
     framePunctualLights.clear();
     if (!settings.punctualLights) {
         return;
@@ -448,7 +448,7 @@ void Renderer::buildPunctualLightList() {
     }
 }
 
-void Renderer::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
+void GpuScene::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, punctualLightBuffer, uploadedPunctualLights.data(),
                          sizeof(GpuPunctualLight) * uploadedPunctualLights.size());
     punctualLightsUploadPending = false;
@@ -458,7 +458,7 @@ void Renderer::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
 void Renderer::buildPunctualLightSettingsUi() {
     ImGui::Checkbox("Enabled##punctual", &settings.punctualLights);
     ImGui::SameLine();
-    ImGui::TextDisabled("%zu lights", framePunctualLights.size());
+    ImGui::TextDisabled("%zu lights", scene.framePunctualLights.size());
     ImGui::SliderFloat("Scale##punctual", &settings.punctualLightScale, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Multiplies every light from the files (KHR_lights_punctual). They come in candela (point,\n"

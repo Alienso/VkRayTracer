@@ -34,7 +34,7 @@ static const char* renderModeName(int mode) {
 // Created when first needed (the reference image takes ~6 MB at 1600x900). The GPU must be idle, so this is
 // only called from the UI and from scripted runs, never while frames are in flight.
 void Renderer::ensureNoiseResources() {
-    vkp.deviceWaitIdle(device);
+    vkp.deviceWaitIdle(gpu.device);
 
     if (!noiseResourcesCreated) {
         // 0 = displayed HDR image, 1 = reference, 2 = workgroup sums (one set per frame in flight)
@@ -47,7 +47,7 @@ void Renderer::ensureNoiseResources() {
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = 3;
         layoutInfo.pBindings = bindings;
-        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &noiseDescriptorSetLayout) != VK_SUCCESS) {
+        if (vkCreateDescriptorSetLayout(gpu.device, &layoutInfo, nullptr, &noiseDescriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create noise descriptor set layout!");
         }
 
@@ -59,7 +59,7 @@ void Renderer::ensureNoiseResources() {
         poolInfo.maxSets = sets;
         poolInfo.poolSizeCount = 2;
         poolInfo.pPoolSizes = poolSizes;
-        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &noiseDescriptorPool) != VK_SUCCESS) {
+        if (vkCreateDescriptorPool(gpu.device, &poolInfo, nullptr, &noiseDescriptorPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create noise descriptor pool!");
         }
         std::vector<VkDescriptorSetLayout> layouts(sets, noiseDescriptorSetLayout);
@@ -69,7 +69,7 @@ void Renderer::ensureNoiseResources() {
         allocInfo.descriptorSetCount = sets;
         allocInfo.pSetLayouts = layouts.data();
         noiseDescriptorSets.resize(sets);
-        if (vkAllocateDescriptorSets(device, &allocInfo, noiseDescriptorSets.data()) != VK_SUCCESS) {
+        if (vkAllocateDescriptorSets(gpu.device, &allocInfo, noiseDescriptorSets.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate noise descriptor sets!");
         }
 
@@ -80,10 +80,10 @@ void Renderer::ensureNoiseResources() {
         pipelineLayoutInfo.pSetLayouts = &noiseDescriptorSetLayout;
         pipelineLayoutInfo.pushConstantRangeCount = 1;
         pipelineLayoutInfo.pPushConstantRanges = &pushRange;
-        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &noisePipelineLayout) != VK_SUCCESS) {
+        if (vkCreatePipelineLayout(gpu.device, &pipelineLayoutInfo, nullptr, &noisePipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create noise pipeline layout!");
         }
-        VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("noise.comp.spv")));
+        VkShaderModule shaderModule = gpu.createShaderModule(readFile(Configuration::shaderPath("noise.comp.spv")));
         VkComputePipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -91,10 +91,10 @@ void Renderer::ensureNoiseResources() {
         pipelineInfo.stage.module = shaderModule;
         pipelineInfo.stage.pName = "main";
         pipelineInfo.layout = noisePipelineLayout;
-        if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &noisePipeline) != VK_SUCCESS) {
+        if (vkCreateComputePipelines(gpu.device, gpu.pipelineCache, 1, &pipelineInfo, nullptr, &noisePipeline) != VK_SUCCESS) {
             throw std::runtime_error("failed to create noise pipeline!");
         }
-        vkDestroyShaderModule(device, shaderModule, nullptr);
+        vkDestroyShaderModule(gpu.device, shaderModule, nullptr);
         noisePending.assign(Configuration::maxFramesInFlight, NoisePending{});
         noiseResourcesCreated = true;
     }
@@ -103,9 +103,9 @@ void Renderer::ensureNoiseResources() {
     // is compared.
     if (noiseReferenceImage.image == VK_NULL_HANDLE || noiseReferenceExtent.width != outputExtent.width ||
         noiseReferenceExtent.height != outputExtent.height) {
-        destroyImage(noiseReferenceImage);
-        createImage(outputExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, noiseReferenceImage);
-        immediateSubmit([&](VkCommandBuffer cmd) {
+        gpu.destroyImage(noiseReferenceImage);
+        gpu.createImage(outputExtent, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, noiseReferenceImage);
+        gpu.immediateSubmit([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -125,18 +125,18 @@ void Renderer::ensureNoiseResources() {
     uint32_t groups = ((outputExtent.width + 15) / 16) * ((outputExtent.height + 15) / 16);
     if (groups > noiseGroupCapacity) {
         for (size_t i = 0; i < noiseSumBuffers.size(); i++) {
-            vmaUnmapMemory(allocator, noiseSumMemories[i]);
-            vkDestroyBuffer(device, noiseSumBuffers[i], nullptr);
-            vmaFreeMemory(allocator, noiseSumMemories[i]);
+            vmaUnmapMemory(gpu.allocator, noiseSumMemories[i]);
+            vkDestroyBuffer(gpu.device, noiseSumBuffers[i], nullptr);
+            vmaFreeMemory(gpu.allocator, noiseSumMemories[i]);
         }
         noiseSumBuffers.resize(Configuration::maxFramesInFlight);
         noiseSumMemories.resize(Configuration::maxFramesInFlight);
         noiseSumMapped.resize(Configuration::maxFramesInFlight);
         for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-            createBuffer(2 * sizeof(glm::vec4) * groups, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         noiseSumBuffers[i], noiseSumMemories[i]);
-            vmaMapMemory(allocator, noiseSumMemories[i], &noiseSumMapped[i]);
+            gpu.createBuffer(2 * sizeof(glm::vec4) * groups, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             noiseSumBuffers[i], noiseSumMemories[i]);
+            vmaMapMemory(gpu.allocator, noiseSumMemories[i], &noiseSumMapped[i]);
         }
         noiseGroupCapacity = groups;
     }
@@ -172,7 +172,7 @@ void Renderer::updateNoiseDescriptorSets() {
         writes[0].pImageInfo = &measuredInfo;
         writes[1].pImageInfo = &referenceInfo;
         writes[2].pBufferInfo = &sumInfo;
-        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+        vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
     }
 }
 
@@ -397,15 +397,15 @@ void Renderer::destroyNoiseResources() {
     if (!noiseResourcesCreated) {
         return;
     }
-    vkDestroyPipeline(device, noisePipeline, nullptr);
-    vkDestroyPipelineLayout(device, noisePipelineLayout, nullptr);
-    vkDestroyDescriptorPool(device, noiseDescriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device, noiseDescriptorSetLayout, nullptr);
-    destroyImage(noiseReferenceImage);
+    vkDestroyPipeline(gpu.device, noisePipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, noisePipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, noiseDescriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, noiseDescriptorSetLayout, nullptr);
+    gpu.destroyImage(noiseReferenceImage);
     for (size_t i = 0; i < noiseSumBuffers.size(); i++) {
-        vmaUnmapMemory(allocator, noiseSumMemories[i]);
-        vkDestroyBuffer(device, noiseSumBuffers[i], nullptr);
-        vmaFreeMemory(allocator, noiseSumMemories[i]);
+        vmaUnmapMemory(gpu.allocator, noiseSumMemories[i]);
+        vkDestroyBuffer(gpu.device, noiseSumBuffers[i], nullptr);
+        vmaFreeMemory(gpu.allocator, noiseSumMemories[i]);
     }
     noiseResourcesCreated = false;
 }
