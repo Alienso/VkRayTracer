@@ -72,9 +72,10 @@ VkAccelerationStructureInstanceKHR Renderer::makeTlasInstance(const RenderInstan
     instance.transform = toVkTransform(renderInstance.world);
     instance.instanceCustomIndex = renderInstance.mesh;  // 24 bits for us; the shader uses it to find the mesh
     const Material& material = assets.materials()[gpuAssets.meshInfos[renderInstance.mesh].materialIndex].material;
-    // Rays look at everything (0xFF); fog volumes are also in groups of their own, which mediumAt looks at alone:
-    // 0x02 even fog, 0x04 varying (see "Fog" there). The rest: 0x01.
-    instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : 0x01;
+    // Rays look at everything (0xFF); fog and glass volumes are also in groups of their own, which mediumAt looks at
+    // alone: 0x02 even fog, 0x04 varying, 0x08 solid glass (see "Fog" and "Glass volumes" there). The rest: 0x01.
+    bool glassVolume = material.transmission > 0.0f && material.solid;
+    instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : glassVolume ? 0x08 : 0x01;
     instance.instanceShaderBindingTableRecordOffset = 0;
     instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     // Materials a ray can pass through (needsHitTest) are "not opaque": rays ask the shader whether a hit on

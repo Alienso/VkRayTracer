@@ -14,12 +14,18 @@ already counted that light.
 - Where: `shadowTransmittance`, the `throughGlass` / `reflectedOnce` rules in `tracePath` (shaders/raytrace.comp).
 - Fix: photon mapping, manifold next-event estimation, or path guiding.
 
-### Rough glass lit by the sun sparkles
-Looking through frosted glass at a light (sun or lamp) is only found when a scattered ray happens to hit the
-light, so it shows fireflies that fade slowly (yellow rough sphere in TransmissionTest).
-- Why: the transmission lobe is only sampled, never evaluated, so there is no light sampling through it.
-- Where: `sampleBrdf` (transmission branch), `evaluateBrdf` covers reflection only.
-- Fix: evaluate the rough BTDF (Walter et al. 2007) and include it in light sampling + MIS.
+### Light sampling through rough glass only where nothing reflected before
+Rough glass (roughness 0.1 and up) light-samples what is behind it: a thin pane, or solid glass where the path
+leaves it into air (BTDF of Walter et al. 2007, MIS with the bounce). Only on the camera's side of the first
+reflection, and its shadow rays stop at more glass. So these still sparkle: frosted glass seen in a mirror (the
+mirror's straight shadow ray stands in for it, and counts nothing visible), and a light seen through frosted glass
+and then more glass behind it (a frosted pane in front of a clear one: only bounce rays find the light).
+Measured unbiased (thin and solid slab with the sun and a lamp behind it, 16k frames: within 0.2% of before,
+which still sparkled at 16k).
+- Why: after a reflection, its straight shadow ray already counted the light behind the glass (see "No
+  caustics"); also light-sampling the glass would count it twice.
+- Where: `glassLit`, `hit.lightThrough` in `tracePath`; `evaluateGlassTransmission`.
+- Fix: comes with caustics (a reflection's shadow rays would have to stop at glass, too).
 
 ### Transmission energy split is approximate
 The light that goes through is `(1 - reflection albedo) * transmission * base color`, averaged over the
@@ -34,18 +40,24 @@ The glTF reference applies the base color at every surface event; we apply it wh
 every crossing). Colored solid glass is therefore lighter than in the reference.
 - Where: `sampleBrdf` (weight includes albedo), `sampleGlassExit` (weight 1), `shadowTransmittance` (`entering`).
 
-### Volumes assume closed meshes and a camera outside
-Absorption is applied when a ray hits the back face of a solid material, over the distance since the previous
-hit. Breaks for open meshes, a camera inside glass, nested or overlapping volumes (glass in water), and objects
-inside glass. The radiance scaling by (n1/n2)^2 at interfaces is ignored (cancels when entering and leaving
-the same object).
-- Where: `tracePath` (absorption, `leavingGlass`).
-- Fix: a medium stack along the path.
+### Glass volumes: no priorities, closed meshes
+Paths keep which solid glass they are in, in the fog's list of media (up to 4 volumes; see "Glass volumes" in
+the shader). The glass entered last is the one the path is in; overlapping volumes are resolved by that alone,
+as glTF has no priorities. For liquids modelled into their glass's wall (Bistro) the glass-to-water boundary is
+then a few mm early; ice poking out of water bends at the water's surface inside the ice (1.31 vs 1.33). Meshes
+must be closed. The radiance scaling by (n1/n2)^2 at interfaces is ignored (cancels when entering and leaving).
+Shadow rays still add up each volume's absorption separately, so where volumes overlap both absorb. Scenes with
+solid glass use the fog pipelines (the plain ones without the media were 6% faster on Sponza).
+- Where: `tracePath` (`glassHere`, `insideGlass`, `passThrough`), `mediumAt`, `shadowTransmittance`.
+- Fix: per-volume priorities (Schmidt & Budge 2002) set in the editor.
 
-### Light trapped inside glass is cut off
-Paths that bounce around inside glass (total internal reflection) end at `maxBounces`. Clear solid glass in
-the white furnace reaches 93% of the background at 8 bounces, 96.6% at 16.
-- Fix: no cap for transmission events (with Russian roulette), or a separate bounce budget for glass.
+### Glass passes have a budget of their own
+Passes through glass (in, out, reflected inside) don't count towards Max bounces, but at most 16 of them per path
+(`MAX_GLASS_PASSES`). Clear solid glass in the white furnace now matches the background (before: 93% at 8
+bounces). Close-ups full of glass cost more: Bistro's glass of water with ice up close took 46-60 ms instead of
+33 (the old image was dark and murky there); a budget of 8 was back at 35 ms but lost up to 40% of the light in
+the glass.
+- Where: `glassPasses` in `tracePath`.
 
 ### Absorption units
 glTF gives the attenuation distance in the file's world units; the shader converts mesh units using the

@@ -17,9 +17,10 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // RESTIR_PASS = 3, its shading (restirGiShade).
 layout(constant_id = 0) const uint CACHE_UPDATE_PASS = 0;
 layout(constant_id = 1) const uint RESTIR_PASS = 0;
-// FOG = 1: some material has fog inside or an invisible surface (see "Fog"). Each pass has a pipeline without the fog's
-// code too, for scenes without: less code (image paths 289 KB instead of 366, varying fog 396). The register counts
-// don't follow the size: the driver gives the plain image paths 168 and the fog ones 128 (2026-10-13).
+// FOG = 1: some material has fog inside or an invisible surface (see "Fog"), or is solid glass (paths keep their media
+// for both, see "Glass volumes"). Each pass has a pipeline without the fog's code too, for scenes without: less code
+// (image paths 289 KB instead of 366, varying fog 396). The register counts don't follow the size: the driver gives the
+// plain image paths 168 and the fog ones 128 (2026-10-13). Keeping the media in the plain pipeline made Sponza 6% slower.
 layout(constant_id = 2) const uint FOG = 0;
 // FEATURES: which of the scene features below the pipeline has the code for (a bit each, all by default). Without one,
 // the scene must not use it: the code assumes it away (no portals, lamps, glass, cut-outs or diffuse transmission).
@@ -579,7 +580,6 @@ struct Hit {
     uint materialIndex;
     int lightIndex;         // this triangle in emissiveTriangles, -1 if it doesn't glow
     bool frontFace;         // hit from the outside (the side the normals point to)
-    float objectScale;      // length of one world unit along the ray in the model file's units (for absorption)
 
     // Material at this point (constants * textures)
     vec3 albedo;            // base color
@@ -589,10 +589,11 @@ struct Hit {
     float transmission;
     float ior;
     bool solid;
-    vec3 absorption;
     float diffuseTransmission;
     vec3 diffuseTransmissionColor;
     vec3 emissive;
+    // Set by tracePath: light sampling here also looks through the glass (see "Light through rough glass")
+    bool lightThrough;
 };
 
 // Texture reads at a hit, filtered over the hit's footprint (see uvFootprint): the GPU picks the mip level and
@@ -637,7 +638,7 @@ void evaluateMaterial(inout Hit hit) {
     }
     hit.ior = material.ior;
     hit.solid = material.solid != 0;
-    hit.absorption = material.absorption;
+    hit.lightThrough = false;
 
     hit.diffuseTransmission = FEATURE_DIFFUSE_TRANSMISSION ? material.diffuseTransmission : 0.0;
     if (FEATURE_DIFFUSE_TRANSMISSION && material.diffuseTransmissionTexture >= 0) {
@@ -884,6 +885,44 @@ uint mediumMaterial(uint instance) {
     return meshInfos[instances[instance].meshIndex].materialIndex;
 }
 
+// Glass volumes. Solid glass (a transmissive material on a closed mesh, KHR_materials_volume) is a medium too, kept
+// in the same list as the fog: a path knows which glass it is in, so it can start inside glass (the camera under
+// water: mediumAt), pass objects inside glass, and go from one glass into another (water in a glass, ice in the
+// water). The glass it is in is the one of its media it entered last; it absorbs along the way (Beer's law), and at
+// a surface the light bends by the ratio of the indices of refraction on both sides (tracePath).
+// Liquids are usually modelled overlapping their container: the water's outer surface lies inside the glass wall,
+// not on its inner surface (Bistro's glasses). Entering the water there counts (the glass to water boundary is then
+// there, a few mm early); leaving the glass while in the water that came later changes nothing, and the ray passes
+// on unchanged. (Renderers that do this exactly give each volume a priority, which glTF doesn't have.)
+// Only in the pipelines with FOG: a scene with solid glass uses those (the plain ones assume there is none).
+const uint GLASS_MASK = 0x08u;  // TLAS group of the glass volumes (mediumAt)
+
+bool glassMaterial(uint material) {
+    return FEATURE_GLASS && materials[material].transmission > 0.0 && materials[material].solid != 0;
+}
+
+// The glass the path is in: the last of its media that is glass (NO_MEDIUM: none, it is in air or fog only)
+uint currentGlass(uvec2 media) {
+    for (uvec2 rest = media; FOG != 0 && FEATURE_GLASS && firstMedium(rest) != NO_MEDIUM; rest = otherMedia(rest)) {
+        if (glassMaterial(mediumMaterial(firstMedium(rest)))) {
+            return firstMedium(rest);
+        }
+    }
+    return NO_MEDIUM;
+}
+
+// The index of refraction in a glass volume (NO_MEDIUM: air, 1)
+float glassIor(uint glass) {
+    return glass == NO_MEDIUM ? 1.0 : materials[mediumMaterial(glass)].ior;
+}
+
+// What the light keeps going a distance t along direction through a glass volume. Its absorption is per unit of the
+// model file (the glTF node's scale, MeshInfo.unitScale).
+vec3 glassTransmittance(uint glass, vec3 direction, float t) {
+    float units = length(instanceWorldToObject(glass) * direction) * meshInfos[instances[glass].meshIndex].unitScale;
+    return exp(-materials[mediumMaterial(glass)].absorption * t * units);
+}
+
 bool fogVaries(uint material) {
     return FOG >= 2 && (materials[material].fogNoise != 0 || materials[material].fogEdge > 0.0);
 }
@@ -1022,20 +1061,22 @@ float pastSurface(float tMin, float t) {
     return max(tMin, t - max(1e-4, t * 1e-5));
 }
 
-// The fog volumes p is in: the fog surfaces straight above it, in order; a volume whose first one is seen from the
-// inside holds p. Up to MAX_VOLUME_CROSSINGS surfaces and MAX_MEDIA volumes.
+// The volumes (fog, glass) p is in: their surfaces straight above it, in order; a volume whose first one is seen from
+// the inside holds p. Up to MAX_VOLUME_CROSSINGS surfaces and MAX_MEDIA volumes. (Nested ones come out in the order
+// they are seen from p, the innermost first: as if entered from the outside in.)
 uvec2 mediumAt(vec3 p) {
     uvec2 media = OUTSIDE;
     uvec2 seen = OUTSIDE;
     float tMin = 0.0;
     uvec4 passed = uvec4(~0u);
+    uint mask = FOG_MASK | VARYING_FOG_MASK | (FEATURE_GLASS ? GLASS_MASK : 0u);
+    uint held = 0;
     for (uint crossing = 0; crossing < MAX_VOLUME_CROSSINGS; crossing++) {
         uint instance;
         int primitive;
         float t;
         bool entering;
-        if (!nextFogSurface(p, vec3(0.0, 1.0, 0.0), tMin, RAY_FAR, FOG_MASK | VARYING_FOG_MASK, passed, instance,
-                            primitive, t, entering)) {
+        if (!nextFogSurface(p, vec3(0.0, 1.0, 0.0), tMin, RAY_FAR, mask, passed, instance, primitive, t, entering)) {
             break;
         }
         if (!inMedium(seen, instance)) {
@@ -1044,7 +1085,7 @@ uvec2 mediumAt(vec3 p) {
             }
             seen = enterMedium(seen, instance);
             if (!entering) {
-                media = enterMedium(media, instance);
+                setMediaSlot(media, held++, instance);  // behind the ones found before: those are further in
             }
         }
         tMin = pastSurface(tMin, t);
@@ -1459,7 +1500,6 @@ Hit hitFromIntersection(Intersection intersection, vec3 direction, float coneWid
 
     // The normals still point outwards here: tells whether the ray enters or leaves a solid.
     hit.frontFace = dot(hit.geometricNormal, direction) < 0.0;
-    hit.objectScale = length(instanceWorldToObject(hit.instanceIndex) * direction) * mesh.unitScale;
 
     // Triangles are double-sided: if we hit the back, flip both normals towards the ray.
     if (!hit.frontFace) {
@@ -1500,7 +1540,6 @@ Hit fogHit(vec3 position, vec3 direction, float t, uint medium) {
     hit.materialIndex = FOG_MATERIAL;
     hit.lightIndex = -1;
     hit.frontFace = true;
-    hit.objectScale = 1.0;
     hit.albedo = materials[medium].fogColor;
     hit.alpha = 1.0;
     hit.metallic = 0.0;
@@ -1508,10 +1547,10 @@ Hit fogHit(vec3 position, vec3 direction, float t, uint medium) {
     hit.transmission = 0.0;
     hit.ior = 1.0;
     hit.solid = false;
-    hit.absorption = vec3(0.0);
     hit.diffuseTransmission = 1.0;
     hit.diffuseTransmissionColor = vec3(1.0);
     hit.emissive = vec3(0.0);
+    hit.lightThrough = false;
     return hit;
 }
 
@@ -1750,8 +1789,8 @@ float fresnelDielectric(float cosIncident, float eta) {
 
 // Reflected light towards v per unit of light arriving from l (the BRDF value), and the pdf with which
 // sampleBrdf would pick l. Covers the reflecting layers (cosL > 0) and diffuse transmission (cosL < 0, light
-// arriving from the other side of a thin surface). Light arriving through glass (specular transmission) is never
-// evaluated this way (see shadowTransmittance and tracePath).
+// arriving from the other side of a thin surface). Light arriving through glass (specular transmission) is not
+// evaluated here (see shadowTransmittance and tracePath; rough glass: evaluateGlassTransmission).
 // Takes only what the formulas need: the cosines of v and l with the shading normal, of v with the half vector h,
 // and h's sine^2 and cosine with the normal. These don't depend on the frame, so the light loop in tracePath can
 // evaluate it from world-space vectors (evaluateBrdfWorld) without keeping a shading frame in registers.
@@ -1798,11 +1837,60 @@ vec3 evaluateBrdf(Hit hit, vec3 v, vec3 l, out float pdf) {
     return evaluateBrdfAngles(hit, v.z, l.z, dot(v, h), h.x * h.x + h.y * h.y, h.z, pdf);
 }
 
+// Light through rough glass (hit.lightThrough, see tracePath): the transmission lobe as a BTDF, so light sampling can
+// look through frosted glass. Value per unit of light from l (per cosine), and the pdf with which the bounce picks l.
+// Both ways of going through give the path a fixed weight w (sampleBrdf's thin pane: the transmitted share over the
+// lobe's chance; sampleGlassExit: 1), so the BTDF is simply w * pdf / |cos l|, and it agrees with the sampling exactly.
+// Thin: the reflection lobe mirrored to the other side. Leaving solid glass: refraction from glass (ior) into air
+// through the microfacet h halfway between them (Walter et al. 2007, "Microfacet Models for Refraction through Rough
+// Surfaces"), picked among the visible ones and taken with chance 1 - Fresnel, as sampleGlassExit does.
+// l is on the other side (dot(n, l) < 0).
+vec3 evaluateGlassTransmission(Hit hit, vec3 n, vec3 v, vec3 l, out float pdf) {
+    float alpha = ggxAlpha(hit.roughness);
+    float cosV = dot(n, v);
+    float cosL = dot(n, l);
+    if (hit.solid) {
+        vec3 h = -(hit.ior * v + l);
+        h = normalize(dot(n, h) < 0.0 ? -h : h);
+        float cosVH = dot(v, h);
+        float cosLH = dot(l, h);
+        float spread = hit.ior * cosVH + cosLH;  // dh / dl = |cos_lh| / spread^2
+        if (cosVH <= 0.0 || cosLH >= 0.0 || spread <= 0.0) {
+            pdf = 0.0;
+            return vec3(0.0);
+        }
+        vec3 hAcross = cross(n, h);
+        float visibleNormals = smithG1(cosV, alpha) * cosVH * ggxDistribution(dot(hAcross, hAcross), dot(n, h), alpha) / cosV;
+        pdf = visibleNormals * (1.0 - fresnelDielectric(cosVH, hit.ior)) * -cosLH / (spread * spread);
+        return vec3(pdf / -cosL);
+    }
+    vec3 h = normalize(v + l - 2.0 * cosL * n);
+    vec3 hAcross = cross(n, h);
+    float lobePdf = smithG1(cosV, alpha) * ggxDistribution(dot(hAcross, hAcross), dot(n, h), alpha) / (4.0 * cosV);
+    ReflectionEnergy energy = reflectionEnergy(hit, cosV);
+    LobeProbabilities p = lobeProbabilities(hit, energy);
+    pdf = p.transmission * lobePdf;
+    return (1.0 - hit.metallic) * hit.transmission * (1.0 - energy.dielectricAlbedo) * hit.albedo * lobePdf / -cosL;
+}
+
 // The same with world-space directions and the shading normal n. dot(n, v) > 0.
+// With hit.lightThrough, light from the other side also comes through the glass: leaving solid glass only that way
+// (sampleGlassExit has nothing else), on a thin pane besides its diffuse transmission.
 vec3 evaluateBrdfWorld(Hit hit, vec3 n, vec3 v, vec3 l, out float pdf) {
+    vec3 glass = vec3(0.0);
+    float glassPdf = 0.0;
+    if (FEATURE_GLASS && hit.lightThrough && dot(n, l) < 0.0) {
+        glass = evaluateGlassTransmission(hit, n, v, l, glassPdf);
+        if (hit.solid) {
+            pdf = glassPdf;
+            return glass;
+        }
+    }
     vec3 h = normalize(v + l);
     vec3 hAcross = cross(n, h);  // its length is the sine
-    return evaluateBrdfAngles(hit, dot(n, v), dot(n, l), dot(v, h), dot(hAcross, hAcross), dot(n, h), pdf);
+    vec3 brdf = evaluateBrdfAngles(hit, dot(n, v), dot(n, l), dot(v, h), dot(hAcross, hAcross), dot(n, h), pdf);
+    pdf += glassPdf;
+    return brdf + glass;
 }
 
 // Samples a microfacet normal from the facets visible from v (VNDF), so no samples are wasted on facets that
@@ -1873,6 +1961,13 @@ bool sampleBrdf(Hit hit, vec3 v, vec3 random, out vec3 l, out vec3 weight, out f
             l.z = -l.z;
         }
         pdf = 0.0;
+        if (hit.lightThrough) {
+            // Light sampling looks through it too: the pdf for MIS (as evaluateGlassTransmission, with the diffuse
+            // transmission's share, which also goes this way)
+            float alpha = ggxAlpha(hit.roughness);
+            pdf = p.transmission * smithG1(v.z, alpha) * ggxDistribution(h.x * h.x + h.y * h.y, h.z, alpha) / (4.0 * v.z)
+                  + p.diffuseTransmission * -l.z / PI;
+        }
         weight = (1.0 - hit.metallic) * hit.transmission * (1.0 - energy.dielectricAlbedo) * hit.albedo / p.transmission;
         return true;
     }
@@ -1902,15 +1997,26 @@ bool sampleBrdf(Hit hit, vec3 v, vec3 random, out vec3 l, out vec3 weight, out f
 // Inside solid glass, at the surface on the way out: either reflect back inside or refract out into the air,
 // chosen by the exact Fresnel reflectance of the visible microfacet. Light isn't lost or tinted here (the tint
 // was applied on the way in; absorption on the way through), so the weight is 1 either way.
+// hit.ior: n_glass / n_air (or the other side's, see "Glass volumes"). pdf: refracted out with hit.lightThrough, for
+// MIS (as evaluateGlassTransmission); else 0.
 // random: x chooses reflection or refraction, y and z the microfacet
-bool sampleGlassExit(Hit hit, vec3 v, vec3 random, out vec3 l) {
-    vec3 h = sampleGgxVisibleNormal(v, ggxAlpha(hit.roughness), random.yz);
-    float fresnel = fresnelDielectric(dot(v, h), hit.ior);  // n_glass / n_air
+bool sampleGlassExit(Hit hit, vec3 v, vec3 random, out vec3 l, out float pdf) {
+    float alpha = ggxAlpha(hit.roughness);
+    vec3 h = sampleGgxVisibleNormal(v, alpha, random.yz);
+    float cosVH = dot(v, h);
+    float fresnel = fresnelDielectric(cosVH, hit.ior);
+    pdf = 0.0;
     if (random.x < fresnel) {
         l = reflect(-v, h);
         return l.z > 0.0;
     }
     l = refract(-v, h, hit.ior);
+    if (hit.lightThrough && l.z < 0.0) {
+        float cosLH = dot(l, h);
+        float spread = hit.ior * cosVH + cosLH;
+        pdf = smithG1(v.z, alpha) * cosVH * ggxDistribution(h.x * h.x + h.y * h.y, h.z, alpha) / v.z
+              * (1.0 - fresnel) * -cosLH / max(spread * spread, 1e-12);
+    }
     return l.z < 0.0;
 }
 
@@ -2445,7 +2551,7 @@ float lightCandidateReach(EmissiveTriangle light, vec3 p, vec3 n, bool twoSided)
 LightSample sampleEmissiveLight(Hit hit, vec3 shadingNormal, vec3 surfacePoint, vec4 random, inout uint seed) {
     LightSample s = noLightSample();
     // 1: pick a triangle
-    bool twoSided = hit.diffuseTransmission > 0.0;
+    bool twoSided = hit.diffuseTransmission > 0.0 || hit.lightThrough;
     int lightIndex = -1;
     float pickProbability = 0.0;
     float weightSum = 0.0;
@@ -2809,6 +2915,7 @@ Hit unpackRestirSurface(RestirSurface surface) {
     hit.diffuseTransmission = FEATURE_DIFFUSE_TRANSMISSION ? material.z : 0.0;
     hit.diffuseTransmissionColor = unpackUnorm4x8(surface.diffuseTransmissionColor).rgb;
     hit.transmission = 0.0;  // ReSTIR surfaces have none
+    hit.lightThrough = false;
     return hit;
 }
 
@@ -3486,6 +3593,12 @@ const uint CACHE_PROBES = 8;
 const uint CACHE_MAX_VERTICES = 4;
 const float MIRROR_ROUGHNESS = 0.01;    // smoother reflections count as mirrors: no Russian roulette after them
 const float CACHE_ROUGHNESS = 0.25;     // smoother surfaces (and glass) reflect too sharply to be cached
+// Smoother glass doesn't light-sample what is behind it (see glassLit): its lobe is so narrow that bounce rays find the
+// lights about as well, and every shadow ray would be wasted
+const float GLASS_LIGHT_ROUGHNESS = 0.1;
+// Passes through glass a path may make besides its bounces (see glassPasses in tracePath): a glass of water with ice
+// seen through takes about ten
+const uint MAX_GLASS_PASSES = 16;
 const float CACHE_MAX_RADIANCE = 256.0; // one sample's light is clamped to this (rare glints of the sun)
 // A cell averages its whole area, so in a corner it holds more light than the corner itself gets (the walls
 // further out are brighter). A path that reached the cell with a short ray, i.e. from right next to it (inside
@@ -3685,6 +3798,13 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // Otherwise a glossy table reflecting the window would only get the shadow rays, which rarely hit its narrow
     // reflection: fireflies. So the sky needs to know about solid glass, and the last reflection's pdf.
     bool throughSolidGlass = false;  // went through solid glass since the last reflection
+    // Light through rough glass. Seen through frosted glass, a lamp or the sun is found only when the spread-out ray
+    // happens to hit it: fireflies. So where there was no reflection yet, rough glass light-samples what lies behind it
+    // (hit.lightThrough: a thin pane, or solid glass where the path leaves it; evaluateGlassTransmission), and shares
+    // the light its bounce ray finds by MIS, like a reflection. Its shadow rays stop at more glass: that light is the
+    // next glass's (if rough), or its bounce rays' (counted fully then). After a reflection the reflection's straight
+    // shadow ray already counted the light behind the glass (see above), so glass doesn't.
+    bool glassLit = false;  // the last light sampling was at rough glass (no reflection yet)
     // Portals gone through since the last reflection. Light sampling reaches the sun and the punctual lights through
     // one of them (light images, see "Portals"), nothing else through any: whatever else such a ray finds (a glowing surface, the
     // sky, the sun after two) counts fully, and isn't that surface's direct light for the radiance cache either
@@ -3706,17 +3826,23 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
     // pixel collected before. 3 = it found no surface that can be one.
     uint giState = 0;
     vec3 giImageLight = vec3(0.0);
-    // The fog the path is in (see "Fog")
+    // The fog and glass the path is in (see "Fog", "Glass volumes")
     uvec2 media = FOG != 0 ? mediumAt(origin) : OUTSIDE;
+    // Passes through glass (in or out, or reflected inside) don't count as bounces: light that gets trapped inside
+    // glass (total internal reflection) would otherwise run out of bounces and be lost, and a window would cost two.
+    // They have a budget of their own (MAX_GLASS_PASSES). "bounce" below counts both (its random numbers, the first
+    // surface's special cases), depth only the bounces (Max bounces, the radiance cache's windows, Russian roulette).
+    uint glassPasses = 0;
 
     // maxBounces surfaces get lit (by light sampling and their bounce ray). The bounce ray leaving the last one
     // is still traced, but only to collect what it sees directly (sky or a glowing surface): light sampling
     // already counts direct light at that last surface, so without this ray, sky and glowing surfaces found
     // by bouncing would be one bounce short, and the methods wouldn't agree. (Update paths: lastBounce, see above.)
-    for (uint bounce = 0; bounce <= lastBounce; bounce++) {
+    for (uint bounce = 0; bounce - glassPasses <= lastBounce; bounce++) {
+        uint depth = bounce - glassPasses;
         // light found at this hit (the sky, the sun, a glowing surface). Not in a GI sample's Lo (see "ReSTIR GI").
         uint clampDepth = giState == 2 ? 0u : reflections;
-        lightBounce = bounce;
+        lightBounce = depth;
         // (not traceClosest: one copy of the code that builds a Hit, called once here, keeps the shader smaller)
         Intersection intersection;
         bool found;
@@ -3768,7 +3894,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // The lamps' light fog scatters into this stretch (not the final ray's: as at its end, see below). Not in
         // update paths: one more shadow ray took them from 128 registers to 168; their scatter points light-sample
         // the lamps instead (noisier, but the cache averages it).
-        if (CACHE_UPDATE_PASS == 0 && intersection.lampWeight > 0.0 && bounce < scene.maxBounces) {
+        if (CACHE_UPDATE_PASS == 0 && intersection.lampWeight > 0.0 && depth < scene.maxBounces) {
             ADD_LIGHT(throughput * fogLampLight(origin, direction, intersection, bounce, seed));
         }
         bool crossedPortal = intersection.travelled != 0.0;
@@ -3779,8 +3905,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             hit = hitFromIntersection(intersection, direction, coneWidth, coneSpread);
         }
         if (FOG != 0 && intersection.inFog) {
-            // Scattered in fog before anything: the path's vertex is there. Its color: the share that goes on; in
-            // glass, also what its absorption took on the way (in world units here)
+            // Scattered in fog before anything: the path's vertex is there. Its color: the share that goes on (in
+            // glass, what the glass absorbed on the way: below)
             uint medium = intersection.fogMedium;
             if (reflections == 0 && giState != 2) {
                 cameraRayFog = 1.0;  // the camera sees this fog (see radianceImage)
@@ -3790,7 +3916,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // every scatter: after a few dozen (high Max bounces), cosines above 1 made the phase function NaN
             direction = normalize(direction);
             hit = fogHit(scatterPoint, direction, intersection.travelled + intersection.t, medium);
-            throughput *= materials[medium].fogColor * exp(-materials[medium].absorption * intersection.t);
+            throughput *= materials[medium].fogColor;
             if (bounce == 0 && wantGuides) {
                 guidesRetrace = true;  // the guides: of what is behind the fog
             }
@@ -3809,7 +3935,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 break;  // lost in portals: no light
             }
             vec3 skyLight = throughput * environmentLight(direction);
-            if (scene.environmentSampling == 0 || !reflectedOnce || portalCrossings > 0) {
+            bool lightSampled = reflectedOnce || (glassLit && !throughGlass);  // where this ray started, or before
+            if (scene.environmentSampling == 0 || !lightSampled || portalCrossings > 0) {
                 ADD_LIGHT(skyLight);  // nothing else finds it (the camera sees the sky, maybe through glass)
             } else if (!throughSolidGlass && !restirReflection) {
                 // The bounce-sampling share of the last surface's direct skylight, also through thin panes. Unlike
@@ -3824,7 +3951,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 vec3 sunRadiance = scene.sunColor.rgb * scene.sunRadianceScale;
                 // Its image through a portal is light-sampled only through one, and only with "Shadows" (as there)
                 bool sunImaged = portalCrossings == 1 && scene.shadowsEnabled != 0;
-                if (!reflectedOnce || (portalCrossings > 0 && !sunImaged)) {
+                if (!lightSampled || (portalCrossings > 0 && !sunImaged)) {
                     ADD_LIGHT(throughput * sunRadiance);  // the camera sees it (maybe through glass), or portals
                 } else if (sunImaged && CACHE_UPDATE_PASS != 0) {
                     // Update paths sample no light images: the bounce counts it fully, as the last surface's direct
@@ -3844,9 +3971,36 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             guidesRetrace = guideMirror(hit);
         }
 
-        // Leaving a solid from the inside: the ray just travelled hit.t through it, losing light (Beer's law).
-        if (hit.solid && !hit.frontFace) {
-            throughput *= exp(-hit.absorption * hit.t * hit.objectScale);
+        // Glass volumes (see there). The ray just travelled hit.t through the glass it is in, losing light (Beer's law).
+        // Leaving glass it didn't know it was in (more than the media can hold), it was in that one.
+        bool glassSurface = FOG != 0 && FEATURE_GLASS && hit.solid && glassMaterial(hit.materialIndex);  // (fog's isn't solid)
+        bool leavingUnknown = glassSurface && !hit.frontFace && !inMedium(media, hit.instanceIndex);
+        uint glassHere = currentGlass(media);
+        if (leavingUnknown && glassHere == NO_MEDIUM) {
+            glassHere = hit.instanceIndex;
+        }
+        if (glassHere != NO_MEDIUM) {
+            throughput *= glassTransmittance(glassHere, direction, hit.t);
+        }
+        // At a glass surface: which glass is on either side. From here on hit.ior is the ratio of their indices of
+        // refraction. Into glass from air (or fog) as n_glass / n_air, which sampleBrdf expects; otherwise the ray is
+        // in glass here (insideGlass), and it is n_here / n_there for sampleGlassExit: out into air, or into
+        // another glass (from the glass into the water in it). passThrough: out of a glass while in one entered
+        // after it (the water's surface inside the glass's wall): nothing changes, the ray goes on.
+        bool insideGlass = false;
+        bool passThrough = false;
+        bool outIntoAir = false;
+        if (glassSurface) {
+            if (hit.frontFace) {
+                insideGlass = glassHere != NO_MEDIUM;
+                hit.ior = insideGlass ? glassIor(glassHere) / hit.ior : hit.ior;
+            } else {
+                uint glassThere = currentGlass(leaveMedium(media, hit.instanceIndex));
+                insideGlass = true;
+                passThrough = glassHere != hit.instanceIndex;
+                outIntoAir = glassThere == NO_MEDIUM;
+                hit.ior /= glassIor(glassThere);
+            }
         }
 
         // Light given off by the surface itself. Seen directly by the camera it always counts. Found by a bounce
@@ -3862,7 +4016,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                                               reflectionTwoSided) > 0.0 ? 0.0 : 1.0;
             } else if (reflectedOnce && throughGlass) {
                 weight = 0.0;
-            } else if (reflectedOnce) {
+            } else if (reflectedOnce || (glassLit && !throughGlass)) {
                 if (scene.emissiveSampling == EMISSIVE_LIGHT_SAMPLING) {
                     weight = 0.0;
                 } else {
@@ -3876,8 +4030,11 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // Found by the bounce of a surface that also light-sampled it: part of that surface's direct light
             ADD_LIGHT_EXCEPT(throughput * hit.emissive * weight, reflectedOnce && lightSampled ? previousVertex : -1);
         }
-        if (bounce == lastBounce) {
-            break;  // the final ray: only what it sees counts
+        // The final ray: only what it sees counts, also through glass (a pass is no bounce: it goes on, unless the
+        // glass reflects it). No light sampling at glass then.
+        bool finalRay = depth == lastBounce;
+        if (finalRay && !(FEATURE_GLASS && hit.transmission > 0.0)) {
+            break;
         }
 
         // ReSTIR GI: the second surface of a GI pixel. Its glow (above) stays the first surface's; everything after
@@ -3921,8 +4078,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     int entry = cacheFindOrInsert(slot, fingerprint);
                     if (entry >= 0) {
                         currentVertex = int(cacheVertices);
-                        cacheEntries[cacheVertices] = uint(entry) | (min(bounce, 255u) << 24u);
-                        lastBounce = bounce + cacheDepth;
+                        cacheEntries[cacheVertices] = uint(entry) | (min(depth, 255u) << 24u);
+                        lastBounce = depth + cacheDepth;
                         // Channels that carry (almost) nothing can't tell how bright the light behind them is
                         cacheInverseThroughput[cacheVertices] = mix(vec3(0.0), 1.0 / max(throughput, vec3(1e-8)),
                                                                     greaterThan(throughput, vec3(1e-6)));
@@ -3949,8 +4106,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             }
         }
 
-        // Inside glass there is nothing to light-sample: lights are outside, behind the glass surface.
-        bool leavingGlass = hit.solid && !hit.frontFace && hit.transmission > 0.0;
+        // Inside glass there is nothing to light-sample: lights are outside, behind the glass surface. Unless it is rough,
+        // the path had no reflection yet, and air is behind it: then the lights behind it (see glassLit).
+        bool leavingGlass = insideGlass;
+        hit.lightThrough = FEATURE_GLASS && !reflectedOnce && hit.transmission > 0.0 && hit.metallic < 1.0
+                           && hit.roughness >= GLASS_LIGHT_ROUGHNESS
+                           && (glassSurface ? outIntoAir && !passThrough : !hit.solid);
         // The first surface with ReSTIR DI: slot 2 takes the reservoir's sample instead of a glowing triangle,
         // the sky slot is left out, and the punctual ones if the reservoir has them (more than a few lights)
         bool restirVertex = bounce == 0 && usePrimaryHit && !isFog(hit)
@@ -3959,7 +4120,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                 && intersection.crossings == 0) {  // through portals no, in mirrors yes (see "Mirrors and ReSTIR")
             giState = 1;
         }
-        if (!leavingGlass) {
+        if ((!leavingGlass || hit.lightThrough) && !finalRay) {
             // Direct light: one shadow ray per kind of light (see LightSample). Slot 0: the sun, 1: the sky, 2: the
             // glowing triangles, 3 and up: the punctual lights, then the sun's and the punctual lights' images through
             // each portal end (portalLightImage). One loop, so the shadow ray and the BRDF exist only
@@ -3967,7 +4128,7 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             // shadow rays. Shadow rays start slightly off the surface so they don't hit the surface they start on,
             // along the real triangle plane's normal (the smooth normal can point a bit into the surface).
             clampDepth = giState == 2 ? 0u : reflections + 1;  // light this surface reflects
-            lightBounce = bounce + 1;
+            lightBounce = depth + 1;
             // (none at a scatter point in the fog: the stretches before take the lamps' light, see fogLampLight)
             uint lightSlots = (restirVertex && scene.restirPunctualCandidates > 0) || (isFog(hit) && CACHE_UPDATE_PASS == 0)
                               ? 3 : 3 + punctualLightSamples();
@@ -4022,12 +4183,13 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     continue;
                 }
 
-                // In front of the surface, or behind a thin one that lets light through (diffuse transmission).
-                // The shading normal and the real triangle must agree on the side.
+                // In front of the surface, or behind a thin one that lets light through (diffuse transmission, rough
+                // glass). Leaving glass, only behind: in front is inside the glass. The shading normal and the real
+                // triangle must agree on the side.
                 float cosLight = dot(hit.normal, s.direction);
                 float side = dot(hit.geometricNormal, s.direction);
-                bool behind = cosLight < 0.0 && side < 0.0 && hit.diffuseTransmission > 0.0;
-                if (!((cosLight > 0.0 && side > 0.0) || behind)) {
+                bool behind = cosLight < 0.0 && side < 0.0 && (hit.diffuseTransmission > 0.0 || hit.lightThrough);
+                if (!((cosLight > 0.0 && side > 0.0 && !leavingGlass) || behind)) {
                     continue;
                 }
                 float pdfBounce;  // how likely the bounce sampling would have picked this direction
@@ -4052,6 +4214,9 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
                     // frame is known to be seen from its own surface (restirTemporal counts on that)
                     if (restirVertex && slot == 2 && all(equal(transmittance, vec3(0.0)))) {
                         reservoirs[restirIndex(pixel, false)].W = 0.0;
+                    }
+                    if (behind && hit.lightThrough && crossedGlass) {
+                        continue;  // through rough glass and more glass: the bounce rays' (see glassLit)
                     }
                 }
                 // Behind glass, bounce rays don't find the light (they are bent), so the shadow ray counts it fully.
@@ -4085,8 +4250,12 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
             l = toLocal(frame, sampleFogDirection(direction, materials[hit.meshIndex].fogForward, bounceRandom.xy, bouncePdf));
             lobeRoughness = 1.0;
             specularLobe = false;
+        } else if (passThrough) {
+            l = -v;  // on unchanged (see insideGlass)
+            lobeRoughness = 0.0;
+            transmitted = true;
         } else if (leavingGlass) {
-            if (!sampleGlassExit(hit, v, bounceRandom.xyz, l)) {
+            if (!sampleGlassExit(hit, v, bounceRandom.xyz, l, bouncePdf)) {
                 break;
             }
             transmitted = true;  // in or out, the path stays "through glass" for the light rules above
@@ -4130,28 +4299,33 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         if (throughSurface ? side >= 0.0 : side <= 0.0) {
             break;
         }
+        // Through glass that light-sampled what is behind it (not reflected back inside: nothing to find there).
+        // bouncePdf is then the pdf for MIS (see glassLit).
+        bool glassSampled = transmitted && hit.lightThrough && throughSurface;
         // Through the surface of a mesh with fog: into its fog or out of it (see "Fog"). Solid glass, and thin glass
-        // too (a bubble of smoke: it doesn't bend the ray, but the fog is still inside)
-        if (FOG != 0 && throughSurface && materials[hit.materialIndex].fogDensity > 0.0) {
+        // too (a bubble of smoke: it doesn't bend the ray, but the fog is still inside). Solid glass without fog too
+        // (see "Glass volumes").
+        if (throughSurface && (glassSurface || (FOG != 0 && materials[hit.materialIndex].fogDensity > 0.0))) {
             media = hit.frontFace ? enterMedium(media, hit.instanceIndex) : leaveMedium(media, hit.instanceIndex);
         }
         throughput *= weight;
         // Continue from just off the surface, on the side the new ray goes to.
         origin = offsetRay(hit.position, throughSurface ? -hit.geometricNormal : hit.geometricNormal);
-        if (transmitted) {
+        if (transmitted && !glassSampled) {
             throughGlass = true;
             throughSolidGlass = throughSolidGlass || hit.solid;
         } else {
             throughGlass = false;
             throughSolidGlass = false;
             portalCrossings = 0;
-            reflectedOnce = true;
-            reflections++;
+            reflectedOnce = reflectedOnce || !transmitted;
+            glassLit = transmitted;
+            reflections += transmitted ? 0u : 1u;
             restirReflection = restirVertex;
             reflectionPdf = bouncePdf;
             reflectionPosition = hit.position;
             reflectionNormal = hit.normal;
-            reflectionTwoSided = hit.diffuseTransmission > 0.0;
+            reflectionTwoSided = hit.diffuseTransmission > 0.0 || hit.lightThrough;
         }
 
         // Russian roulette: after a few bounces, randomly stop paths that carry little light and
@@ -4163,12 +4337,18 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         // facing each other) the throughput drops fast, and the few survivors, boosted 10x and more, made the
         // nested reflections speckled. Max bounces still ends such paths.
         bool mirrorBounce = specularLobe && lobeRoughness < MIRROR_ROUGHNESS;
-        if (bounce >= 2 && !mirrorBounce) {
+        if (depth >= 2 && !mirrorBounce) {
             float survive = min(max(throughput.r, max(throughput.g, throughput.b)), 1.0);
             if (bounceRandom.w >= survive) {
                 break;
             }
             throughput /= survive;
+        }
+        if (transmitted) {
+            glassPasses++;  // no bounce (see glassPasses)
+            if (glassPasses > MAX_GLASS_PASSES) {
+                break;
+            }
         }
     }
 

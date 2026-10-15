@@ -470,7 +470,7 @@ struct RenderSettings {
     // Points on glowing triangles: spread evenly over the triangle's solid angle as the surface sees it (Arvo 1995),
     // or evenly over its area (then a large panel close by gets most samples in its far parts)
     bool emissiveSolidAngle = true;
-    int maxBounces = 8;  // glass needs a few: in and out of each pane; Russian roulette ends matte paths early
+    int maxBounces = 8;  // passes through glass don't count (see glassPasses); Russian roulette ends matte paths early
     bool blurCaustics = true;  // less noise from light reflected by shiny surfaces onto matte ones, slightly biased
     bool textureMipmaps = true;  // read textures at the level that fits each hit (off: always the full size)
     bool normalMapFiltering = true;  // Toksvig: distant bumpy surfaces keep their blurrier reflection
@@ -846,9 +846,10 @@ private:
     VkPipeline rtRestirGiShadePipeline;  // RESTIR_PASS = 3: ReSTIR GI's shading, after the image pass
     VkPipeline rtRestirGiTemporalPipeline;  // RESTIR_PASS = 4: ReSTIR GI's temporal reuse, before its shading
     VkPipeline rtRestirGiSpatialPipeline;   // RESTIR_PASS = 5: ReSTIR GI's spatial reuse, between those two
-    // The same seven with FOG = 1, used while some material has fog inside or an invisible surface, and with FOG = 2
-    // while some fog varies through its volume (fogLevel). Scenes without fog use the plain ones, which leave the fog's
-    // code out (smaller; the register counts don't follow the size, see FOG in the shader).
+    // The same seven with FOG = 1, used while some material has fog inside or an invisible surface or is solid glass
+    // (the paths then keep which volumes they are in), and with FOG = 2 while some fog varies through its volume
+    // (fogLevel). Scenes without either use the plain ones, which leave that code out (smaller; the register counts
+    // don't follow the size, see FOG in the shader).
     VkPipeline rtFogPipelines[2][7] = {};
     uint32_t fogLevel = 0;  // this frame's FOG (buildSceneUniforms)
     VkPipeline tracePipeline(VkPipeline plain) const;  // plain, or its fog version in a fog scene

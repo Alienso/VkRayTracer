@@ -956,6 +956,9 @@ SceneUniforms Renderer::buildSceneUniforms() {
     fogLevel = 0;
     bool fogDrifts = false;
     for (const SceneMaterial& material : assets.materials()) {
+        if (material.material.transmission > 0.0f && material.material.solid) {
+            fogLevel = std::max(fogLevel, 1u);  // glass volumes (see FOG in the shader)
+        }
         if (fogVaries(material.material)) {
             fogLevel = 2;
             fogDrifts = fogDrifts || (material.material.fogNoise && material.material.fogDrift != glm::vec3(0.0f));
