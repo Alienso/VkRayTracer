@@ -18,7 +18,9 @@ public:
     static const float cameraFar;   // also the depth written where rays hit nothing (sky)
     static const std::vector<const char*> validationLayers;
     static const std::vector<const char*> deviceExtensions;
-    static const bool enableValidationLayers;
+    // The Vulkan validation layer: on in Debug builds, off in Release; --validation / --no-validation (main.cpp)
+    // override it. It slows the CPU side (every Vulkan call is checked): off for timing runs.
+    static bool enableValidationLayers;
     static const int maxFramesInFlight;
 
     Configuration()= default;

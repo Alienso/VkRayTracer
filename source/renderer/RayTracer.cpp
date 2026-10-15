@@ -794,7 +794,7 @@ void Renderer::createTracePipelines(bool basic) {
             if (pipelineStatisticsSupported) {
                 pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
             }
-            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, pipeline) != VK_SUCCESS) {
+            if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, pipeline) != VK_SUCCESS) {
                 failed = true;
             }
         });
@@ -849,6 +849,7 @@ void Renderer::updateTracePipelines() {
     vkp.deviceWaitIdle(device);  // the pipelines are replaced, no frame may use them
     destroyTracePipelines();
     createTracePipelines(settings.basicShader);
+    savePipelineCache();  // the newly compiled ones, for the next switch (or run)
     resetAccumulation = true;  // a different shader: a different image where the scene has the features
 }
 

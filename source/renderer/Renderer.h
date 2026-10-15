@@ -21,6 +21,10 @@
 #include "renderer/GpuAssets.h"
 #include "core/Configuration.h"
 
+// The structs the shaders read ("must match") are checked for size (static_assert after each): a change here fails
+// the build, as a reminder to change the shader's copy too. The sizes are the shaders' (spirv-cross --reflect on the
+// .spv). Only the size: two fields swapped, or a change on the shader side alone, still go unnoticed.
+
 // Must match the SceneUniforms block in shaders/raytrace.comp (std140: matrices and vec4s first, no vec3s)
 struct SceneUniforms {
     glm::mat4 viewProjection;          // this frame, without jitter (motion vectors)
@@ -109,6 +113,7 @@ struct SceneUniforms {
     uint32_t cacheFog;               // 1 = scatter points in fog have radiance cache cells too
     uint32_t maxPortalCrossings;     // portals a ray may go through; at least 1
 };
+static_assert(sizeof(SceneUniforms) == 564, "SceneUniforms must match SceneUniforms in shaders/raytrace.comp");
 
 // Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
 // Ruins has 2.9 million instances (the inverse matrix is the shader's to work out, the motion its object's).
@@ -118,6 +123,7 @@ struct GpuInstance {
     uint32_t meshIndex;         // as the TLAS instance's custom index (fog volumes are known by their instance)
     uint32_t motion;            // index into the motions, binding 34 (RenderList::motions: one per object)
 };
+static_assert(sizeof(GpuInstance) == 56, "GpuInstance must match InstanceData in shaders/raytrace.comp");
 
 // One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
 struct GpuPrimaryHit {
@@ -132,6 +138,7 @@ struct GpuPrimaryHit {
     uint32_t tintRG;         // the mirrors' color (half floats)
     uint32_t tintB;
 };
+static_assert(sizeof(GpuPrimaryHit) == 52, "GpuPrimaryHit must match PrimaryHit in shaders/raytrace.comp");
 
 // One per render pixel, binding 28: the image path's first bounce at a ReSTIR surface, traced by the ReSTIR pass as
 // its BRDF candidate. Must match BounceHit in shaders/raytrace.comp.
@@ -146,6 +153,7 @@ struct GpuBounceHit {
     uint32_t weightBRoughness;
     float pdf;
 };
+static_assert(sizeof(GpuBounceHit) == 48, "GpuBounceHit must match BounceHit in shaders/raytrace.comp");
 
 // Three per render pixel (this frame's, last frame's, and the ReSTIR pass's result for the spatial pass), binding 26:
 // ReSTIR DI's light sample. Must match Reservoir in shaders/raytrace.comp.
@@ -155,6 +163,7 @@ struct GpuReservoir {
     float W;
     float M;
 };
+static_assert(sizeof(GpuReservoir) == 16, "GpuReservoir must match Reservoir in shaders/raytrace.comp");
 
 // Three per render pixel (this frame's, last frame's, the image pass's fresh samples), binding 29: ReSTIR GI's sample.
 // Must match GiReservoir in shaders/raytrace.comp.
@@ -166,6 +175,7 @@ struct GpuGiReservoir {
     float M;
     uint32_t age;  // frames since the sample was found (bits 0-15), GI_SEEN flag; written by the shader only
 };
+static_assert(sizeof(GpuGiReservoir) == 40, "GpuGiReservoir must match GiReservoir in shaders/raytrace.comp");
 
 // Two per render pixel, binding 27: the first surface, packed, for ReSTIR's reuse. Must match RestirSurface in
 // shaders/raytrace.comp.
@@ -179,6 +189,7 @@ struct GpuRestirSurface {
     glm::vec3 seenAt;        // where the camera sees it (in mirrors: its image)
     uint32_t view;           // towards the viewer (octahedral)
 };
+static_assert(sizeof(GpuRestirSurface) == 48, "GpuRestirSurface must match RestirSurface in shaders/raytrace.comp");
 
 // Must match the push constants in shaders/cache_resolve.comp
 struct CacheResolvePushConstants {
@@ -187,6 +198,7 @@ struct CacheResolvePushConstants {
     float maxWeight;  // cap of a cell's sample weight
     uint32_t maxAge;  // frames without new samples until a cell is freed
 };
+static_assert(sizeof(CacheResolvePushConstants) == 16, "CacheResolvePushConstants must match the push constants in shaders/cache_resolve.comp");
 
 // Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the display pass
 // reads the exposure from it, and a copy comes back to the CPU (a few frames late) for the UI.
@@ -201,6 +213,7 @@ struct ExposureState {
     float highLuminance;
     uint32_t meteredPixels;
 };
+static_assert(sizeof(ExposureState) == 2072, "ExposureState must match ExposureState in shaders/exposure.comp");
 
 // Must match the push constants in shaders/exposure.comp
 struct ExposurePushConstants {
@@ -218,6 +231,7 @@ struct ExposurePushConstants {
     float darkenSpeed;
     float deltaTime;
 };
+static_assert(sizeof(ExposurePushConstants) == 52, "ExposurePushConstants must match the push constants in shaders/exposure.comp");
 
 // Must match the push constants in shaders/display.comp
 struct DisplayPushConstants {
@@ -230,6 +244,7 @@ struct DisplayPushConstants {
     float grainSize;        // output pixels
     uint32_t frame;
 };
+static_assert(sizeof(DisplayPushConstants) == 32, "DisplayPushConstants must match the push constants in shaders/display.comp");
 
 // Must match the push constants in shaders/noise.comp
 struct NoisePushConstants {
@@ -238,6 +253,7 @@ struct NoisePushConstants {
     glm::ivec2 regionMin;  // a rectangle whose brightness is also measured on its own
     glm::ivec2 regionMax;
 };
+static_assert(sizeof(NoisePushConstants) == 24, "NoisePushConstants must match the push constants in shaders/noise.comp");
 
 // One frame of a noise measurement (Noise.cpp)
 struct NoiseResult {
@@ -347,6 +363,7 @@ struct GpuMaterial {
     glm::vec3 fogNoiseOffset;       // from the seed, in texture repeats
     glm::vec3 fogDrift;             // in texture repeats per second
 };
+static_assert(sizeof(GpuMaterial) == 356, "GpuMaterial must match Material in shaders/raytrace.comp");
 
 // The fog noise texture holds this many blobs along each side (Volumes.cpp)
 static constexpr float fogNoiseBlobs = 4.0f;
@@ -398,6 +415,7 @@ struct EmissiveTriangle {
     float area;
     uint32_t treeTrail; // its way down the light tree: bit d = 1 means "right child" at depth d
 };
+static_assert(sizeof(EmissiveTriangle) == 80, "EmissiveTriangle must match EmissiveTriangle in shaders/raytrace.comp");
 
 // How light sampling picks one of the glowing triangles at a surface point
 enum class LightPicking : int {
@@ -413,6 +431,7 @@ struct LightTreeNode {
     glm::vec3 boundsMax;
     int32_t child;        // >= 0: the first of its two children (the second follows); < 0: a leaf, triangle -child-1
 };
+static_assert(sizeof(LightTreeNode) == 32, "LightTreeNode must match LightTreeNode in shaders/raytrace.comp");
 
 // Must match PunctualLight in shaders/raytrace.comp (scalar layout). One per enabled light of every visible object,
 // in world space, rebuilt every frame (see updateScene).
@@ -425,6 +444,7 @@ struct GpuPunctualLight {
     float cosOuterCone;      // spot: cos of the outer and inner cone angles
     float cosInnerCone;
 };
+static_assert(sizeof(GpuPunctualLight) == 52, "GpuPunctualLight must match PunctualLight in shaders/raytrace.comp");
 
 // Must match Portal in shaders/raytrace.comp (scalar layout). One per end of every enabled portal pair, in world space,
 // rebuilt every frame (see updateScene); a pair's ends are entries 2k and 2k + 1.
@@ -437,6 +457,7 @@ struct GpuPortal {
     uint32_t shape;          // PortalShape
     glm::mat4x3 toPartner;   // takes points (and directions) from this end to the other one
 };
+static_assert(sizeof(GpuPortal) == 96, "GpuPortal must match Portal in shaders/raytrace.comp");
 
 // A device-local buffer the CPU refills from time to time. The CPU writes what changed into the current frame's part
 // of the upload ring (Renderer::uploadRings), then the GPU copies it over.
@@ -858,6 +879,12 @@ private:
     glm::mat4 frameViewProjection = glm::mat4(1.0f);
     glm::mat4 framePreviousViewProjection = glm::mat4(1.0f);
 
+    // The compiled pipelines, kept on disk between runs (pipelineCacheFile, next to the executable): compiling the
+    // trace shader's 21 pipelines takes seconds; from the cache, a fraction of that. Passed to every pipeline creation.
+    static constexpr const char* pipelineCacheFile = "pipeline_cache.bin";
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    uint64_t pipelineCacheShaderHash = 0;  // of the shaders it was made from: written before the cache in the file
+
     VkDescriptorSetLayout rtDescriptorSetLayout;
     VkDescriptorPool rtDescriptorPool;
     VkDescriptorSet rtDescriptorSet = VK_NULL_HANDLE;  // null until init creates it; updateScene runs before that
@@ -1030,6 +1057,8 @@ private:
     void pickPhysicalDevice();
     void createLogicalDevice();
     void createAllocator();
+    void createPipelineCache();
+    void savePipelineCache();
     void createSwapChain();
     void createImageViews();
     void createRenderPass();

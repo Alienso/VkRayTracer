@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-// Must match Vertex in shaders/raytrace.comp (scalar layout)
+// A vertex as loaded. Packed for the GPU into GpuVertex (renderer/GpuAssets.h), which is what the shaders read.
 struct SceneVertex {
     glm::vec3 position;
     glm::vec3 normal;

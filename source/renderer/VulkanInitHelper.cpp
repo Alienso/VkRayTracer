@@ -13,6 +13,8 @@
 #include <limits>
 #include <algorithm>
 #include <fstream>
+#include <cstdio>
+#include <iterator>
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_vulkan.h>
 #include "renderer/Renderer.h"
@@ -266,6 +268,84 @@ void Renderer::createAllocator() {
     if (vmaCreateAllocator(&createInfo, &allocator) != VK_SUCCESS) {
         throw std::runtime_error("failed to create the memory allocator!");
     }
+}
+
+// The shaders the pipelines are made from (all .spv files the renderer loads), as one 64-bit hash (FNV-1a)
+static uint64_t shaderBinariesHash() {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (const char* name : {"raytrace.comp.spv", "display.comp.spv", "exposure.comp.spv", "noise.comp.spv",
+                             "cache_resolve.comp.spv"}) {
+        std::ifstream file(name, std::ios::binary);
+        for (std::istreambuf_iterator<char> it(file), end; it != end; ++it) {
+            hash = (hash ^ static_cast<uint8_t>(*it)) * 0x100000001b3ull;
+        }
+    }
+    return hash;
+}
+
+// The pipeline cache, with what the last run saved if it was made from the same shaders by this GPU and driver
+// (anything else, or no file, starts empty). Pipelines whose shader and settings are in it are created without
+// compiling. (The NVIDIA driver keeps a cache of its own too, but per executable: a rebuilt or renamed exe misses it.)
+// The file starts with the hash of the shaders: after a shader change the cache starts empty, so it holds only the
+// current shaders' pipelines (kept, every change would add ~8 MB of pipelines nothing uses any more).
+void Renderer::createPipelineCache() {
+    pipelineCacheShaderHash = shaderBinariesHash();
+    std::vector<char> data;
+    std::ifstream file(pipelineCacheFile, std::ios::binary | std::ios::ate);
+    if (file) {
+        size_t size = static_cast<size_t>(file.tellg());
+        uint64_t shaderHash = 0;
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(&shaderHash), sizeof(shaderHash));
+        if (file && size > sizeof(shaderHash) && shaderHash == pipelineCacheShaderHash) {
+            data.resize(size - sizeof(shaderHash));
+            file.read(data.data(), static_cast<std::streamsize>(data.size()));
+        }
+        VkPipelineCacheHeaderVersionOne header{};
+        bool matches = file && data.size() >= sizeof(header);
+        if (matches) {
+            std::memcpy(&header, data.data(), sizeof(header));
+            matches = header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+                      header.vendorID == physicalDeviceProperties.vendorID &&
+                      header.deviceID == physicalDeviceProperties.deviceID &&
+                      std::memcmp(header.pipelineCacheUUID, physicalDeviceProperties.pipelineCacheUUID,
+                                  VK_UUID_SIZE) == 0;
+        }
+        if (!matches) {
+            data.clear();  // another GPU or driver version: compile anew
+        }
+    }
+    VkPipelineCacheCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    createInfo.initialDataSize = data.size();
+    createInfo.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device, &createInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create the pipeline cache!");
+    }
+}
+
+// Writes the cache to disk for the next run: at exit, and after new pipelines were compiled (the basic shader). Into
+// a temporary file first, so a run that stops halfway leaves the old file intact.
+void Renderer::savePipelineCache() {
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) != VK_SUCCESS || size == 0) {
+        return;
+    }
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    std::string temporary = std::string(pipelineCacheFile) + ".tmp";
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(&pipelineCacheShaderHash), sizeof(pipelineCacheShaderHash));
+        file.write(data.data(), static_cast<std::streamsize>(size));
+        if (!file) {
+            return;
+        }
+    }
+    std::remove(pipelineCacheFile);
+    std::rename(temporary.c_str(), pipelineCacheFile);
 }
 
 void Renderer::createSwapChain() {

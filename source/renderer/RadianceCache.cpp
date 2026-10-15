@@ -106,7 +106,7 @@ void Renderer::createRadianceCache() {
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
     pipelineInfo.layout = cachePipelineLayout;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &cachePipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &cachePipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache pipeline!");
     }
     vkDestroyShaderModule(device, shaderModule, nullptr);

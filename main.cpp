@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include "app/Application.h"
+#include "core/Configuration.h"
 
 int main(int argc, char** argv) {
     Application app;
@@ -17,10 +18,15 @@ int main(int argc, char** argv) {
             app.setDlssDisabled(true);  // don't load Streamline at all (no driver vsync, no per-frame cost)
         } else if (std::strcmp(argv[i], "--dlss-cnn") == 0) {
             app.setDlssCnn(true);  // load the older DLSS RR version that still has the CNN models
+        } else if (std::strcmp(argv[i], "--validation") == 0) {
+            Configuration::enableValidationLayers = true;  // the Vulkan validation layer (default: Debug builds only)
+        } else if (std::strcmp(argv[i], "--no-validation") == 0) {
+            Configuration::enableValidationLayers = false;
         } else if (argv[i][0] != '-') {
             app.setStartScene(argv[i]);  // a scene file to open
         } else {
-            std::cerr << "unknown option " << argv[i] << " (known: --no-dlss, --dlss-cnn, a scene file)" << std::endl;
+            std::cerr << "unknown option " << argv[i]
+                      << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, a scene file)" << std::endl;
         }
     }
 

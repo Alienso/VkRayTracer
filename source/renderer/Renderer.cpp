@@ -24,6 +24,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     pickPhysicalDevice();
     createLogicalDevice();
     createAllocator();
+    createPipelineCache();  // before any pipeline
     createSwapChain();
     createImageViews();
     createRenderPass();
@@ -130,6 +131,7 @@ void Renderer::render(const RenderList& list) {
 void Renderer::shutdown() {
     vkp.deviceWaitIdle(device);
     finishCapture();
+    savePipelineCache();
     cleanup();
 }
 
@@ -152,6 +154,7 @@ void Renderer::cleanup() {
     vkDestroyCommandPool(device, commandPool, nullptr);
     shutdownStreamline();
     vmaDestroyAllocator(allocator);  // everything allocated from it must be freed by now
+    vkDestroyPipelineCache(device, pipelineCache, nullptr);
     vkDestroyDevice(device, nullptr);
 
     if (Configuration::enableValidationLayers) {

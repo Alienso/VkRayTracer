@@ -6,7 +6,11 @@ set(CMAKE_CXX_STANDARD 17)
 # Optimized even in Debug builds: model loading does per-texel work on the CPU (mip levels, Toksvig textures, light
 # lists) that takes about 20x longer unoptimized
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -D_GLIBCXX_DEBUG -D_GLIBCXX_ASSERTIONS -g  -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -g  -O2")
+# Checked STL containers (out-of-range indices and invalid iterators stop the program) in Debug builds only: they slow
+# down the CPU side a lot (Jungle Ruins' millions of instances). Release builds also leave out the validation layer
+# (Configuration::enableValidationLayers) and assert()s.
+add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_DEBUG> $<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS>)
 
 include_directories(${PROJECT_SOURCE_DIR}/include/)
 include_directories(${PROJECT_SOURCE_DIR}/source/)  # project headers by folder: "renderer/Renderer.h"

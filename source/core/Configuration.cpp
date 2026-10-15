@@ -24,4 +24,8 @@ const std::vector<const char*> Configuration::deviceExtensions = {
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME        // radiance cache: adding up samples with atomicAdd
 };
 
-const bool Configuration::enableValidationLayers = true;
+#ifdef NDEBUG
+bool Configuration::enableValidationLayers = false;
+#else
+bool Configuration::enableValidationLayers = true;
+#endif

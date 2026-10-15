@@ -188,7 +188,7 @@ void Renderer::createDisplayResources() {
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
     pipelineInfo.layout = displayPipelineLayout;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &displayPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, nullptr, &displayPipeline) != VK_SUCCESS) {
         throw std::runtime_error("failed to create display pipeline!");
     }
     vkDestroyShaderModule(device, shaderModule, nullptr);
