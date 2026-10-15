@@ -5,6 +5,7 @@
 #ifndef GRASSTERRAIN_CONFIGURATION_H
 #define GRASSTERRAIN_CONFIGURATION_H
 
+#include <string>
 #include <vector>
 
 class Configuration{
@@ -21,6 +22,9 @@ public:
     // The Vulkan validation layer: on in Debug builds, off in Release; --validation / --no-validation (main.cpp)
     // override it. It slows the CPU side (every Vulkan call is checked): off for timing runs.
     static bool enableValidationLayers;
+    // Where the models and HDR environments are (models/, environments/): the project's resource folder, shared by
+    // all builds (VULKANDEMO_RESOURCE_DIR, set by CMakeLists.txt); --resources <dir> (main.cpp) points elsewhere.
+    static std::string resourceDirectory;
     static const int maxFramesInFlight;
 
     Configuration()= default;

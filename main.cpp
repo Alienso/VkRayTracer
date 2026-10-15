@@ -12,9 +12,17 @@
 #include "core/Configuration.h"
 
 int main(int argc, char** argv) {
+    // --resources first: the asset store takes its folders when the application is made
+    for (int i = 1; i + 1 < argc; i++) {
+        if (std::strcmp(argv[i], "--resources") == 0) {
+            Configuration::resourceDirectory = argv[i + 1];  // models/ and environments/ (default: the project's resource/)
+        }
+    }
     Application app;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--no-dlss") == 0) {
+        if (std::strcmp(argv[i], "--resources") == 0) {
+            i++;  // (read above)
+        } else if (std::strcmp(argv[i], "--no-dlss") == 0) {
             app.setDlssDisabled(true);  // don't load Streamline at all (no driver vsync, no per-frame cost)
         } else if (std::strcmp(argv[i], "--dlss-cnn") == 0) {
             app.setDlssCnn(true);  // load the older DLSS RR version that still has the CNN models
@@ -26,7 +34,8 @@ int main(int argc, char** argv) {
             app.setStartScene(argv[i]);  // a scene file to open
         } else {
             std::cerr << "unknown option " << argv[i]
-                      << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, a scene file)" << std::endl;
+                      << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, --resources <dir>, a scene file)"
+                      << std::endl;
         }
     }
 

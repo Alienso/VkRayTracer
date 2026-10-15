@@ -6,7 +6,15 @@ set(CMAKE_CXX_STANDARD 17)
 # Optimized even in Debug builds: model loading does per-texel work on the CPU (mip levels, Toksvig textures, light
 # lists) that takes about 20x longer unoptimized
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -g  -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -O2")
+# No debug info by default, in any configuration: with it the exe was 97 MB and every link took ~3 s instead of 0.6.
+# For a debugger: cmake -DVULKANDEMO_DEBUG_INFO=ON
+option(VULKANDEMO_DEBUG_INFO "Compile with debug info (-g)" OFF)
+set(CMAKE_C_FLAGS_DEBUG "")
+set(CMAKE_CXX_FLAGS_DEBUG "")
+if (VULKANDEMO_DEBUG_INFO)
+    add_compile_options(-g)
+endif ()
 # Checked STL containers (out-of-range indices and invalid iterators stop the program) in Debug builds only: they slow
 # down the CPU side a lot (Jungle Ruins' millions of instances). Release builds also leave out the validation layer
 # (Configuration::enableValidationLayers) and assert()s.
@@ -63,13 +71,9 @@ add_executable(vulkanDemo main.cpp
 
 target_link_libraries(vulkanDemo glfw3 gdi32 Vulkan::Vulkan)
 
-#add_custom_command(TARGET vulkanDemo PRE_BUILD
-#        COMMAND ${CMAKE_COMMAND} -E copy_directory
-#        ${PROJECT_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:vulkanDemo>)
-
-add_custom_command(TARGET vulkanDemo PRE_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-        ${PROJECT_SOURCE_DIR}/resource $<TARGET_FILE_DIR:vulkanDemo>)
+# Models and HDR environments are read from the project's resource folder, shared by all builds (copied next to each
+# executable they took 5.8 GB per build folder, and ~15 s of every build). --resources <dir> overrides it.
+target_compile_definitions(vulkanDemo PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
 
 # Scene files (scenes/): the editor opens and saves them in the scenes folder next to the executable. Copied there
 # when CMake runs, and only those that aren't there yet: a build never overwrites a scene saved there. To keep a
@@ -131,13 +135,6 @@ file(GLOB SHADERS
         ${SHADER_SOURCE_DIR}/*.rchit
         ${SHADER_SOURCE_DIR}/*.rmiss)
 
-add_custom_command(
-        COMMAND
-        ${CMAKE_COMMAND} -E make_directory ${SHADER_BINARY_DIR}
-        OUTPUT ${SHADER_BINARY_DIR}
-        COMMENT "Creating ${SHADER_BINARY_DIR}"
-)
-
 foreach(source IN LISTS SHADERS)
     get_filename_component(FILENAME ${source} NAME)
     add_custom_command(
@@ -148,7 +145,7 @@ foreach(source IN LISTS SHADERS)
             -o ${SHADER_BINARY_DIR}/${FILENAME}.spv
             ${source}
             OUTPUT ${SHADER_BINARY_DIR}/${FILENAME}.spv
-            DEPENDS ${source} ${SHADER_BINARY_DIR}
+            DEPENDS ${source}  # (not the folder: writing a .spv into it changes its time, and Ninja then rebuilt all)
             COMMENT "Compiling ${FILENAME}"
     )
     list(APPEND SPV_SHADERS ${SHADER_BINARY_DIR}/${FILENAME}.spv)

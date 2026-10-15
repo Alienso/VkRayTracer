@@ -124,9 +124,15 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
    ```bash
    powershell -ExecutionPolicy Bypass -File download_streamline.ps1
    ```
-3. Build with CMake. The shaders are compiled to SPIR-V with `glslc` as part of the build.
-4. Run `vulkanDemo.exe`, or `vulkanDemo.exe scenes/sponza.json` to open a scene. Options: `--no-dlss` (don't load
-   Streamline), `--dlss-cnn` (the DLSS version that still has the CNN models).
+3. Build with CMake, preferably with the Ninja generator (`-G Ninja`; CLion: Settings > Build, Execution, Deployment >
+   CMake > Generator). The shaders are compiled to SPIR-V with `glslc` as part of the build. Builds have no debug
+   info (faster links, a 6 MB exe instead of 97 MB); `-DVULKANDEMO_DEBUG_INFO=ON` adds it for a debugger.
+4. Run `vulkanDemo.exe`, or `vulkanDemo.exe scenes/sponza.json` to open a scene. Models and HDR environments are read
+   from the project's `resource/` folder (not copied next to the executable). Options:
+   - `--no-dlss`: don't load Streamline (starts ~3 s faster; Accumulation only)
+   - `--dlss-cnn`: the DLSS version that still has the CNN models
+   - `--validation` / `--no-validation`: the Vulkan validation layer (default: on in Debug builds, off in Release)
+   - `--resources <dir>`: read models/ and environments/ from another folder
 
 Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
 for fullscreen, F1 to hide the UI, Ctrl+S to save the scene.

@@ -24,6 +24,12 @@ const std::vector<const char*> Configuration::deviceExtensions = {
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME        // radiance cache: adding up samples with atomicAdd
 };
 
+#ifdef VULKANDEMO_RESOURCE_DIR
+std::string Configuration::resourceDirectory = VULKANDEMO_RESOURCE_DIR;
+#else
+std::string Configuration::resourceDirectory = "resource";
+#endif
+
 #ifdef NDEBUG
 bool Configuration::enableValidationLayers = false;
 #else

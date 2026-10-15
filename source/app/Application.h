@@ -14,6 +14,7 @@
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 #include "app/Window.h"
+#include "core/Configuration.h"
 
 class Application {
 public:
@@ -35,7 +36,7 @@ private:
     bool fullscreenKeyDown = false;  // F11 toggles once per press
 
     // Each refers to the ones before it, so they come in this order
-    AssetStore assets{"models", "environments"};  // folders copied next to the executable from resource/
+    AssetStore assets{Configuration::resourceDirectory + "/models", Configuration::resourceDirectory + "/environments"};
     Scene scene{assets};
     RenderList renderList;  // what this frame draws (Scene::buildRenderList), given to the renderer
     CameraController cameraController;  // moves scene.camera()
