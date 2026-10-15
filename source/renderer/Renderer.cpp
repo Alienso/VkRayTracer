@@ -36,6 +36,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createSpecularAlbedoTable();
     createBlueNoiseTexture();
     createVolumeTextures();
+    createUploadRings();  // the staging for the streamed buffers below
     createTopLevelAccelerationStructure(16);  // grows when more instances are needed
     createStreamedBuffer(motionData, sizeof(glm::mat4) * 16);  // and this with the objects (updateScene)
     createLightBuffers();
@@ -164,6 +165,7 @@ void Renderer::cleanup() {
 void Renderer::drawFrame() {
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
     deferredDeletion.collect(frameNumber);  // the frame that last used this slot is done: its releases can go
+    uploadRingUsed = 0;  // and so is its upload ring
     updateTracePipelines();
 
     uint32_t imageIndex;

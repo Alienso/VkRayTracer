@@ -502,12 +502,13 @@ vec4 pathSample(uint bounce, uint decision, inout uint seed) {
         return vec4(randomFloat(seed), randomFloat(seed), randomFloat(seed), randomFloat(seed));
     }
     uint dimensionSeed = pcgHash(sobolPixelSeed ^ pcgHash(bounce * 8u + decision));
-    uint index = nestedUniformScramble(sobolIndex, dimensionSeed);
+    // Each bit of the scrambled index depends only on the index's bits from it up, so the bits above the index's
+    // highest one are those of sample 0's. XORed out (the same for every sample: a constant XORed into all points,
+    // which the scramble below randomizes anyway), the loop runs over ~log2(samples) bits instead of all 32.
+    uint index = nestedUniformScramble(sobolIndex, dimensionSeed) ^ nestedUniformScramble(0u, dimensionSeed);
     uvec4 x = uvec4(0u);
-    for (uint bit = 0u; index != 0u; bit++, index >>= 1u) {
-        if ((index & 1u) != 0u) {
-            x ^= SOBOL_DIRECTIONS[bit];
-        }
+    for (; index != 0u; index &= index - 1u) {
+        x ^= SOBOL_DIRECTIONS[findLSB(index)];  // only the set bits
     }
     x = uvec4(nestedUniformScramble(x.x, pcgHash(dimensionSeed + 1u)), nestedUniformScramble(x.y, pcgHash(dimensionSeed + 2u)),
               nestedUniformScramble(x.z, pcgHash(dimensionSeed + 3u)), nestedUniformScramble(x.w, pcgHash(dimensionSeed + 4u)));

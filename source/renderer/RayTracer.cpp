@@ -1391,6 +1391,7 @@ void Renderer::cleanupRayTracing() {
     destroyPortalBuffer();
     destroyStreamedBuffer(motionData);
     destroyEnvironment();
+    destroyUploadRings();
 
     vkDestroyBuffer(device, uniformBuffer, nullptr);
     vmaFreeMemory(allocator, uniformBufferMemory);

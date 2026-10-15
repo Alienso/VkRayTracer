@@ -250,7 +250,8 @@ void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
     }
     push.view = static_cast<uint32_t>(view);
     push.farDistance = Configuration::cameraFar;
-    push.grainStrength = settings.fogGrain ? settings.fogGrainStrength : 0.0f;
+    // Without fog the radiance image's alpha is 0 everywhere: skip reading it (fogLevel, buildSceneUniforms)
+    push.grainStrength = settings.fogGrain && fogLevel > 0 ? settings.fogGrainStrength : 0.0f;
     push.grainSize = std::max(settings.fogGrainSize, 1.0f);
     push.frame = static_cast<uint32_t>(frameNumber);
 

@@ -19,6 +19,28 @@
 #include "renderer/Renderer.h"
 #include "core/Configuration.h"
 
+// Staging for all streamed buffers: a fixed size, however big they get (a staging copy of each, per frame in flight,
+// took ~700 MB of pinned system memory for Jungle Ruins' instances)
+void Renderer::createUploadRings() {
+    uploadRings.resize(Configuration::maxFramesInFlight);
+    for (UploadRing& ring : uploadRings) {
+        createBuffer(uploadRingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     ring.buffer, ring.memory, VK_NULL_HANDLE, true);
+        vmaMapMemory(allocator, ring.memory, &ring.mapped);
+    }
+    uploadRingUsed = 0;
+}
+
+void Renderer::destroyUploadRings() {
+    for (UploadRing& ring : uploadRings) {
+        vmaUnmapMemory(allocator, ring.memory);
+        vkDestroyBuffer(device, ring.buffer, nullptr);
+        vmaFreeMemory(allocator, ring.memory);
+    }
+    uploadRings.clear();
+}
+
 void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity, VkBufferUsageFlags usage,
                                     VkPipelineStageFlags readers) {
     streamed.capacity = capacity;
@@ -26,24 +48,9 @@ void Renderer::createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capac
     streamed.readers = readers;
     createBuffer(capacity, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  streamed.buffer, streamed.memory, VK_NULL_HANDLE, true);
-
-    streamed.staging.resize(Configuration::maxFramesInFlight);
-    streamed.stagingMemory.resize(Configuration::maxFramesInFlight);
-    streamed.stagingMapped.resize(Configuration::maxFramesInFlight);
-    for (int i = 0; i < Configuration::maxFramesInFlight; i++) {
-        createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     streamed.staging[i], streamed.stagingMemory[i], VK_NULL_HANDLE, true);
-        vmaMapMemory(allocator, streamed.stagingMemory[i], &streamed.stagingMapped[i]);
-    }
 }
 
 void Renderer::destroyStreamedBuffer(StreamedBuffer& streamed) {
-    for (size_t i = 0; i < streamed.staging.size(); i++) {
-        vmaUnmapMemory(allocator, streamed.stagingMemory[i]);
-        vkDestroyBuffer(device, streamed.staging[i], nullptr);
-        vmaFreeMemory(allocator, streamed.stagingMemory[i]);
-    }
     vkDestroyBuffer(device, streamed.buffer, nullptr);
     vmaFreeMemory(allocator, streamed.memory);
     streamed = {};
@@ -63,10 +70,16 @@ bool Renderer::ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize siz
     return true;
 }
 
-// The copies from this frame's staging buffer (filled already) into the buffer, after its readers in the previous
-// frame are done with the old contents, before its readers in this one
+// The pieces into the buffer: packed into this frame's part of the upload ring and copied over, after the buffer's
+// readers in the previous frame are done with the old contents, before its readers in this one
 void Renderer::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
-                                    const std::vector<VkBufferCopy>& copies) {
+                                    const std::vector<StreamedPiece>& pieces) {
+    auto aligned = [](VkDeviceSize size) { return (size + 15) & ~VkDeviceSize(15); };
+    VkDeviceSize total = 0;
+    for (const StreamedPiece& piece : pieces) {
+        total += aligned(piece.size);
+    }
+
     VkBufferMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -74,28 +87,89 @@ void Renderer::recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffe
     barrier.buffer = streamed.buffer;
     barrier.offset = 0;
     barrier.size = VK_WHOLE_SIZE;
-    // (Shader reads, and acceleration structure builds reading their input, both count as shader reads)
-    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer, streamed.readers, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, nullptr, 1, &barrier, 0, nullptr);
-    vkCmdCopyBuffer(commandBuffer, streamed.staging[currentFrame], streamed.buffer,
-                    static_cast<uint32_t>(copies.size()), copies.data());
+    if (total <= uploadRingSize - uploadRingUsed) {
+        UploadRing& ring = uploadRings[currentFrame];
+        std::vector<VkBufferCopy> copies;
+        copies.reserve(pieces.size());
+        for (const StreamedPiece& piece : pieces) {
+            std::memcpy(static_cast<uint8_t*>(ring.mapped) + uploadRingUsed, piece.data, piece.size);
+            copies.push_back({uploadRingUsed, piece.offset, piece.size});
+            uploadRingUsed += aligned(piece.size);
+        }
+        // (Shader reads, and acceleration structure builds reading their input, both count as shader reads)
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(commandBuffer, streamed.readers, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        vkCmdCopyBuffer(commandBuffer, ring.buffer, streamed.buffer, static_cast<uint32_t>(copies.size()),
+                        copies.data());
+    } else {
+        uploadStreamedNow(streamed, pieces);
+    }
+    // (Copies submitted before this command buffer, by uploadStreamedNow, are covered too)
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, streamed.readers,
                          0, 0, nullptr, 1, &barrier, 0, nullptr);
 }
 
+// Too much for the ring (everything changed in a big scene: loading it, adding an object): copied right away through
+// a temporary staging buffer of the ring's size, a ring's worth at a time, the CPU waiting for each. The frames
+// still in flight are done with the buffer first. This frame's command buffer isn't submitted yet, so its readers
+// see the new contents. Rare, and a few dozen milliseconds for Jungle Ruins' instances.
+void Renderer::uploadStreamedNow(StreamedBuffer& streamed, const std::vector<StreamedPiece>& pieces) {
+    vkQueueWaitIdle(graphicsQueue);
+    VkDeviceSize total = 0;
+    for (const StreamedPiece& piece : pieces) {
+        total += piece.size;
+    }
+    VkDeviceSize chunk = std::min(total, uploadRingSize);
+    VkBuffer staging;
+    VmaAllocation stagingMemory;
+    void* mapped;
+    createBuffer(chunk, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 staging, stagingMemory, VK_NULL_HANDLE, true);
+    vmaMapMemory(allocator, stagingMemory, &mapped);
+
+    std::vector<VkBufferCopy> copies;
+    VkDeviceSize used = 0;
+    auto flush = [&]() {
+        immediateSubmit([&](VkCommandBuffer cmd) {
+            vkCmdCopyBuffer(cmd, staging, streamed.buffer, static_cast<uint32_t>(copies.size()), copies.data());
+        });
+        copies.clear();
+        used = 0;
+    };
+    for (const StreamedPiece& piece : pieces) {
+        for (VkDeviceSize done = 0; done < piece.size;) {
+            if (used == chunk) {
+                flush();
+            }
+            VkDeviceSize size = std::min(piece.size - done, chunk - used);
+            std::memcpy(static_cast<uint8_t*>(mapped) + used, static_cast<const uint8_t*>(piece.data) + done, size);
+            copies.push_back({used, piece.offset + done, size});
+            used += size;
+            done += size;
+        }
+    }
+    if (!copies.empty()) {
+        flush();
+    }
+
+    vmaUnmapMemory(allocator, stagingMemory);
+    vkDestroyBuffer(device, staging, nullptr);
+    vmaFreeMemory(allocator, stagingMemory);
+}
+
 void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size) {
     if (size == 0) {
         return;
     }
-    std::memcpy(streamed.stagingMapped[currentFrame], data, size);
-    recordStreamedCopies(commandBuffer, streamed, {{0, 0, size}});
+    recordStreamedCopies(commandBuffer, streamed, {{data, 0, size}});
 }
 
-// The same for some ranges of elements: each goes to the same place in the staging buffer and in the buffer
+// The same for some ranges of elements: each goes to the same place in the buffer
 void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
                                     VkDeviceSize elementSize, const std::vector<InstanceRange>& ranges) {
     if (ranges.empty()) {
@@ -116,16 +190,13 @@ void Renderer::recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffe
     }
     merged.resize(kept + 1);
 
-    std::vector<VkBufferCopy> copies;
-    copies.reserve(merged.size());
+    std::vector<StreamedPiece> pieces;
+    pieces.reserve(merged.size());
     for (const InstanceRange& range : merged) {
         VkDeviceSize offset = range.first * elementSize;
-        VkDeviceSize size = range.count * elementSize;
-        std::memcpy(static_cast<uint8_t*>(streamed.stagingMapped[currentFrame]) + offset,
-                    static_cast<const uint8_t*>(data) + offset, size);
-        copies.push_back({offset, offset, size});
+        pieces.push_back({static_cast<const uint8_t*>(data) + offset, offset, range.count * elementSize});
     }
-    recordStreamedCopies(commandBuffer, streamed, copies);
+    recordStreamedCopies(commandBuffer, streamed, pieces);
 }
 
 void Renderer::createLightBuffers() {

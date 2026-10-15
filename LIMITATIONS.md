@@ -336,8 +336,11 @@ only followed by the fading (their old light lingers for a moment, in DLSS modes
 ### Fixed size, fixed cost
 The table has 2^20 entries (40 MB); when the 8 slots a cell may use are taken, the cell isn't cached (its paths
 just trace on). The update paths and the resolve over all entries cost ~0.3 ms even where the cache helps
-little (the helmet scene: 1.27 ms instead of 1.03 ms per frame).
-- Fix: resolve only the entries that were used (a list of them), size the table from the scene.
+little (the helmet scene: 1.27 ms instead of 1.03 ms per frame). Nearly all of it is the update paths: the resolve
+alone takes ~0.03 ms (helmet) to ~0.06 ms (Sponza). In Jungle Ruins the cache pass takes ~6 ms at 1600x900, and grows
+with the pixel count.
+- Fix: see CACHE_PERFORMANCE_PLAN.md (cells and update budget independent of the resolution, update paths that read
+  the cache, fewer or adaptive update paths); size the table from the scene.
 
 ### One sample's light is clamped
 Update paths clamp what one sample brings into a cell to 256 (a glint of the sun seen in a mirror would make the

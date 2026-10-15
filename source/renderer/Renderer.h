@@ -438,17 +438,28 @@ struct GpuPortal {
     glm::mat4x3 toPartner;   // takes points (and directions) from this end to the other one
 };
 
-// A device-local buffer the CPU refills from time to time. The CPU writes into a staging buffer of the
-// current frame in flight (the other frame may still be copying from its own), then the GPU copies it over.
+// A device-local buffer the CPU refills from time to time. The CPU writes what changed into the current frame's part
+// of the upload ring (Renderer::uploadRings), then the GPU copies it over.
 struct StreamedBuffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation memory = VK_NULL_HANDLE;
-    std::vector<VkBuffer> staging;
-    std::vector<VmaAllocation> stagingMemory;
-    std::vector<void*> stagingMapped;
     VkDeviceSize capacity = 0;
     VkBufferUsageFlags usage = 0;      // what the buffer is used as (besides a copy's destination)
     VkPipelineStageFlags readers = 0;  // the stages that read it
+};
+
+// One piece of an upload into a StreamedBuffer: `size` bytes from `data` to `offset` in the buffer
+struct StreamedPiece {
+    const void* data;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+};
+
+// A frame in flight's host-visible staging buffer, shared by all streamed buffers
+struct UploadRing {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
 };
 
 // The renderer's settings. What is lit and how (sun, sky, map) is the scene's: SceneEnvironment.
@@ -706,6 +717,14 @@ private:
     StreamedBuffer instanceData;                     // frameGpuInstances on the GPU, room for tlasCapacity
     std::vector<glm::mat4> frameMotions;             // the render list's motions (one per object)
     StreamedBuffer motionData;                       // frameMotions on the GPU, binding 34
+    // The streamed buffers' changes go through these: one per frame in flight (the other frame may still be copying
+    // from its own), filled from the start each frame (uploadRingUsed, reset in drawFrame). More than fits (all of
+    // the 2.9 million instances changed) is copied right away instead, see uploadStreamedNow: that stalls the frame,
+    // so the ring holds what may change every frame (a moving glowing object re-sends the light list and tree, ~144 B
+    // per glowing triangle: ~230k of them fit).
+    static constexpr VkDeviceSize uploadRingSize = 32 * 1024 * 1024;
+    std::vector<UploadRing> uploadRings;
+    VkDeviceSize uploadRingUsed = 0;
     // The instances that changed since a buffer was last written: all of them, or these ranges. Only the changes
     // are copied: big scenes have millions of instances, and usually only a few of them move.
     struct PendingInstances {
@@ -1066,6 +1085,8 @@ private:
     void releaseTexture(const GpuTexture& texture);
 
     // Lights.cpp
+    void createUploadRings();
+    void destroyUploadRings();
     void createStreamedBuffer(StreamedBuffer& streamed, VkDeviceSize capacity,
                               VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                               VkPipelineStageFlags readers = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1073,7 +1094,8 @@ private:
     bool ensureStreamedCapacity(StreamedBuffer& streamed, VkDeviceSize size);
     void recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data, VkDeviceSize size);
     void recordStreamedCopies(VkCommandBuffer commandBuffer, StreamedBuffer& streamed,
-                              const std::vector<VkBufferCopy>& copies);
+                              const std::vector<StreamedPiece>& pieces);
+    void uploadStreamedNow(StreamedBuffer& streamed, const std::vector<StreamedPiece>& pieces);
     // Only these ranges of an array of elementSize-byte elements (the rest of the buffer stays as it is)
     void recordStreamedUpload(VkCommandBuffer commandBuffer, StreamedBuffer& streamed, const void* data,
                               VkDeviceSize elementSize, const std::vector<InstanceRange>& ranges);
