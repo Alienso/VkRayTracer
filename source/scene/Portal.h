@@ -1,7 +1,7 @@
 //
 // Portals: pairs of flat openings, two-way windows into each other. A ray that goes into one end comes out of the
 // other: into the front of one, out of the front of the other; into the back, out of the back. The renderer traces
-// them (see "Portals" in shaders/raytrace.comp); the scene only places them.
+// them (see "Portals" in shaders/raytrace/portals.glsl); the scene only places them.
 //
 // Each end is an entity with a PortalComponent naming the other end, so either end can be placed (and parented)
 // on its own. An end's opening lies in its entity's local XY plane, centered on its position, X along its width,

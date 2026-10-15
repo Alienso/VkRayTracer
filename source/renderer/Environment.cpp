@@ -40,7 +40,7 @@ static float smoothstep(float edge0, float edge1, float x) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-// Must match environmentLight in shaders/raytrace.comp (the gradient part). y: the direction's height.
+// Must match environmentLight in shaders/raytrace/portals.glsl (the gradient part). y: the direction's height.
 static glm::vec3 gradientSky(const SceneEnvironment& environment, float y) {
     float skyT = std::pow(smoothstep(0.0f, 0.4f, y), 0.35f);
     glm::vec3 sky = glm::mix(environment.skyHorizonColor, environment.skyZenithColor, skyT);

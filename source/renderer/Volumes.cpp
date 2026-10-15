@@ -1,5 +1,6 @@
 //
-// The fog's 3D textures (see "Varying density" in shaders/raytrace.comp), one bindless array of sampler3D (binding 32):
+// The fog's 3D textures (see "Varying density" in shaders/raytrace/fog.glsl), one bindless array of sampler3D
+// (binding 32):
 //
 // 0: the fog noise. 128^3 texels that tile, made once at startup: Perlin-Worley noise as in game cloud renderers
 //    (Schneider & Vos 2015): smooth Perlin noise, eroded into billows by inverted Worley (cell) noise. Its values are

@@ -2,7 +2,7 @@
 // Radiance cache: a world-space hash table of small surface cells with the light that leaves them, so that image
 // paths can stop after one diffuse bounce and read the light from there instead of tracing many more bounces.
 // Similar to NVIDIA's SHaRC ("spatially hashed radiance cache"). The idea and the shader side are described in
-// shaders/raytrace.comp ("Radiance cache"); per frame:
+// shaders/raytrace/radiance_cache.glsl ("Radiance cache"); per frame:
 //   1. update paths (raytrace.comp, CACHE_UPDATE_PASS = 1): one full path per few pixels adds samples to cells
 //   2. resolve (shaders/cache_resolve.comp): new samples are blended into each cell's average, old cells freed
 //   3. the image paths (raytrace.comp) read the averages

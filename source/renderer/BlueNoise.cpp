@@ -1,5 +1,5 @@
 //
-// Blue-noise texture for the path sampler (binding 30, see pathSample in shaders/raytrace.comp): 64 x 64 texels,
+// Blue-noise texture for the path sampler (binding 30, see pathSample in shaders/raytrace/random.glsl): 64 x 64 texels,
 // four independent channels, tiled over the screen.
 //
 // In a blue-noise mask neighboring texels have very different values: no clumps of similar values, no large gaps.

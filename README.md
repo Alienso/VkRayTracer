@@ -11,8 +11,9 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 ## Rendering features
 
 ### Path tracing
-- Unidirectional path tracer in a single compute shader (`shaders/raytrace.comp`), one path per pixel per sample,
-  up to 64 bounces, with Russian roulette.
+- Unidirectional path tracer in a single compute shader (`shaders/raytrace.comp`, its parts in `shaders/raytrace/`:
+  tracing, BRDF, lights, fog, portals, ReSTIR, ...), one path per pixel per sample, up to 64 bounces, with Russian
+  roulette.
 - Light sampling with multiple importance sampling (MIS) for the sun, the sky and glowing surfaces. Points on
   glowing triangles are spread over the triangle's solid angle.
 - A **light tree** picks which glowing triangle to sample, by power, distance and orientation, so scenes with

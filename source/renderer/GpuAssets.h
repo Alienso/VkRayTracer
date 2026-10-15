@@ -31,7 +31,7 @@ struct AccelerationStructure {
     VkDeviceAddress address = 0;
 };
 
-// Must match MeshInfo in shaders/raytrace.comp (scalar layout). One per mesh, indexed by the
+// Must match MeshInfo in shaders/raytrace/bindings.glsl (scalar layout). One per mesh, indexed by the
 // TLAS instance's custom index. Tells the shader where the mesh's data lives in the shared buffers.
 struct MeshInfo {
     uint32_t materialIndex;  // into the material buffer
@@ -46,17 +46,18 @@ struct MeshInfo {
     glm::vec3 boundsMax;
     int32_t distanceField;  // in the volume textures: distance to the surface over that box (Volumes.cpp); -1: none
 };
-static_assert(sizeof(MeshInfo) == 60, "MeshInfo must match MeshInfo in shaders/raytrace.comp");
+static_assert(sizeof(MeshInfo) == 60, "MeshInfo must match MeshInfo in shaders/raytrace/bindings.glsl");
 
-// A vertex as the shader reads it (binding 4): 28 bytes, SceneVertex has 48. Must match Vertex in shaders/raytrace.comp
-// (scalar layout). The BLAS builds read the position (first). Made by packVertex (SceneGpu.cpp).
+// A vertex as the shader reads it (binding 4): 28 bytes, SceneVertex has 48. Must match Vertex in
+// shaders/raytrace/bindings.glsl (scalar layout). The BLAS builds read the position (first). Made by packVertex
+// (SceneGpu.cpp).
 struct GpuVertex {
     glm::vec3 position;
     uint32_t normal;   // octahedral (Cigolle et al. 2014), 2 x 16-bit snorm: decodeDirection in the shader
     uint32_t tangent;  // octahedral, 16 + 15-bit snorm; bit 31 set: tangent.w < 0 (decodeTangent in the shader)
     glm::vec2 uv;
 };
-static_assert(sizeof(GpuVertex) == 28, "GpuVertex must match Vertex in shaders/raytrace.comp");
+static_assert(sizeof(GpuVertex) == 28, "GpuVertex must match Vertex in shaders/raytrace/bindings.glsl");
 
 // The free parts of a buffer of `capacity` elements: a range is taken from the first free part it fits in (first
 // fit), and a freed range joins its free neighbors, so space left by unloaded meshes is reused.

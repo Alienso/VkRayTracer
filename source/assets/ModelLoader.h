@@ -65,13 +65,13 @@ struct Material {
     float diffuseTransmission = 0.0f;
     glm::vec3 diffuseTransmissionColor = glm::vec3(1.0f);
     // Fog inside: the closed mesh is filled with fog of this thickness (per unit of distance in the world: light goes
-    // ~1 / fogDensity before it scatters; 0 = none). See "Fog" in shaders/raytrace.comp. Not from glTF (yet).
+    // ~1 / fogDensity before it scatters; 0 = none). See "Fog" in shaders/raytrace/fog.glsl. Not from glTF (yet).
     float fogDensity = 0.0f;
     glm::vec3 fogColor = glm::vec3(1.0f);  // its color in white light (the share of the light it scatters that goes on)
     float fogForward = 0.3f;               // -1..1: how much scattered light keeps going forward (0: every way alike)
     bool invisibleSurface = false;         // rays pass the surface unchanged: only the fog inside shows
-    // Fog that varies through the volume (see "Varying density" in shaders/raytrace.comp). Its thickness is then the
-    // most there is anywhere; noise and the edge fade only take away.
+    // Fog that varies through the volume (see "Varying density" in shaders/raytrace/fog.glsl). Its thickness is then
+    // the most there is anywhere; noise and the edge fade only take away.
     bool fogNoise = false;     // patchy: a 3D noise in the mesh's own space (moves, turns and scales with the object)
     float fogNoiseSize = 1.0f; // the size of its blobs, in the mesh's units
     float fogCoverage = 0.5f;  // 0..1: about the share of the volume that has fog

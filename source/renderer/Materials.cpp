@@ -316,7 +316,7 @@ void Renderer::recordMaterialUpdate(VkCommandBuffer commandBuffer) {
 //   E(F0) = F0 * scale + bias,  scale = average of (1 - (1 - v.h)^5),  bias = average of (1 - v.h)^5
 // so two numbers per entry cover every F0 (the "split sum" table of real-time engines). For a white
 // reflection (F0 = 1) the total is scale + bias.
-// These are the same formulas as in shaders/raytrace.comp; the two must agree.
+// These are the same formulas as in shaders/raytrace/brdf.glsl; the two must agree.
 
 namespace {
     float smithG1(float cosTheta, float alpha) {

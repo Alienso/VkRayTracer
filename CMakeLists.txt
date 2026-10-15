@@ -136,17 +136,29 @@ file(GLOB SHADERS
         ${SHADER_SOURCE_DIR}/*.rchit
         ${SHADER_SOURCE_DIR}/*.rmiss)
 
+# The files a shader #includes (raytrace.comp's parts in shaders/raytrace/) are found by glslc, which lists them in a
+# depfile: a change in one rebuilds the shader. (CMP0116: the depfile's paths are taken as glslc writes them.) Makefile
+# builds read depfiles one build late, so raytrace.comp also depends on its parts directly.
+if (POLICY CMP0116)
+    cmake_policy(SET CMP0116 NEW)
+endif ()
+file(GLOB RAYTRACE_PARTS ${SHADER_SOURCE_DIR}/raytrace/*.glsl)
 foreach(source IN LISTS SHADERS)
     get_filename_component(FILENAME ${source} NAME)
+    set(includedParts)
+    if (FILENAME STREQUAL "raytrace.comp")
+        set(includedParts ${RAYTRACE_PARTS})
+    endif ()
     add_custom_command(
             COMMAND
             ${glslc_executable}
             --target-env=vulkan1.3  # needed for GL_EXT_ray_query
-            #      -MD -MF ${SHADER_BINARY_DIR}/${FILENAME}.d
+            -MD -MF ${SHADER_BINARY_DIR}/${FILENAME}.d
             -o ${SHADER_BINARY_DIR}/${FILENAME}.spv
             ${source}
             OUTPUT ${SHADER_BINARY_DIR}/${FILENAME}.spv
-            DEPENDS ${source}  # (not the folder: writing a .spv into it changes its time, and Ninja then rebuilt all)
+            DEPENDS ${source} ${includedParts}  # (not the folder: writing a .spv into it changes its time, and Ninja then rebuilt all)
+            DEPFILE ${SHADER_BINARY_DIR}/${FILENAME}.d
             COMMENT "Compiling ${FILENAME}"
     )
     list(APPEND SPV_SHADERS ${SHADER_BINARY_DIR}/${FILENAME}.spv)

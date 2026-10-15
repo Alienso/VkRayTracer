@@ -1,6 +1,6 @@
 //
 // Portals: the render list's portal ends -> the shader's portal list (binding 31). The shader does the rest (see
-// "Portals" in shaders/raytrace.comp).
+// "Portals" in shaders/raytrace/portals.glsl).
 //
 
 #include <cstring>

@@ -25,7 +25,7 @@
 // the build, as a reminder to change the shader's copy too. The sizes are the shaders' (spirv-cross --reflect on the
 // .spv). Only the size: two fields swapped, or a change on the shader side alone, still go unnoticed.
 
-// Must match the SceneUniforms block in shaders/raytrace.comp (std140: matrices and vec4s first, no vec3s)
+// Must match the SceneUniforms block in shaders/raytrace/bindings.glsl (std140: matrices and vec4s first, no vec3s)
 struct SceneUniforms {
     glm::mat4 viewProjection;          // this frame, without jitter (motion vectors)
     glm::mat4 previousViewProjection;  // last frame's
@@ -113,19 +113,19 @@ struct SceneUniforms {
     uint32_t cacheFog;               // 1 = scatter points in fog have radiance cache cells too
     uint32_t maxPortalCrossings;     // portals a ray may go through; at least 1
 };
-static_assert(sizeof(SceneUniforms) == 564, "SceneUniforms must match SceneUniforms in shaders/raytrace.comp");
+static_assert(sizeof(SceneUniforms) == 564, "SceneUniforms must match SceneUniforms in shaders/raytrace/bindings.glsl");
 
-// Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace.comp (scalar layout). 56 bytes: Jungle
-// Ruins has 2.9 million instances (the inverse matrix is the shader's to work out, the motion its object's).
+// Per TLAS instance, binding 12. Must match InstanceData in shaders/raytrace/bindings.glsl (scalar layout). 56 bytes:
+// Jungle Ruins has 2.9 million instances (the inverse matrix is the shader's to work out, the motion its object's).
 struct GpuInstance {
     glm::mat4x3 objectToWorld;  // the shader reads this instead of the ray query's, so hits stored by the ReSTIR
                                 // camera-ray pass can be rebuilt the same way
     uint32_t meshIndex;         // as the TLAS instance's custom index (fog volumes are known by their instance)
     uint32_t motion;            // index into the motions, binding 34 (RenderList::motions: one per object)
 };
-static_assert(sizeof(GpuInstance) == 56, "GpuInstance must match InstanceData in shaders/raytrace.comp");
+static_assert(sizeof(GpuInstance) == 56, "GpuInstance must match InstanceData in shaders/raytrace/bindings.glsl");
 
-// One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace.comp.
+// One per render pixel, binding 25: the camera ray's hit. Must match PrimaryHit in shaders/raytrace/bindings.glsl.
 struct GpuPrimaryHit {
     uint32_t meshIndex;
     uint32_t instanceIndex;
@@ -138,10 +138,10 @@ struct GpuPrimaryHit {
     uint32_t tintRG;         // the mirrors' color (half floats)
     uint32_t tintB;
 };
-static_assert(sizeof(GpuPrimaryHit) == 52, "GpuPrimaryHit must match PrimaryHit in shaders/raytrace.comp");
+static_assert(sizeof(GpuPrimaryHit) == 52, "GpuPrimaryHit must match PrimaryHit in shaders/raytrace/bindings.glsl");
 
 // One per render pixel, binding 28: the image path's first bounce at a ReSTIR surface, traced by the ReSTIR pass as
-// its BRDF candidate. Must match BounceHit in shaders/raytrace.comp.
+// its BRDF candidate. Must match BounceHit in shaders/raytrace/bindings.glsl.
 struct GpuBounceHit {
     uint32_t meshIndex;
     uint32_t instanceIndex;
@@ -153,20 +153,20 @@ struct GpuBounceHit {
     uint32_t weightBRoughness;
     float pdf;
 };
-static_assert(sizeof(GpuBounceHit) == 48, "GpuBounceHit must match BounceHit in shaders/raytrace.comp");
+static_assert(sizeof(GpuBounceHit) == 48, "GpuBounceHit must match BounceHit in shaders/raytrace/bindings.glsl");
 
 // Three per render pixel (this frame's, last frame's, and the ReSTIR pass's result for the spatial pass), binding 26:
-// ReSTIR DI's light sample. Must match Reservoir in shaders/raytrace.comp.
+// ReSTIR DI's light sample. Must match Reservoir in shaders/raytrace/restir_di.glsl.
 struct GpuReservoir {
     uint32_t light;
     uint32_t point;
     float W;
     float M;
 };
-static_assert(sizeof(GpuReservoir) == 16, "GpuReservoir must match Reservoir in shaders/raytrace.comp");
+static_assert(sizeof(GpuReservoir) == 16, "GpuReservoir must match Reservoir in shaders/raytrace/restir_di.glsl");
 
 // Three per render pixel (this frame's, last frame's, the image pass's fresh samples), binding 29: ReSTIR GI's sample.
-// Must match GiReservoir in shaders/raytrace.comp.
+// Must match GiReservoir in shaders/raytrace/restir_gi.glsl.
 struct GpuGiReservoir {
     glm::vec3 position;
     uint32_t normal;
@@ -175,10 +175,10 @@ struct GpuGiReservoir {
     float M;
     uint32_t age;  // frames since the sample was found (bits 0-15), GI_SEEN flag; written by the shader only
 };
-static_assert(sizeof(GpuGiReservoir) == 40, "GpuGiReservoir must match GiReservoir in shaders/raytrace.comp");
+static_assert(sizeof(GpuGiReservoir) == 40, "GpuGiReservoir must match GiReservoir in shaders/raytrace/restir_gi.glsl");
 
 // Two per render pixel, binding 27: the first surface, packed, for ReSTIR's reuse. Must match RestirSurface in
-// shaders/raytrace.comp.
+// shaders/raytrace/restir_di.glsl.
 struct GpuRestirSurface {
     glm::vec3 position;
     uint32_t normal;
@@ -189,7 +189,8 @@ struct GpuRestirSurface {
     glm::vec3 seenAt;        // where the camera sees it (in mirrors: its image)
     uint32_t view;           // towards the viewer (octahedral)
 };
-static_assert(sizeof(GpuRestirSurface) == 48, "GpuRestirSurface must match RestirSurface in shaders/raytrace.comp");
+static_assert(sizeof(GpuRestirSurface) == 48,
+              "GpuRestirSurface must match RestirSurface in shaders/raytrace/restir_di.glsl");
 
 // Must match the push constants in shaders/cache_resolve.comp
 struct CacheResolvePushConstants {
@@ -320,7 +321,7 @@ inline constexpr VkFormat hitDistanceFormat = VK_FORMAT_R16_SFLOAT;
 // format qualifier, as it reads the radiance image through the same descriptor in Accumulation)
 inline constexpr VkFormat dlssOutputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
-// Must match Material in shaders/raytrace.comp (scalar layout). Material (ModelLoader.h) packed for the GPU:
+// Must match Material in shaders/raytrace/bindings.glsl (scalar layout). Material (ModelLoader.h) packed for the GPU:
 // emission premultiplied by its strength, disabled textures set to -1.
 struct GpuMaterial {
     glm::vec4 baseColor;
@@ -363,7 +364,7 @@ struct GpuMaterial {
     glm::vec3 fogNoiseOffset;       // from the seed, in texture repeats
     glm::vec3 fogDrift;             // in texture repeats per second
 };
-static_assert(sizeof(GpuMaterial) == 356, "GpuMaterial must match Material in shaders/raytrace.comp");
+static_assert(sizeof(GpuMaterial) == 356, "GpuMaterial must match Material in shaders/raytrace/bindings.glsl");
 
 // The fog noise texture holds this many blobs along each side (Volumes.cpp)
 static constexpr float fogNoiseBlobs = 4.0f;
@@ -404,7 +405,7 @@ enum class EmissiveSampling : int {
     Mis = 2            // both, weighted by multiple importance sampling
 };
 
-// Must match EmissiveTriangle in shaders/raytrace.comp (scalar layout). One per triangle of every visible
+// Must match EmissiveTriangle in shaders/raytrace/bindings.glsl (scalar layout). One per triangle of every visible
 // instance with an emissive material, in world space. Shadow rays are aimed at random points on these.
 struct EmissiveTriangle {
     glm::vec3 p0, p1, p2;
@@ -415,7 +416,8 @@ struct EmissiveTriangle {
     float area;
     uint32_t treeTrail; // its way down the light tree: bit d = 1 means "right child" at depth d
 };
-static_assert(sizeof(EmissiveTriangle) == 80, "EmissiveTriangle must match EmissiveTriangle in shaders/raytrace.comp");
+static_assert(sizeof(EmissiveTriangle) == 80,
+              "EmissiveTriangle must match EmissiveTriangle in shaders/raytrace/bindings.glsl");
 
 // How light sampling picks one of the glowing triangles at a surface point
 enum class LightPicking : int {
@@ -423,18 +425,18 @@ enum class LightPicking : int {
     Tree = 1    // walking down the light tree: by how much each part of the scene could send to this point
 };
 
-// Must match LightTreeNode in shaders/raytrace.comp (scalar layout). The light tree: a binary tree over the glowing
-// triangles that light sampling can pick (probability > 0), built in Lights.cpp. Node 0 is the root.
+// Must match LightTreeNode in shaders/raytrace/bindings.glsl (scalar layout). The light tree: a binary tree over the
+// glowing triangles that light sampling can pick (probability > 0), built in Lights.cpp. Node 0 is the root.
 struct LightTreeNode {
     glm::vec3 boundsMin;  // box around all its triangles
     float power;          // sum of their probabilities (= their share of the scene's light)
     glm::vec3 boundsMax;
     int32_t child;        // >= 0: the first of its two children (the second follows); < 0: a leaf, triangle -child-1
 };
-static_assert(sizeof(LightTreeNode) == 32, "LightTreeNode must match LightTreeNode in shaders/raytrace.comp");
+static_assert(sizeof(LightTreeNode) == 32, "LightTreeNode must match LightTreeNode in shaders/raytrace/bindings.glsl");
 
-// Must match PunctualLight in shaders/raytrace.comp (scalar layout). One per enabled light of every visible object,
-// in world space, rebuilt every frame (see updateScene).
+// Must match PunctualLight in shaders/raytrace/bindings.glsl (scalar layout). One per enabled light of every visible
+// object, in world space, rebuilt every frame (see updateScene).
 struct GpuPunctualLight {
     glm::vec3 position;
     uint32_t type;           // LightType
@@ -444,10 +446,11 @@ struct GpuPunctualLight {
     float cosOuterCone;      // spot: cos of the outer and inner cone angles
     float cosInnerCone;
 };
-static_assert(sizeof(GpuPunctualLight) == 52, "GpuPunctualLight must match PunctualLight in shaders/raytrace.comp");
+static_assert(sizeof(GpuPunctualLight) == 52,
+              "GpuPunctualLight must match PunctualLight in shaders/raytrace/bindings.glsl");
 
-// Must match Portal in shaders/raytrace.comp (scalar layout). One per end of every enabled portal pair, in world space,
-// rebuilt every frame (see updateScene); a pair's ends are entries 2k and 2k + 1.
+// Must match Portal in shaders/raytrace/portals.glsl (scalar layout). One per end of every enabled portal pair, in
+// world space, rebuilt every frame (see updateScene); a pair's ends are entries 2k and 2k + 1.
 struct GpuPortal {
     glm::vec3 center;
     float halfWidth;
@@ -457,7 +460,7 @@ struct GpuPortal {
     uint32_t shape;          // PortalShape
     glm::mat4x3 toPartner;   // takes points (and directions) from this end to the other one
 };
-static_assert(sizeof(GpuPortal) == 96, "GpuPortal must match Portal in shaders/raytrace.comp");
+static_assert(sizeof(GpuPortal) == 96, "GpuPortal must match Portal in shaders/raytrace/portals.glsl");
 
 // A device-local buffer the CPU refills from time to time. The CPU writes what changed into the current frame's part
 // of the upload ring (Renderer::uploadRings), then the GPU copies it over.
