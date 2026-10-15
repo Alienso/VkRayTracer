@@ -236,12 +236,8 @@ void Editor::buildLogUi() {
     ImGui::EndChild();
 }
 
-void Editor::buildRenderingPanel() {
-    renderer.buildRenderingUi();
-}
-
 void Editor::buildDebugPanel() {
-    renderer.buildDebugUi();
+    buildRendererDebugUi();
     ImGui::Separator();
     ImGui::Checkbox("Check scene updates", &scene.checkUpdates);
     if (ImGui::IsItemHovered()) {

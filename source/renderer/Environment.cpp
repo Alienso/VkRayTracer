@@ -23,7 +23,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <glm/gtc/constants.hpp>
-#include <imgui/imgui.h>
 #include <stb_image.h>
 #include "renderer/Renderer.h"
 
@@ -293,15 +292,4 @@ void GpuScene::recordEnvironmentUpload(VkCommandBuffer commandBuffer) {
                              sizeof(float) * environmentDistribution.size());
     }
     environmentUploadPending = false;
-}
-
-// How the renderer samples the sky (part of the editor's Lighting panel, shown unless the background is black)
-void Renderer::buildSkySamplingUi() {
-    ImGui::Combo("Sample the sky", &settings.skySampling, "Auto (HDR maps only)\0On\0Off\0");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("On: every surface aims a shadow ray at the sky (bright parts more often), combined with\n"
-                          "the bounce rays (MIS). Off: the sky is only found by bounce rays that happen to leave\n"
-                          "the scene. Both give the same image. Sampling costs a ray per bounce: it pays off for an\n"
-                          "HDR map with a sun (much less noise), hardly for the smooth gradient sky. Auto: maps only.");
-    }
 }

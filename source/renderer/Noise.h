@@ -46,7 +46,6 @@ public:
     void finishNoiseMeasurement();
     void recordNoise(VkCommandBuffer commandBuffer);
     void destroyNoiseResources();
-    void buildNoiseUi();
 
     bool noiseResourcesCreated = false;
     RenderImage noiseReferenceImage;          // R32F (luminance) at output size

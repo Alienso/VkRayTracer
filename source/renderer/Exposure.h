@@ -16,8 +16,9 @@ class ExposurePass {
 public:
     // The renderer's: settings (the UI edits them), frame slot, output size, frame time, and the HDR image shown
     // (the radiance image, or DLSS's output)
-    ExposurePass(GpuContext& gpu, RenderSettings& settings, const uint32_t& currentFrame, const VkExtent2D& outputExtent,
-                 const float& frameDeltaTime, std::function<VkImageView()> displayedHdrView)
+    ExposurePass(GpuContext& gpu, const RenderSettings& settings, const uint32_t& currentFrame,
+                 const VkExtent2D& outputExtent, const float& frameDeltaTime,
+                 std::function<VkImageView()> displayedHdrView)
         : gpu(gpu), settings(settings), currentFrame(currentFrame), outputExtent(outputExtent),
           frameDeltaTime(frameDeltaTime), displayedHdrView(std::move(displayedHdrView)) {}
 
@@ -25,7 +26,6 @@ public:
     void updateExposureDescriptorSet();
     void recordExposure(VkCommandBuffer commandBuffer);
     void destroyExposureResources();
-    void buildExposureUi();
 
     VkBuffer exposureBuffer;
     VmaAllocation exposureMemory;
@@ -44,7 +44,7 @@ public:
 
 private:
     GpuContext& gpu;
-    RenderSettings& settings;
+    const RenderSettings& settings;
     const uint32_t& currentFrame;
     const VkExtent2D& outputExtent;
     const float& frameDeltaTime;

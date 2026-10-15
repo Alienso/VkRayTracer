@@ -35,13 +35,14 @@
 // frame it is given a RenderList (the scene's instances, lights, camera, environment) and reads the AssetStore for
 // what the list refers to. The program (Application.h) owns the window, the systems, the editor and the main loop.
 //
-// Its own settings panels (rendering, debug, light sampling) are drawn into the editor's window. It draws the UI too:
-// the ImGui context is the program's, the Vulkan side of it is here.
+// It renders with the program's RenderSettings, which the editor's panels edit (editor/EditorRenderer.cpp) and benches
+// set; what the panels show of it comes from stats(). It draws the UI too: the ImGui context is the program's, the
+// Vulkan side of it is here.
 class Renderer {
 public:
     static constexpr uint32_t maxTextures = GpuScene::maxTextures;  // size of the texture descriptor array
 
-    explicit Renderer(AssetStore& assets) : assets(assets) {}
+    Renderer(AssetStore& assets, RenderSettings& settings) : assets(assets), settings(settings) {}
 
     // Creates the device, the swapchain for the window, pipelines and images, and uploads what list shows. The
     // ImGui context must exist (its Vulkan side is set up here).
@@ -59,9 +60,8 @@ public:
     void requestCapture(const std::string& fileName = "") { capture.request(fileName); }
     [[nodiscard]] bool capturePending() const { return capture.pending(); }
 
-    // The settings the UI edits; a bench sets them from a file (RenderSettingsFile.h)
+    // The settings it renders with (the program's)
     [[nodiscard]] const RenderSettings& renderSettings() const { return settings; }
-    void setRenderSettings(const RenderSettings& newSettings) { settings = newSettings; }
 
     // The noise tool, run from code: accumulates a reference of the current view for referenceFrames, then measures
     // measureFrames in renderMode (see Noise.cpp). Busy until the results are in noiseResultList.
@@ -73,12 +73,25 @@ public:
     // The trace shader's pipelines, as the driver compiled them (empty without VK_KHR_pipeline_executable_properties)
     [[nodiscard]] const std::vector<PipelineStatistics>& tracePipelineStatistics() const { return trace.rtPipelineStatisticsList; }
 
-    // The renderer's settings panels, for the editor's window (ImGuiInit.cpp, Environment.cpp, Lights.cpp)
-    void buildRenderingUi();
-    void buildDebugUi();
-    void buildShadowsUi();
-    void buildSkySamplingUi();
-    void buildPunctualLightSettingsUi();
+    // What the settings panels ask of it besides the settings
+    void restartAccumulation() { resetAccumulation = true; }
+    void clearRadianceCache() { cache.cacheClearPending = true; }
+    void snapExposure() { exposure.exposureReset = true; }  // auto exposure skips the adaptation once
+    // The noise tool from the Debug panel: a reference of the current view accumulated over referenceFrames, then
+    // measureFrames in renderMode (region: x0, y0, x1, y1 in output pixels, all 0 = the whole image)
+    void startNoiseReference(int referenceFrames) {
+        noise.noiseReferenceFrames = referenceFrames;
+        noise.startNoiseReference();
+    }
+    void startNoiseMeasurement(int renderMode, int measureFrames, glm::ivec4 region) {
+        noise.noiseMeasureFrames = measureFrames;
+        noise.noiseRegion = region;
+        noise.startNoiseMeasurement(renderMode);
+    }
+    [[nodiscard]] bool dlssModelAvailable(int model) const { return dlss.dlssModelAvailable(model); }  // DlssModel
+    [[nodiscard]] double dlssMemoryMegabytes() const { return dlss.memoryMegabytes(); }  // 0 if it can't tell
+    // RenderSettings::outputSize -> rows of the output image (0: the window's)
+    static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
 
     // The window's framebuffer changed size: the swapchain is remade after this frame
     void resize() { framebufferResized = true; }
@@ -114,7 +127,9 @@ private:
     // What is loaded (the program's, Application.h) and what this frame draws (given to render())
     AssetStore& assets;
     const RenderList* renderList = nullptr;
-    RenderSettings settings;  // the UI edits them (the settings panels); benches set them
+    // The program's (Application.h): the editor's panels edit them, benches set them. The renderer changes them too:
+    // no DLSS -> Accumulation (applyRenderMode), the noise tool's render mode.
+    RenderSettings& settings;
 
     // Two sizes (chooseExtents): the path tracer renders at renderExtent, the display pass writes outputExtent
     // (the window, or bigger: RenderSettings::outputSize). Equal in accumulation mode; DLSS renders smaller and upscales.
@@ -217,8 +232,6 @@ private:
     // RenderImages.cpp
     void chooseExtents();
     void applyOutputSize();
-    // RenderSettings::outputSize -> rows of the output image (0: the window's); names in buildRenderModeUi
-    static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
     void recreateRenderImages();
     PerPixelBuffers wantedPerPixelBuffers();
     void applyPerPixelBuffers();
@@ -227,11 +240,9 @@ private:
     void createDisplayImages();  // the display image (DisplayPass) and, in the DLSS modes, DLSS's output image
     void destroyDisplayImages();
 
-    // ImGuiInit.cpp: the UI's Vulkan side, and the settings panels
+    // ImGuiInit.cpp: the UI's Vulkan side
     void initImGui();
     void cleanupImGui();
-    void buildRestirUi();
-    void buildRenderModeUi();
 };
 
 

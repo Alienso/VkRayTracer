@@ -49,8 +49,9 @@ private:
     Scene scene{assets};
     RenderList renderList;  // what this frame draws (Scene::buildRenderList), given to the renderer
     CameraController cameraController;  // moves scene.camera()
-    Renderer renderer{assets};
-    Editor editor{assets, scene, cameraController, renderer, window};
+    RenderSettings renderSettings;  // the renderer renders with them, the editor edits them, a bench sets them
+    Renderer renderer{assets, renderSettings};
+    Editor editor{assets, scene, cameraController, renderer, renderSettings, window};
 
     void createDefaultScene();
     void mainLoop();

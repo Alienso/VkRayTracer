@@ -1,6 +1,6 @@
 //
 // The editor: the menu bar and the panels around the image (ImGui). The panels edit the scene (objects, camera, sun
-// and sky: here and EditorScene.cpp) and show the renderer's own settings (Renderer::buildRenderingUi and co.); where
+// and sky: here and EditorScene.cpp) and the renderer's settings (EditorRenderer.cpp); where
 // they dock, the menus, the log and the numbers over the image: EditorLayout.cpp.
 //
 
@@ -9,8 +9,9 @@
 #include "editor/Editor.h"
 
 Editor::Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
-               Window& window)
-        : assets(assets), scene(scene), cameraController(cameraController), renderer(renderer), window(window),
+               RenderSettings& settings, Window& window)
+        : assets(assets), scene(scene), cameraController(cameraController), renderer(renderer), settings(settings),
+          window(window),
           panels{{{"Outliner", true, &Editor::buildOutliner},
                   {"Details", true, &Editor::buildDetails},
                   {"Rendering", true, &Editor::buildRenderingPanel},
@@ -108,13 +109,13 @@ void Editor::buildLightingUi() {
     ImGui::SliderFloat("Size (degrees)", &environment.sunAngularRadius, 0.0f, 15.0f, "%.2f");
     ImGui::ColorEdit3("Color##sun", &environment.sunColor.x);
     ImGui::SliderFloat("Intensity##sun", &environment.sunIntensity, 0.0f, 5.0f);
-    renderer.buildShadowsUi();
+    ImGui::Checkbox("Shadows", &settings.shadowsEnabled);
 
     ImGui::SeparatorText("Sky");
     buildEnvironmentUi();
 
     ImGui::SeparatorText("Lights from models");
-    renderer.buildPunctualLightSettingsUi();
+    buildPunctualLightSettingsUi();
 }
 
 
@@ -182,6 +183,6 @@ void Editor::buildEnvironmentUi() {
         }
     }
     if (mode != Background::Black) {
-        renderer.buildSkySamplingUi();
+        buildSkySamplingUi();
     }
 }

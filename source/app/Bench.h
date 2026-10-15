@@ -47,8 +47,8 @@ public:
 
     // The scene file to open ("" = the default scene)
     [[nodiscard]] const std::string& sceneFile() const { return scenePath; }
-    // After the renderer is set up: its settings from the file
-    void start(Renderer& renderer);
+    // After the renderer is set up: the program's render settings from the file
+    void start(RenderSettings& settings);
     // The time step for this frame: the file's, or the real one
     [[nodiscard]] float deltaTime(float realDeltaTime) const { return fixedDeltaTime > 0.0f ? fixedDeltaTime : realDeltaTime; }
     // Each frame before the render list is made: the camera, captures, the noise run

@@ -17,8 +17,9 @@ class RadianceCache {
 public:
     // The renderer's: settings (the UI edits them), frame slot, render size, and the trace shader's descriptor set,
     // pipeline layout and cache update pipeline (the update paths are the trace shader's)
-    RadianceCache(GpuContext& gpu, RenderSettings& settings, const uint32_t& currentFrame, const VkExtent2D& renderExtent,
-                  const VkDescriptorSet& rtDescriptorSet, const VkPipelineLayout& rtPipelineLayout,
+    RadianceCache(GpuContext& gpu, const RenderSettings& settings, const uint32_t& currentFrame,
+                  const VkExtent2D& renderExtent, const VkDescriptorSet& rtDescriptorSet,
+                  const VkPipelineLayout& rtPipelineLayout,
                   std::function<VkPipeline()> cacheUpdatePipeline)
         : gpu(gpu), settings(settings), currentFrame(currentFrame), renderExtent(renderExtent),
           rtDescriptorSet(rtDescriptorSet), rtPipelineLayout(rtPipelineLayout),
@@ -28,7 +29,6 @@ public:
     // Clears it if asked (cacheClearPending), traces the update paths, averages, reads back the cell count
     void recordRadianceCache(VkCommandBuffer commandBuffer);
     void destroyRadianceCache();
-    void buildRadianceCacheUi();
 
     static constexpr uint32_t cacheCapacity = 1u << 20;  // entries (40 MB in all)
     static constexpr float cacheMaxWeight = 256.0f;
@@ -49,7 +49,7 @@ public:
 
 private:
     GpuContext& gpu;
-    RenderSettings& settings;
+    const RenderSettings& settings;
     const uint32_t& currentFrame;
     const VkExtent2D& renderExtent;
     const VkDescriptorSet& rtDescriptorSet;

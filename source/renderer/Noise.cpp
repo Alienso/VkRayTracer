@@ -19,7 +19,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <imgui/imgui.h>
 #include "renderer/Noise.h"
 #include "core/Configuration.h"
 
@@ -408,76 +407,4 @@ void NoiseTool::destroyNoiseResources() {
         vmaFreeMemory(gpu.allocator, noiseSumMemories[i]);
     }
     noiseResourcesCreated = false;
-}
-
-void NoiseTool::buildNoiseUi() {
-    ImGui::SeparatorText("Noise measurement");
-    ImGui::TextDisabled("Keep the camera still. The reference is the current view, accumulated\n"
-                        "for a long time; the measurement then starts over and compares every frame.");
-    bool idle = noiseState == NoiseState::Idle;
-    ImGui::BeginDisabled(!idle);
-    ImGui::SliderInt("Reference frames", &noiseReferenceFrames, 256, 65536, "%d", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::Button("Make reference")) {
-        startNoiseReference();
-    }
-    ImGui::SameLine();
-    if (noiseState == NoiseState::BuildingReference) {
-        ImGui::Text("%u / %d frames", dlssActive() ? 0u : accumulatedFrames, noiseReferenceFrames);
-    } else if (noiseReferenceValid) {
-        ImGui::TextDisabled("reference ready (average luminance %.3g)", noiseReferenceLuminance);
-    } else {
-        ImGui::TextDisabled("no reference");
-    }
-
-    ImGui::SliderInt("Measured frames", &noiseMeasureFrames, 1, 1024, "%d", ImGuiSliderFlags_Logarithmic);
-    ImGui::DragInt4("Region", &noiseRegion.x, 1.0f, 0, static_cast<int>(std::max(outputExtent.width, outputExtent.height)));
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("x0, y0, x1, y1 in pixels: a part of the image whose brightness is also measured\n"
-                          "on its own (\"region\" column). All 0 = the whole image.");
-    }
-    ImGui::BeginDisabled(!noiseReferenceValid);
-    if (ImGui::Button("Measure")) {
-        startNoiseMeasurement(settings.renderMode);
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("(in the current renderer)");
-    ImGui::EndDisabled();
-    if (noiseState == NoiseState::Measuring) {
-        ImGui::Text("frame %u / %d", noiseFrame, noiseMeasureFrames);
-    } else if (!noiseStatus.empty()) {
-        ImGui::TextDisabled("%s", noiseStatus.c_str());
-    }
-
-    if (!noiseResults.empty() && ImGui::BeginTable("noise", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("frame");
-        ImGui::TableSetupColumn("rel. MSE");
-        ImGui::TableSetupColumn("rel. RMSE");
-        ImGui::TableSetupColumn("brightness");
-        ImGui::TableSetupColumn("region");
-        ImGui::TableHeadersRow();
-        for (const NoiseResult& result : noiseResults) {
-            if ((result.frame & (result.frame - 1)) != 0 && &result != &noiseResults.back()) {
-                continue;  // powers of two (and the last one)
-            }
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("%u", result.frame);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.3e", result.relativeMse);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.2f%%", 100.0f * std::sqrt(result.relativeMse));
-            ImGui::TableNextColumn();
-            ImGui::Text("%.2f%%", 100.0f * result.brightness);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.2f%%", 100.0f * result.regionBrightness);
-        }
-        ImGui::EndTable();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("rel. MSE: mean of ((frame - reference) / reference)^2 over the image (luminance).\n"
-                          "Unbiased: halves when the frame count doubles. Stops shrinking: biased.\n"
-                          "brightness: the frame's total light compared to the reference's.\n"
-                          "region: the same inside the Region rectangle above (light leaking into a corner shows up there).");
-    }
 }

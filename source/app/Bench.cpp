@@ -164,12 +164,10 @@ Bench::Bench(const std::string& path, std::string outputDirectory)
     std::filesystem::remove(std::filesystem::path(this->outputDirectory) / "results.json");
 }
 
-void Bench::start(Renderer& renderer) {
-    RenderSettings settings = renderer.renderSettings();
+void Bench::start(RenderSettings& settings) {
     if (!settingsJson.is_null()) {
         applyRenderSettingsJson(settings, settingsJson);  // checked when the file was read
     }
-    renderer.setRenderSettings(settings);
 }
 
 // The camera at this frame: the keyframes around it, blended

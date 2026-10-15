@@ -1,7 +1,7 @@
 //
 // The editor: dockable panels around the image (ImGui), with the scene's objects, materials, lights, camera, sun
-// and sky, and the renderer's own settings panels. It changes the Scene and the AssetStore's materials and lights;
-// it asks the renderer only for its panels, its numbers (Renderer::stats) and a capture.
+// and sky, and the renderer's settings. It changes the Scene, the AssetStore's materials and lights and the program's
+// RenderSettings; of the renderer it reads its numbers (Renderer::stats) and asks for captures and the like.
 //
 
 #ifndef VULKANDEMO_EDITOR_H
@@ -17,7 +17,8 @@
 
 class Editor {
 public:
-    Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer, Window& window);
+    Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
+           RenderSettings& settings, Window& window);
 
     // After the scene was made: the last object selected, a load error to show
     void init(const std::string& error);
@@ -39,6 +40,7 @@ private:
     Scene& scene;
     CameraController& cameraController;
     Renderer& renderer;
+    RenderSettings& settings;  // the program's: the renderer renders with them
     Window& window;
     RendererStats stats;  // fetched at the start of build()
 
@@ -97,13 +99,26 @@ private:
     void buildOverlay();
     void buildStatisticsUi();
     void buildLogUi();
-    void buildRenderingPanel();
     void buildDebugPanel();
 
     // Editor.cpp
     void buildCameraUi();
     void buildLightingUi();
     void buildEnvironmentUi();
+
+    // EditorRenderer.cpp: the renderer's settings
+    int noiseReferenceFrames = 4096;         // noise tool: frames accumulated for the reference
+    int noiseMeasureFrames = 256;            // frames measured
+    glm::ivec4 noiseRegion = glm::ivec4(0);  // x0, y0, x1, y1 in output pixels; all 0 = the whole image
+    void buildRenderingPanel();
+    void buildRenderModeUi();
+    void buildRadianceCacheUi();
+    void buildRestirUi();
+    void buildExposureUi();
+    void buildRendererDebugUi();  // the Debug panel's top: debug views, the noise tool, shader statistics
+    void buildNoiseUi();
+    void buildSkySamplingUi();            // in the Lighting panel's Sky part
+    void buildPunctualLightSettingsUi();  // in the Lighting panel
 
     // EditorFile.cpp
     void buildFileMenu();

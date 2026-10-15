@@ -25,7 +25,7 @@ int Application::run() {
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);  // true: install input callbacks, chaining the window's own
     renderer.init(window.handle(), renderList);
     if (bench) {
-        bench->start(renderer);
+        bench->start(renderSettings);
     }
     mainLoop();
     renderer.shutdown();

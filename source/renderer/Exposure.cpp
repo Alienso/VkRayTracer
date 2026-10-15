@@ -11,7 +11,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-#include <imgui/imgui.h>
 #include "renderer/Exposure.h"
 #include "core/Configuration.h"
 
@@ -22,8 +21,6 @@ std::vector<char> readFile(const std::string& filename);
 // The black level 2^-16 sits far below anything the exposure limits can brighten to middle grey (+10 stops:
 // 0.18 / 1024 ~ 2^-12.5). It has to be above zero-ish noise: DLSS's output for a black background is ~2^-19.6,
 // which metered as "very dark" pushed the exposure of the Cornell box to +7 stops.
-static const float histogramMinLog2 = -16.0f;
-static const float histogramLog2Range = 28.0f;
 
 void ExposurePass::createExposureResources() {
     // State buffer: histogram counters start at 0, the exposure at 1 (used by the very first frame)
@@ -220,87 +217,4 @@ void ExposurePass::destroyExposureResources() {
     }
     vkDestroyBuffer(gpu.device, exposureBuffer, nullptr);
     vmaFreeMemory(gpu.allocator, exposureMemory);
-}
-
-// Part of the "Rendering" section
-void ExposurePass::buildExposureUi() {
-    ImGui::Checkbox("Auto exposure", &settings.autoExposure);
-    if (!settings.autoExposure) {
-        ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-        return;
-    }
-
-    ImGui::SameLine();
-    if (exposureInfoValid) {
-        ImGui::Text("x%.2f (%+.1f stops)", exposureInfo.exposure * std::exp2(settings.exposureCompensation),
-                    std::log2(exposureInfo.exposure) + settings.exposureCompensation);
-    }
-    ImGui::SliderFloat("Compensation", &settings.exposureCompensation, -4.0f, 4.0f, "%+.1f stops");
-
-    if (!ImGui::TreeNode("Auto exposure settings")) {
-        return;
-    }
-
-    // Histogram of the last metered frame: brightness from dark (left) to bright (right), log scale.
-    // The highlighted band is the metered part, the line is the measured average.
-    if (exposureInfoValid) {
-        float bins[exposureBinCount - 1];
-        float largest = 1.0f;
-        for (uint32_t i = 1; i < exposureBinCount; i++) {
-            bins[i - 1] = static_cast<float>(exposureInfo.lastHistogram[i]);
-            largest = std::max(largest, bins[i - 1]);
-        }
-        ImGui::PlotHistogram("##histogram", bins, exposureBinCount - 1, 0, nullptr, 0.0f, largest,
-                             ImVec2(ImGui::GetContentRegionAvail().x, 70.0f));
-        ImVec2 min = ImGui::GetItemRectMin();
-        ImVec2 max = ImGui::GetItemRectMax();
-        auto xOf = [&](float luminance) {
-            float t = (std::log2(std::max(luminance, 1e-30f)) - histogramMinLog2) / histogramLog2Range;
-            return min.x + std::clamp(t, 0.0f, 1.0f) * (max.x - min.x);
-        };
-        ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(ImVec2(xOf(exposureInfo.lowLuminance), min.y), ImVec2(xOf(exposureInfo.highLuminance), max.y),
-                            IM_COL32(80, 200, 120, 50));
-        float average = xOf(exposureInfo.averageLuminance);
-        draw->AddLine(ImVec2(average, min.y), ImVec2(average, max.y), IM_COL32(255, 220, 80, 255), 2.0f);
-        ImGui::TextDisabled("metered: luminance %.3g .. %.3g, average %.3g", exposureInfo.lowLuminance,
-                            exposureInfo.highLuminance, exposureInfo.averageLuminance);
-    }
-
-    ImGui::SliderFloat("Ignore darkest", &settings.meterLowPercent, 0.0f, 98.0f, "%.0f%%");
-    ImGui::SliderFloat("Ignore above", &settings.meterHighPercent, 2.0f, 100.0f, "%.0f%%");
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Pixels are ranked from dark to bright. Only the ones between the two\n"
-                          "percentages are averaged: deep shadows and a black background don't\n"
-                          "make the image brighter, the sun, the sky and fireflies don't make it darker.");
-    }
-    ImGui::Checkbox("Center-weighted", &settings.centerWeighted);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(the middle of the image counts up to 4x)");
-    ImGui::SliderFloat("Key", &settings.exposureKey, 0.05f, 0.5f, "%.2f");
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("The measured average is made this bright before tone mapping.\n"
-                          "0.18 = middle grey; Compensation does the same in stops.");
-    }
-    ImGui::DragFloatRange2("Limits", &settings.minExposureStops, &settings.maxExposureStops, 0.1f, -10.0f, 12.0f,
-                           "%+.1f stops", "%+.1f stops");
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("How far auto exposure may darken (x%.2f) or brighten (x%.1f) the image.\n"
-                          "Keeps very dark scenes from turning into grey noise.",
-                          std::exp2(settings.minExposureStops), std::exp2(settings.maxExposureStops));
-    }
-    ImGui::SliderFloat("Brighten speed", &settings.brightenSpeed, 0.1f, 10.0f, "%.1f /s", ImGuiSliderFlags_Logarithmic);
-    ImGui::SliderFloat("Darken speed", &settings.darkenSpeed, 0.1f, 10.0f, "%.1f /s", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::Button("Snap now")) {
-        exposureReset = true;
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(skip the adaptation once)");
-    ImGui::TreePop();
 }

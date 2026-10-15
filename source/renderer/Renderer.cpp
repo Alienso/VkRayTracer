@@ -83,6 +83,30 @@ RendererStats Renderer::stats() const {
     stats.debugView = settings.debugView != 0;
     stats.captureMessage = capture.captureMessage;
     stats.environmentMapSize = renderList != nullptr && scene.environmentMapReady() ? scene.environmentMapSize : glm::uvec2(0);
+    stats.dlssActive = dlssActive();
+    stats.renderExtent = renderExtent;
+    stats.outputExtent = outputExtent;
+    stats.lightTreeNodes = scene.lightTree.size();
+    stats.lightTreeDepth = scene.lightTreeDepth;
+    stats.punctualLights = scene.framePunctualLights.size();
+    stats.cacheUsedEntries = cache.cacheUsedEntries;
+    stats.cacheCapacity = RadianceCache::cacheCapacity;
+    stats.cacheQueriesSuspended = cache.cacheQueriesSuspended;
+    stats.exposureValid = exposure.exposureInfoValid;
+    stats.exposure = exposure.exposureInfo;
+    stats.tracePipelineStatistics = trace.rtPipelineStatistics;
+    stats.dlssSupported = dlss.dlssSupported;
+    stats.dlssStatus = dlss.dlssStatus;
+    stats.dlssVersion = dlss.dlssVersion;
+    stats.dlssCnnVersion = dlss.dlssCnnVersion;
+    stats.noiseState = noise.noiseState;
+    stats.noiseReferenceValid = noise.noiseReferenceValid;
+    stats.noiseReferenceLuminance = noise.noiseReferenceLuminance;
+    stats.noiseReferenceFrames = noise.noiseReferenceFrames;
+    stats.noiseFrame = noise.noiseFrame;
+    stats.noiseMeasureFrames = noise.noiseMeasureFrames;
+    stats.noiseStatus = noise.noiseStatus;
+    stats.noiseResults = noise.noiseResults;
     return stats;
 }
 

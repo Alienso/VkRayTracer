@@ -15,7 +15,6 @@
 #include <cmath>
 #include <limits>
 #include <glm/gtc/constants.hpp>
-#include <imgui/imgui.h>
 #include "renderer/Renderer.h"
 #include "core/Configuration.h"
 
@@ -452,17 +451,4 @@ void GpuScene::recordPunctualLightUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, punctualLightBuffer, uploadedPunctualLights.data(),
                          sizeof(GpuPunctualLight) * uploadedPunctualLights.size());
     punctualLightsUploadPending = false;
-}
-
-// The "Lights from models" part of the Lighting panel
-void Renderer::buildPunctualLightSettingsUi() {
-    ImGui::Checkbox("Enabled##punctual", &settings.punctualLights);
-    ImGui::SameLine();
-    ImGui::TextDisabled("%zu lights", scene.framePunctualLights.size());
-    ImGui::SliderFloat("Scale##punctual", &settings.punctualLightScale, 0.001f, 1000.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Multiplies every light from the files (KHR_lights_punctual). They come in candela (point,\n"
-                          "spot) and lux (directional). For comparison: the Sun at intensity 1 gives pi lux, a 100 cd\n"
-                          "lamp 2 m away gives 25 lux. Edit single lights under Scene > object > Lights.");
-    }
 }

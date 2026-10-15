@@ -197,6 +197,9 @@ static_assert(sizeof(CacheResolvePushConstants) == 16, "CacheResolvePushConstant
 // Must match ExposureState in shaders/exposure.comp (scalar layout). Lives on the GPU; the display pass
 // reads the exposure from it, and a copy comes back to the CPU (a few frames late) for the UI.
 static constexpr uint32_t exposureBinCount = 256;
+// The histogram's range: log2 of the luminance, from histogramMinLog2 over histogramLog2Range
+static constexpr float histogramMinLog2 = -16.0f;
+static constexpr float histogramLog2Range = 28.0f;
 struct ExposureState {
     uint32_t histogram[exposureBinCount];      // being filled during a frame
     uint32_t lastHistogram[exposureBinCount];  // the finished histogram of the last metered frame
@@ -628,6 +631,33 @@ struct RendererStats {
     bool debugView = false;     // a debug view replaces the image
     std::string captureMessage;
     glm::uvec2 environmentMapSize = glm::uvec2(0);  // the scene's HDR map, once it is on the GPU (else 0)
+
+    // For the settings panels (editor/EditorRenderer.cpp)
+    bool dlssActive = false;    // a DLSS mode, not Accumulation
+    VkExtent2D renderExtent{};  // what the path tracer renders
+    VkExtent2D outputExtent{};  // the image (RenderSettings::outputSize)
+    size_t lightTreeNodes = 0;  // 0: no tree (light picking by power)
+    uint32_t lightTreeDepth = 0;
+    size_t punctualLights = 0;
+    uint32_t cacheUsedEntries = 0;  // radiance cache cells, a few frames late
+    uint32_t cacheCapacity = 0;
+    bool cacheQueriesSuspended = false;  // the noise tool's reference is being made without the cache
+    bool exposureValid = false;  // exposure holds a frame's auto exposure
+    ExposureState exposure{};
+    std::string tracePipelineStatistics;  // the trace shader as the driver compiled it (empty: not available)
+    bool dlssSupported = false;
+    std::string dlssStatus;  // why it isn't
+    std::string dlssVersion;
+    bool dlssCnnVersion = false;  // --dlss-cnn: the older DLSS with the CNN models
+    // The noise tool (Noise.h)
+    NoiseState noiseState = NoiseState::Idle;
+    bool noiseReferenceValid = false;
+    float noiseReferenceLuminance = 0.0f;
+    int noiseReferenceFrames = 0;
+    uint32_t noiseFrame = 0;  // measured so far, of noiseMeasureFrames
+    int noiseMeasureFrames = 0;
+    std::string noiseStatus;
+    std::vector<NoiseResult> noiseResults;
 };
 
 // Which of the trace pass's per-pixel buffers have a pixel's worth for every render pixel. The others are 1 x 1 placeholders (the

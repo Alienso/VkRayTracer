@@ -13,7 +13,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-#include <imgui/imgui.h>
 #include "renderer/RadianceCache.h"
 #include "core/Configuration.h"
 
@@ -197,48 +196,4 @@ void RadianceCache::destroyRadianceCache() {
         vkDestroyBuffer(gpu.device, buffers[i], nullptr);
         vmaFreeMemory(gpu.allocator, memories[i]);
     }
-}
-
-// Part of the "Rendering" section
-void RadianceCache::buildRadianceCacheUi() {
-    ImGui::Checkbox("Radiance cache", &settings.radianceCache);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Remembers how much indirect light leaves small patches of the surfaces. Paths stop\n"
-                          "after their first diffuse bounce: they light that point directly and take the\n"
-                          "indirect light from the cache. Much less noise in indirectly lit places, and faster.\n"
-                          "Slightly blurs indirect light; reacts to changes in the lighting within a few dozen frames.");
-    }
-    if (settings.radianceCache) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%u cells (%.0f%% full)%s", cacheUsedEntries, 100.0f * cacheUsedEntries / cacheCapacity,
-                            cacheQueriesSuspended ? ", not used for the noise reference" : "");
-    }
-    if (!ImGui::TreeNode("Radiance cache settings")) {
-        return;
-    }
-    ImGui::SliderFloat("Cell size", &settings.cacheCellPixels, 1.0f, 32.0f, "%.1f pixels", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Cells are about this wide on screen, wherever they are. Smaller: sharper indirect\n"
-                          "light, but fewer samples per cell (noisier cache).");
-    }
-    ImGui::SliderInt("Update paths", &settings.cacheUpdateTile, 1, 16, "1 per %d x %d pixels");
-    ImGui::SliderFloat("History", &settings.cacheHistoryFrames, 4.0f, 256.0f, "%.0f frames", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("How long old samples keep counting. Longer: less noise in the cache, slower to follow\n"
-                          "changes in the lighting.");
-    }
-    ImGui::SliderFloat("Minimum samples", &settings.cacheMinSamples, 1.0f, 64.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("A cell needs this many samples before paths use it; until then they trace on.");
-    }
-    ImGui::Checkbox("In fog too", &settings.cacheFog);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Cells in fog as well: paths stop at their second scatter point and take the light that\n"
-                          "comes there via further scattering from the cache. Much faster in thick fog; light inside\n"
-                          "the fog comes a little blurred and as if scattered evenly in all directions.");
-    }
-    if (ImGui::Button("Clear cache")) {
-        cacheClearPending = true;
-    }
-    ImGui::TreePop();
 }
