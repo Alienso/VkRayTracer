@@ -68,7 +68,7 @@ struct SceneUniforms {
     uint32_t textureMipmaps;         // 1 = textures are read at the mip level that fits the hit (ray cones)
     float pixelSpreadAngle;          // radians between neighboring camera rays (render resolution)
     uint32_t normalMapFiltering;     // 1 = bumps that a normal map's smaller levels average away widen the reflection
-    uint32_t restirDi;               // 1 = ReSTIR DI: camera rays and light samples in a pass of their own (recordRayTracing)
+    uint32_t restirDi;               // 1 = ReSTIR DI: camera rays and light samples in a pass of their own (RayTracer::recordRestir)
     uint32_t restirTriangleCandidates;  // ReSTIR candidates per kind of light (0 when there are none of that kind)
     uint32_t restirPunctualCandidates;
     uint32_t restirSkyCandidates;
@@ -628,6 +628,20 @@ struct RendererStats {
     bool debugView = false;     // a debug view replaces the image
     std::string captureMessage;
     glm::uvec2 environmentMapSize = glm::uvec2(0);  // the scene's HDR map, once it is on the GPU (else 0)
+};
+
+// Which of the trace pass's per-pixel buffers have a pixel's worth for every render pixel. The others are 1 x 1 placeholders (the
+// descriptors need something), never touched by the shader: their features are off (buildSceneUniforms).
+// Remade when a feature is switched on or off (applyPerPixelBuffers).
+struct PerPixelBuffers {
+    bool restir = false;    // primary hits, first bounces, DI reservoirs and surfaces: ReSTIR DI or GI on
+    bool restirGi = false;  // GI reservoirs: ReSTIR GI on
+    bool guides = false;    // the DLSS input images: writeGuides (DLSS modes, guide views)
+    bool history = false;   // the guide history: the reprojection error view
+    bool operator==(const PerPixelBuffers& other) const {
+        return restir == other.restir && restirGi == other.restirGi && guides == other.guides &&
+               history == other.history;
+    }
 };
 
 #endif //VULKANDEMO_RENDERERTYPES_H

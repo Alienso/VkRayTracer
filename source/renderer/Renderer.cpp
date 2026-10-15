@@ -16,14 +16,14 @@
 void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     window = targetWindow;
     renderList = &list;
-    initStreamline();  // DLSS: must come before the instance exists
+    dlss.initStreamline();  // DLSS: must come before the instance exists
     GpuContext::Extras extras;  // DLSS: what Streamline needs of the instance and the device
-    extras.instanceExtensions = streamlineInstanceExtensions;
+    extras.instanceExtensions = dlss.streamlineInstanceExtensions;
     extras.addDeviceRequirements = [this](std::vector<const char*>& extensions, VkPhysicalDeviceVulkan12Features& features12,
                                           VkPhysicalDeviceVulkan13Features& features13) {
-        addStreamlineDeviceRequirements(extensions, features12, features13);
+        dlss.addStreamlineDeviceRequirements(extensions, features12, features13);
     };
-    extras.deviceCreated = [this]() { connectStreamline(); };
+    extras.deviceCreated = [this]() { dlss.connectStreamline(); };
     gpu.create(window, extras);
     createSwapChain();
     createImageViews();
@@ -32,9 +32,9 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     createCommandBuffers();
     createSyncObjects();
 
-    createUniformBuffer();
-    createSpecularAlbedoTable();
-    createBlueNoiseTexture();
+    trace.createUniformBuffer();
+    trace.createSpecularAlbedoTable();
+    trace.createBlueNoiseTexture();
     scene.waitIdle = [this]() { vkp.deviceWaitIdle(gpu.device); };  // (through Streamline with DLSS)
     scene.create();
     // Uploads the geometry, builds the BLASes and collects the instances (and the render list), and the sky's sampling
@@ -42,13 +42,13 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     scene.update(list, frameNumber);
     applySceneChanges();
     chooseExtents();
-    createRayTracingImages();
+    trace.createRayTracingImages();
     createDisplayImages();
-    createExposureResources();
-    createRadianceCache();
-    createRayTracingDescriptors();
-    createRayTracingPipeline();
-    createDisplayResources();  // reads the radiance image and the exposure buffer
+    exposure.createExposureResources();
+    cache.createRadianceCache();
+    trace.createRayTracingDescriptors();
+    trace.createRayTracingPipeline();
+    display.createDisplayResources();  // reads the radiance image and the exposure buffer
     createTimestampQueries();
 
     initImGui();
@@ -56,7 +56,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
 
 void Renderer::beginFrame(float deltaTime) {
     frameDeltaTime = deltaTime;
-    finishCapture();  // a capture recorded last frame -> PNG
+    capture.finishCapture();  // a capture recorded last frame -> PNG
     ImGui_ImplVulkan_NewFrame();
 }
 
@@ -81,7 +81,7 @@ RendererStats Renderer::stats() const {
     stats.accumulating = settings.accumulate && !dlssActive();
     stats.accumulatedFrames = accumulatedFrames;
     stats.debugView = settings.debugView != 0;
-    stats.captureMessage = captureMessage;
+    stats.captureMessage = capture.captureMessage;
     stats.environmentMapSize = renderList != nullptr && scene.environmentMapReady() ? scene.environmentMapSize : glm::uvec2(0);
     return stats;
 }
@@ -128,7 +128,7 @@ void Renderer::render(const RenderList& list) {
 
 void Renderer::shutdown() {
     vkp.deviceWaitIdle(gpu.device);
-    finishCapture();
+    capture.finishCapture();
     gpu.savePipelineCache();
     cleanup();
 }
@@ -136,7 +136,7 @@ void Renderer::shutdown() {
 void Renderer::cleanup() {
     cleanupImGui();
     cleanupSwapChain();
-    destroyRayTracingImages();
+    trace.destroyRayTracingImages();
     destroyDisplayImages();
     cleanupRayTracing();
 
@@ -149,7 +149,7 @@ void Renderer::cleanup() {
         vkDestroyFence(gpu.device, inFlightFences[i], nullptr);
     }
 
-    shutdownStreamline();
+    dlss.shutdownStreamline();
     gpu.destroy();
 }
 
@@ -159,13 +159,13 @@ void Renderer::applySceneChanges() {
         resetAccumulation = true;
     }
     if (changes.clearCache) {
-        cacheClearPending = true;
+        cache.cacheClearPending = true;
     }
     if (changes.resetDlss) {
         dlssReset = true;
     }
-    if (changes.descriptors && rtDescriptorSet != VK_NULL_HANDLE) {  // (made after the first update, in init)
-        updateRayTracingDescriptorSet();
+    if (changes.descriptors && trace.rtDescriptorSet != VK_NULL_HANDLE) {  // (made after the first update, in init)
+        trace.updateRayTracingDescriptorSet();
     }
     changes = {};
 }
@@ -173,7 +173,7 @@ void Renderer::applySceneChanges() {
 void Renderer::drawFrame() {
     vkWaitForFences(gpu.device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
     scene.beginFrame(currentFrame, frameNumber);  // the frame that last used this slot is done
-    updateTracePipelines();
+    trace.updateTracePipelines();
 
     uint32_t imageIndex;
     VkResult result = vkp.acquireNextImage(gpu.device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);

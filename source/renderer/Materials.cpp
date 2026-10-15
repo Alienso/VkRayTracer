@@ -342,7 +342,7 @@ namespace {
     }
 }
 
-void Renderer::createSpecularAlbedoTable() {
+void RayTracer::createSpecularAlbedoTable() {
     const uint32_t n = specularAlbedoSize;
     const uint32_t strata = 48;  // samples per entry: strata^2, spread evenly instead of randomly (less noise)
     std::vector<glm::vec2> table(n * n);
@@ -379,7 +379,7 @@ void Renderer::createSpecularAlbedoTable() {
                                 specularAlbedoBuffer, specularAlbedoMemory);
 }
 
-void Renderer::destroySpecularAlbedoTable() {
+void RayTracer::destroySpecularAlbedoTable() {
     vkDestroyBuffer(gpu.device, specularAlbedoBuffer, nullptr);
     vmaFreeMemory(gpu.allocator, specularAlbedoMemory);
 }

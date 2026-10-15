@@ -129,11 +129,11 @@ void Renderer::buildRenderingUi() {
                           "the same only in scenes without them: there portals and lamps vanish, glass turns opaque\n"
                           "and cut-outs solid. Switching rebuilds the shader (the window stands still a few seconds).");
     }
-    buildRadianceCacheUi();
+    cache.buildRadianceCacheUi();
     buildRestirUi();
 
     ImGui::SeparatorText("Image");
-    buildExposureUi();
+    exposure.buildExposureUi();
     ImGui::Checkbox("Tone mapping (ACES)", &settings.toneMapping);
     ImGui::Checkbox("Fog grain", &settings.fogGrain);
     if (ImGui::IsItemHovered()) {
@@ -310,10 +310,10 @@ void Renderer::buildDebugUi() {
         }
     }
 
-    buildNoiseUi();
+    noise.buildNoiseUi();
 
-    if (!rtPipelineStatistics.empty() && ImGui::CollapsingHeader("Trace shader (from the driver)")) {
-        ImGui::TextUnformatted(rtPipelineStatistics.c_str());
+    if (!trace.rtPipelineStatistics.empty() && ImGui::CollapsingHeader("Trace shader (from the driver)")) {
+        ImGui::TextUnformatted(trace.rtPipelineStatistics.c_str());
         ImGui::TextDisabled("More registers per thread = fewer threads per SM at once, so waiting for rays\n"
                             "and memory is hidden worse. Counts for the whole shader, even unused branches.");
     }
@@ -323,4 +323,66 @@ void Renderer::buildDebugUi() {
 
 void Renderer::cleanupImGui(){
     ImGui_ImplVulkan_Shutdown();
+}
+
+// The "Renderer" combo at the top of the Rendering section
+void Renderer::buildRenderModeUi() {
+    const char* modes[] = {"Accumulation (reference)", "DLSS RR: DLAA (full size)", "DLSS RR: Quality",
+                           "DLSS RR: Balanced", "DLSS RR: Performance", "DLSS RR: Ultra Performance"};
+    const char* models[] = {"Transformer F (newest)", "Transformer E", "Transformer D", "CNN A", "CNN B", "CNN C"};
+    ImGui::BeginDisabled(!dlss.dlssSupported);
+    ImGui::Combo("Renderer", &settings.renderMode, modes, static_cast<int>(std::size(modes)));
+    ImGui::EndDisabled();
+    const char* sizes[] = {"Window", "1080p", "1440p", "2160p (4K)"};
+    static_assert(std::size(sizes) == std::size(outputHeights));
+    ImGui::Combo("Image size", &settings.outputSize, sizes, static_cast<int>(std::size(sizes)));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The size of the image, and of what Capture saves. Bigger than the window: shown shrunk\n"
+                          "to fit, and slower in proportion (4K has 5.8x the pixels of 1600 x 900). Keeps the\n"
+                          "window's shape. For a sharp 4K capture: Accumulation, let it settle, then Capture.");
+    }
+    ImGui::TextDisabled("traces %u x %u, image %u x %u", renderExtent.width, renderExtent.height, outputExtent.width,
+                        outputExtent.height);
+    ImGui::BeginDisabled(!dlss.dlssSupported);
+    // Models the loaded DLSS version doesn't have are shown but can't be picked
+    if (ImGui::BeginCombo("DLSS model", models[settings.dlssModel])) {
+        for (int i = 0; i < static_cast<int>(std::size(models)); i++) {
+            ImGuiSelectableFlags flags = dlss.dlssModelAvailable(i) ? 0 : ImGuiSelectableFlags_Disabled;
+            if (ImGui::Selectable(models[i], settings.dlssModel == i, flags)) {
+                settings.dlssModel = i;
+            }
+            if (!dlss.dlssModelAvailable(i) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(dlss.dlssCnnVersion ? "only in the current DLSS version: start without --dlss-cnn"
+                                                 : "only in the older DLSS version: start with --dlss-cnn");
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The network DLSS Ray Reconstruction runs. Transformer: the newer models, sharper and\n"
+                          "steadier. CNN: the older models, about half the cost on a 20/30 series GPU.\n"
+                          "DLSS %s is loaded (%s).", dlss.dlssVersion.c_str(),
+                          dlss.dlssCnnVersion ? "--dlss-cnn: CNN A-C, transformer D-E"
+                                         : "transformer D-F; start with --dlss-cnn for the CNN models");
+    }
+    ImGui::Checkbox("Clamp bounce light", &settings.clampBounceLight);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+    ImGui::SliderFloat("##bounceClamp", &settings.bounceLightClampLevel, 0.25f, 64.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("DLSS modes: one sample of light that reached the first surface via another surface adds at\n"
+                          "most this much on screen (after exposure, 1 = white before tone mapping). Rare very bright\n"
+                          "samples (a bounce ray that happens to find a lamp) otherwise stand out, and DLSS smears\n"
+                          "them over many frames: ghosting, and an image that settles slowly. Biased: a bit darker.\n"
+                          "Measured in Bistro at night: no less noise or drift, so off by default.");
+    }
+    ImGui::EndDisabled();
+    if (!dlss.dlssSupported) {
+        ImGui::TextDisabled("DLSS unavailable: %s", dlss.dlssStatus.c_str());
+    } else if (dlssActive()) {
+        double megabytes = dlss.memoryMegabytes();
+        ImGui::TextDisabled("render %ux%u -> %ux%u (%.0f%% per axis), DLSS memory %.0f MB",
+                            renderExtent.width, renderExtent.height, outputExtent.width, outputExtent.height,
+                            100.0 * renderExtent.width / outputExtent.width, megabytes);
+    }
 }

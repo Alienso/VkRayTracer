@@ -27,7 +27,7 @@
 #include <streamline/sl_helpers_vk.h>
 #include <streamline/sl_dlss_d.h>
 #include <imgui/imgui.h>
-#include "renderer/Renderer.h"
+#include "renderer/Dlss.h"
 #include "core/Configuration.h"
 
 namespace {
@@ -142,7 +142,7 @@ void logMessage(sl::LogType type, const char* message) {
 }  // namespace
 
 // Before vkCreateInstance: Streamline must be initialized first, and it tells us which extensions it needs.
-void Renderer::initStreamline() {
+void Dlss::initStreamline() {
     if (dlssDisabledByFlag) {
         dlssStatus = "switched off with --no-dlss";
         std::cout << "DLSS: " << dlssStatus << std::endl;
@@ -256,7 +256,7 @@ static void mergeFeatures(T& target, const T& extra) {
 }
 
 // While creating the device: add what Streamline listed in its requirements.
-void Renderer::addStreamlineDeviceRequirements(std::vector<const char*>& extensions,
+void Dlss::addStreamlineDeviceRequirements(std::vector<const char*>& extensions,
                                                   VkPhysicalDeviceVulkan12Features& features12,
                                                   VkPhysicalDeviceVulkan13Features& features13) {
     if (!streamlineInitialized) {
@@ -297,7 +297,7 @@ void Renderer::addStreamlineDeviceRequirements(std::vector<const char*>& extensi
 }
 
 // After vkCreateDevice: hand the device to Streamline and ask whether DLSS RR runs on it.
-void Renderer::connectStreamline() {
+void Dlss::connectStreamline() {
     if (!streamlineInitialized) {
         return;
     }
@@ -383,7 +383,7 @@ void Renderer::connectStreamline() {
 }
 
 // The render size DLSS wants for a mode and window size (e.g. Quality: 2/3 per axis, DLAA: the window size)
-VkExtent2D Renderer::dlssRenderExtent(int renderMode, VkExtent2D output) {
+VkExtent2D Dlss::dlssRenderExtent(int renderMode, VkExtent2D output) {
     sl::DLSSDOptions options;
     options.mode = toDlssMode(renderMode);
     options.outputWidth = output.width;
@@ -401,7 +401,7 @@ VkExtent2D Renderer::dlssRenderExtent(int renderMode, VkExtent2D output) {
 // DLSS keeps its own resources (history, network state) per viewport, sized for the current render and output
 // sizes. It can't resize them on the fly, so they are freed when either changes and recreated by the next
 // evaluate. The GPU must be idle.
-void Renderer::freeDlssResources() {
+void Dlss::freeDlssResources() {
     if (dlssResourcesInUse) {
         sl::Result result = sl_.freeResources(sl::kFeatureDLSS_RR, dlssViewport);
         if (result != sl::Result::eOk) {
@@ -411,42 +411,16 @@ void Renderer::freeDlssResources() {
     }
 }
 
-bool Renderer::dlssModelAvailable(int model) const {
+bool Dlss::dlssModelAvailable(int model) const {
     if (dlssCnnVersion) {
         return model != static_cast<int>(DlssModel::TransformerF);
     }
     return !isCnnModel(model);
 }
 
-// Called once per frame before drawing: switches between accumulation and the DLSS modes (new render size), and
-// between DLSS models (DLSS starts over with the new network).
-void Renderer::applyRenderMode() {
-    if (!dlssSupported) {
-        settings.renderMode = static_cast<int>(RenderMode::Accumulation);
-    }
-    if (!dlssModelAvailable(settings.dlssModel)) {
-        // The newest model the loaded DLSS version has
-        settings.dlssModel = static_cast<int>(dlssCnnVersion ? DlssModel::TransformerE : DlssModel::TransformerF);
-    }
-    if (settings.dlssModel != activeDlssModel) {
-        vkp.deviceWaitIdle(gpu.device);
-        freeDlssResources();
-        activeDlssModel = settings.dlssModel;
-        dlssReset = true;
-    }
-    if (settings.renderMode == activeRenderMode) {
-        return;
-    }
-    vkp.deviceWaitIdle(gpu.device);
-    freeDlssResources();
-    activeRenderMode = settings.renderMode;
-    recreateRenderImages();
-    hasPreviousViewProjection = false;
-    jitterIndex = 0;
-}
 
 // Records DLSS into the frame's command buffer, right after the trace shader. Does nothing in accumulation mode.
-void Renderer::recordDlss(VkCommandBuffer commandBuffer) {
+void Dlss::recordDlss(VkCommandBuffer commandBuffer) {
     if (!dlssActive()) {
         return;
     }
@@ -529,16 +503,16 @@ void Renderer::recordDlss(VkCommandBuffer commandBuffer) {
     auto describe = [&](const RenderImage& image, VkExtent2D extent, VkFormat format, VkImageUsageFlags usage) {
         return describeImage(image.image, gpu.deviceMemoryOf(image.memory), image.view, extent, format, usage);
     };
-    sl::Resource color = describeImage(radianceImage, gpu.deviceMemoryOf(radianceImageMemory), radianceImageView,
+    sl::Resource color = describeImage(trace.radianceImage, gpu.deviceMemoryOf(trace.radianceImageMemory), trace.radianceImageView,
                                        renderExtent, radianceFormat, storage);
     sl::Resource output = describe(dlssOutputImage, outputExtent, dlssOutputFormat, storage);
-    sl::Resource depth = describe(linearDepthImage, renderExtent, linearDepthFormat, storage);
-    sl::Resource motion = describe(motionVectorImage, renderExtent, motionVectorFormat, storage);
-    sl::Resource diffuse = describe(diffuseAlbedoImage, renderExtent, guideColorFormat,
+    sl::Resource depth = describe(trace.linearDepthImage, renderExtent, linearDepthFormat, storage);
+    sl::Resource motion = describe(trace.motionVectorImage, renderExtent, motionVectorFormat, storage);
+    sl::Resource diffuse = describe(trace.diffuseAlbedoImage, renderExtent, guideColorFormat,
                                     storage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    sl::Resource specular = describe(specularAlbedoImage, renderExtent, guideColorFormat, storage);
-    sl::Resource normals = describe(normalRoughnessImage, renderExtent, guideColorFormat, storage);
-    sl::Resource hitDistance = describe(specularHitDistanceImage, renderExtent, hitDistanceFormat, storage);
+    sl::Resource specular = describe(trace.specularAlbedoImage, renderExtent, guideColorFormat, storage);
+    sl::Resource normals = describe(trace.normalRoughnessImage, renderExtent, guideColorFormat, storage);
+    sl::Resource hitDistance = describe(trace.specularHitDistanceImage, renderExtent, hitDistanceFormat, storage);
     sl::Extent renderArea{0, 0, renderExtent.width, renderExtent.height};
     sl::Extent outputArea{0, 0, outputExtent.width, outputExtent.height};
     const sl::ResourceLifecycle lifecycle = sl::ResourceLifecycle::eValidUntilPresent;
@@ -576,72 +550,9 @@ void Renderer::recordDlss(VkCommandBuffer commandBuffer) {
                          0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-// The "Renderer" combo at the top of the Rendering section
-void Renderer::buildRenderModeUi() {
-    const char* modes[] = {"Accumulation (reference)", "DLSS RR: DLAA (full size)", "DLSS RR: Quality",
-                           "DLSS RR: Balanced", "DLSS RR: Performance", "DLSS RR: Ultra Performance"};
-    const char* models[] = {"Transformer F (newest)", "Transformer E", "Transformer D", "CNN A", "CNN B", "CNN C"};
-    ImGui::BeginDisabled(!dlssSupported);
-    ImGui::Combo("Renderer", &settings.renderMode, modes, static_cast<int>(std::size(modes)));
-    ImGui::EndDisabled();
-    const char* sizes[] = {"Window", "1080p", "1440p", "2160p (4K)"};
-    static_assert(std::size(sizes) == std::size(outputHeights));
-    ImGui::Combo("Image size", &settings.outputSize, sizes, static_cast<int>(std::size(sizes)));
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("The size of the image, and of what Capture saves. Bigger than the window: shown shrunk\n"
-                          "to fit, and slower in proportion (4K has 5.8x the pixels of 1600 x 900). Keeps the\n"
-                          "window's shape. For a sharp 4K capture: Accumulation, let it settle, then Capture.");
-    }
-    ImGui::TextDisabled("traces %u x %u, image %u x %u", renderExtent.width, renderExtent.height, outputExtent.width,
-                        outputExtent.height);
-    ImGui::BeginDisabled(!dlssSupported);
-    // Models the loaded DLSS version doesn't have are shown but can't be picked
-    if (ImGui::BeginCombo("DLSS model", models[settings.dlssModel])) {
-        for (int i = 0; i < static_cast<int>(std::size(models)); i++) {
-            ImGuiSelectableFlags flags = dlssModelAvailable(i) ? 0 : ImGuiSelectableFlags_Disabled;
-            if (ImGui::Selectable(models[i], settings.dlssModel == i, flags)) {
-                settings.dlssModel = i;
-            }
-            if (!dlssModelAvailable(i) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                ImGui::SetTooltip(dlssCnnVersion ? "only in the current DLSS version: start without --dlss-cnn"
-                                                 : "only in the older DLSS version: start with --dlss-cnn");
-            }
-        }
-        ImGui::EndCombo();
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("The network DLSS Ray Reconstruction runs. Transformer: the newer models, sharper and\n"
-                          "steadier. CNN: the older models, about half the cost on a 20/30 series GPU.\n"
-                          "DLSS %s is loaded (%s).", dlssVersion.c_str(),
-                          dlssCnnVersion ? "--dlss-cnn: CNN A-C, transformer D-E"
-                                         : "transformer D-F; start with --dlss-cnn for the CNN models");
-    }
-    ImGui::Checkbox("Clamp bounce light", &settings.clampBounceLight);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
-    ImGui::SliderFloat("##bounceClamp", &settings.bounceLightClampLevel, 0.25f, 64.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("DLSS modes: one sample of light that reached the first surface via another surface adds at\n"
-                          "most this much on screen (after exposure, 1 = white before tone mapping). Rare very bright\n"
-                          "samples (a bounce ray that happens to find a lamp) otherwise stand out, and DLSS smears\n"
-                          "them over many frames: ghosting, and an image that settles slowly. Biased: a bit darker.\n"
-                          "Measured in Bistro at night: no less noise or drift, so off by default.");
-    }
-    ImGui::EndDisabled();
-    if (!dlssSupported) {
-        ImGui::TextDisabled("DLSS unavailable: %s", dlssStatus.c_str());
-    } else if (dlssActive()) {
-        sl::DLSSDState state;
-        double megabytes = sl_.dlssdGetState(dlssViewport, state) == sl::Result::eOk
-                           ? static_cast<double>(state.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0) : 0.0;
-        ImGui::TextDisabled("render %ux%u -> %ux%u (%.0f%% per axis), DLSS memory %.0f MB",
-                            renderExtent.width, renderExtent.height, outputExtent.width, outputExtent.height,
-                            100.0 * renderExtent.width / outputExtent.width, megabytes);
-    }
-}
 
 // Before vkDestroyDevice (the GPU is idle)
-void Renderer::shutdownStreamline() {
+void Dlss::shutdownStreamline() {
     if (streamlineInitialized) {
         freeDlssResources();
         sl::Result result = sl_.shutdown();
@@ -652,4 +563,11 @@ void Renderer::shutdownStreamline() {
         FreeLibrary(static_cast<HMODULE>(streamlineModule));
         streamlineModule = nullptr;
     }
+}
+
+// What DLSS's resources take on the GPU (its own estimate; 0 if it can't tell)
+double Dlss::memoryMegabytes() const {
+    sl::DLSSDState state;
+    return sl_.dlssdGetState(dlssViewport, state) == sl::Result::eOk
+           ? static_cast<double>(state.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0) : 0.0;
 }

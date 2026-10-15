@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <imgui/imgui.h>
-#include "renderer/Renderer.h"
+#include "renderer/Exposure.h"
 #include "core/Configuration.h"
 
 std::vector<char> readFile(const std::string& filename);
@@ -25,7 +25,7 @@ std::vector<char> readFile(const std::string& filename);
 static const float histogramMinLog2 = -16.0f;
 static const float histogramLog2Range = 28.0f;
 
-void Renderer::createExposureResources() {
+void ExposurePass::createExposureResources() {
     // State buffer: histogram counters start at 0, the exposure at 1 (used by the very first frame)
     gpu.createBuffer(sizeof(ExposureState),
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -116,7 +116,7 @@ void Renderer::createExposureResources() {
 }
 
 // The HDR image is recreated with the swapchain and the render mode; called from recreateRenderImages.
-void Renderer::updateExposureDescriptorSet() {
+void ExposurePass::updateExposureDescriptorSet() {
     VkDescriptorImageInfo imageInfo{VK_NULL_HANDLE, displayedHdrView(), VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bufferInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet writes[2]{};
@@ -135,7 +135,7 @@ void Renderer::updateExposureDescriptorSet() {
 
 // Recorded right after the trace dispatch. Skipped (no cost) while exposure is manual or a debug view other than the
 // radiance cache's is shown.
-void Renderer::recordExposure(VkCommandBuffer commandBuffer) {
+void ExposurePass::recordExposure(VkCommandBuffer commandBuffer) {
     // This frame slot's fence was waited on before recording: its copy from a few frames ago is complete.
     if (exposureInfoValid || exposureWasAuto) {
         std::memcpy(&exposureInfo, exposureReadbackMapped[currentFrame], sizeof(ExposureState));
@@ -208,7 +208,7 @@ void Renderer::recordExposure(VkCommandBuffer commandBuffer) {
                          0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 }
 
-void Renderer::destroyExposureResources() {
+void ExposurePass::destroyExposureResources() {
     vkDestroyPipeline(gpu.device, exposurePipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, exposurePipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, exposureDescriptorPool, nullptr);
@@ -223,7 +223,7 @@ void Renderer::destroyExposureResources() {
 }
 
 // Part of the "Rendering" section
-void Renderer::buildExposureUi() {
+void ExposurePass::buildExposureUi() {
     ImGui::Checkbox("Auto exposure", &settings.autoExposure);
     if (!settings.autoExposure) {
         ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);

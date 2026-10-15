@@ -14,12 +14,12 @@
 #include <stdexcept>
 #include <string>
 #include <imgui/imgui.h>
-#include "renderer/Renderer.h"
+#include "renderer/RadianceCache.h"
 #include "core/Configuration.h"
 
 std::vector<char> readFile(const std::string& filename);
 
-void Renderer::createRadianceCache() {
+void RadianceCache::createRadianceCache() {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     gpu.createBuffer(sizeof(uint32_t) * cacheCapacity, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, cacheKeyBuffer, cacheKeyMemory,
                      VK_NULL_HANDLE, true);
@@ -114,7 +114,7 @@ void Renderer::createRadianceCache() {
 
 // Recorded before the image paths are traced, after the barrier that waits for the previous frame's shaders.
 // The ray tracing descriptor set (which has the cache buffers too) must be bound by the caller.
-void Renderer::recordRadianceCache(VkCommandBuffer commandBuffer) {
+void RadianceCache::recordRadianceCache(VkCommandBuffer commandBuffer) {
     // This frame slot's fence has been waited on: its copy from a few frames ago is complete
     std::memcpy(&cacheUsedEntries, cacheStatsReadbackMapped[currentFrame], sizeof(uint32_t));
 
@@ -147,7 +147,7 @@ void Renderer::recordRadianceCache(VkCommandBuffer commandBuffer) {
     // 1: update paths, one per tile of cacheUpdateTile x cacheUpdateTile pixels (8x8 tiles per workgroup)
     uint32_t tile = static_cast<uint32_t>(std::max(settings.cacheUpdateTile, 1));
     uint32_t tilesX = (renderExtent.width + tile - 1) / tile, tilesY = (renderExtent.height + tile - 1) / tile;
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, tracePipeline(rtCacheUpdatePipeline));
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cacheUpdatePipeline());
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtPipelineLayout, 0, 1, &rtDescriptorSet, 0, nullptr);
     vkCmdDispatch(commandBuffer, (tilesX + 7) / 8, (tilesY + 7) / 8, 1);
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -181,7 +181,7 @@ void Renderer::recordRadianceCache(VkCommandBuffer commandBuffer) {
                          0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
 }
 
-void Renderer::destroyRadianceCache() {
+void RadianceCache::destroyRadianceCache() {
     vkDestroyPipeline(gpu.device, cachePipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, cachePipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, cacheDescriptorPool, nullptr);
@@ -200,7 +200,7 @@ void Renderer::destroyRadianceCache() {
 }
 
 // Part of the "Rendering" section
-void Renderer::buildRadianceCacheUi() {
+void RadianceCache::buildRadianceCacheUi() {
     ImGui::Checkbox("Radiance cache", &settings.radianceCache);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Remembers how much indirect light leaves small patches of the surfaces. Paths stop\n"

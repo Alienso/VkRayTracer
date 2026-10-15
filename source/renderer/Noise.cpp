@@ -20,7 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <imgui/imgui.h>
-#include "renderer/Renderer.h"
+#include "renderer/Noise.h"
 #include "core/Configuration.h"
 
 std::vector<char> readFile(const std::string& filename);
@@ -33,8 +33,8 @@ static const char* renderModeName(int mode) {
 
 // Created when first needed (the reference image takes ~6 MB at 1600x900). The GPU must be idle, so this is
 // only called from the UI and from scripted runs, never while frames are in flight.
-void Renderer::ensureNoiseResources() {
-    vkp.deviceWaitIdle(gpu.device);
+void NoiseTool::ensureNoiseResources() {
+    waitIdle();
 
     if (!noiseResourcesCreated) {
         // 0 = displayed HDR image, 1 = reference, 2 = workgroup sums (one set per frame in flight)
@@ -144,7 +144,7 @@ void Renderer::ensureNoiseResources() {
 }
 
 // Also called from recreateRenderImages (GPU idle): the displayed image is another one after a mode switch.
-void Renderer::updateNoiseDescriptorSets() {
+void NoiseTool::updateNoiseDescriptorSets() {
     if (!noiseResourcesCreated) {
         return;
     }
@@ -177,7 +177,7 @@ void Renderer::updateNoiseDescriptorSets() {
 }
 
 // The reference and the measurement in one go, started by the next frame (recordNoise)
-void Renderer::startNoiseRun(int renderMode, int referenceFrames, int measureFrames, glm::ivec4 region) {
+void NoiseTool::startNoiseRun(int renderMode, int referenceFrames, int measureFrames, glm::ivec4 region) {
     noiseAutoRun = true;
     noiseAutoMode = renderMode;
     noiseReferenceFrames = referenceFrames;
@@ -186,7 +186,7 @@ void Renderer::startNoiseRun(int renderMode, int referenceFrames, int measureFra
 }
 
 // Accumulates the current view for noiseReferenceFrames frames, then keeps a copy (see recordNoise)
-void Renderer::startNoiseReference() {
+void NoiseTool::startNoiseReference() {
     ensureNoiseResources();
     for (NoisePending& pending : noisePending) {
         pending.active = false;
@@ -201,7 +201,7 @@ void Renderer::startNoiseReference() {
 }
 
 // Starts once the reference is ready and renderMode is active (see recordNoise)
-void Renderer::startNoiseMeasurement(int renderMode) {
+void NoiseTool::startNoiseMeasurement(int renderMode) {
     noiseMeasureMode = renderMode;
     settings.renderMode = renderMode;
     noiseResults.clear();
@@ -210,7 +210,7 @@ void Renderer::startNoiseMeasurement(int renderMode) {
 }
 
 // The current frame slot's fence has been waited on: its sums from a few frames ago are complete.
-void Renderer::readNoiseResults() {
+void NoiseTool::readNoiseResults() {
     if (!noiseResourcesCreated) {
         return;
     }
@@ -268,7 +268,7 @@ void Renderer::readNoiseResults() {
     }
 }
 
-void Renderer::finishNoiseMeasurement() {
+void NoiseTool::finishNoiseMeasurement() {
     noiseState = NoiseState::Idle;
     float traceMs = 0.0f, restirMs = 0.0f, dlssMs = 0.0f;
     for (const NoiseResult& result : noiseResults) {
@@ -305,7 +305,7 @@ void Renderer::finishNoiseMeasurement() {
 }
 
 // Recorded after the exposure pass: the displayed HDR image (radiance or DLSS output) is final by then.
-void Renderer::recordNoise(VkCommandBuffer commandBuffer) {
+void NoiseTool::recordNoise(VkCommandBuffer commandBuffer) {
     if (noiseAutoRun) {
         noiseAutoRun = false;
         noiseAutoContinue = true;
@@ -393,7 +393,7 @@ void Renderer::recordNoise(VkCommandBuffer commandBuffer) {
     noisePending[currentFrame] = {pass, noiseFrame, groupsX * groupsY, true};
 }
 
-void Renderer::destroyNoiseResources() {
+void NoiseTool::destroyNoiseResources() {
     if (!noiseResourcesCreated) {
         return;
     }
@@ -410,7 +410,7 @@ void Renderer::destroyNoiseResources() {
     noiseResourcesCreated = false;
 }
 
-void Renderer::buildNoiseUi() {
+void NoiseTool::buildNoiseUi() {
     ImGui::SeparatorText("Noise measurement");
     ImGui::TextDisabled("Keep the camera still. The reference is the current view, accumulated\n"
                         "for a long time; the measurement then starts over and compares every frame.");

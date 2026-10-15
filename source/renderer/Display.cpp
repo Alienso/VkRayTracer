@@ -12,81 +12,14 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
-#include "renderer/Renderer.h"
+#include "renderer/Display.h"
 #include "core/Configuration.h"
 
 std::vector<char> readFile(const std::string& filename);
 
 static const VkFormat displayFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
-// Output = the window, or a fixed number of rows (e.g. 2160 for a 4K capture) as wide as the window's shape: it is
-// shrunk to fit the window when shown, and Capture saves it at full size. Render = what the path tracer traces: the
-// same in accumulation mode, smaller in the DLSS modes (the size DLSS asks for, e.g. 67% per axis for Quality).
-void Renderer::chooseExtents() {
-    outputExtent = swapChainExtent;
-    uint32_t rows = outputHeights[std::clamp(activeOutputSize, 0, static_cast<int>(std::size(outputHeights)) - 1)];
-    if (rows > 0 && swapChainExtent.height > 0) {
-        double aspect = static_cast<double>(swapChainExtent.width) / swapChainExtent.height;
-        outputExtent = {static_cast<uint32_t>(std::lround(rows * aspect / 2.0)) * 2, rows};  // even, like video sizes
-    }
-    renderExtent = dlssActive() ? dlssRenderExtent(activeRenderMode, outputExtent) : outputExtent;
-}
-
-// A new RenderSettings::outputSize: new images. Called once per frame before drawing.
-void Renderer::applyOutputSize() {
-    settings.outputSize = std::clamp(settings.outputSize, 0, static_cast<int>(std::size(outputHeights)) - 1);
-    if (settings.outputSize == activeOutputSize) {
-        return;
-    }
-    vkp.deviceWaitIdle(gpu.device);
-    freeDlssResources();  // made for the old size
-    activeOutputSize = settings.outputSize;
-    recreateRenderImages();
-    hasPreviousViewProjection = false;
-}
-
-// Everything whose size depends on the window or the render mode. The GPU must be idle.
-void Renderer::recreateRenderImages() {
-    destroyRayTracingImages();
-    destroyDisplayImages();
-    chooseExtents();
-    createRayTracingImages();
-    createDisplayImages();
-    updateRayTracingDescriptorSet();
-    updateExposureDescriptorSet();
-    updateDisplayDescriptorSet();
-    updateNoiseDescriptorSets();  // the displayed image changed (and the reference may no longer fit)
-    resetAccumulation = true;
-    dlssReset = true;
-}
-
-// What this frame's settings need at full size (see PerPixelBuffers): ReSTIR's buffers take 364 bytes per render
-// pixel (GI 120 of them), the guides 34, the history 8, 3.4 GB at 4K. By default Accumulation needs none, the DLSS
-// modes ReSTIR DI's and the guides.
-Renderer::PerPixelBuffers Renderer::wantedPerPixelBuffers() {
-    PerPixelBuffers wanted;
-    wanted.restirGi = settings.restirGi(settings.renderMode);
-    wanted.restir = settings.restirDi(settings.renderMode) || wanted.restirGi;
-    wanted.guides = dlssActive() || isGuideView(settings.debugView);
-    wanted.history = settings.debugView == static_cast<int>(DebugView::GuideReprojectionError);
-    return wanted;
-}
-
-// A feature that needs one of them was switched on (or the last one using it off): new images. Called once per frame
-// before drawing.
-void Renderer::applyPerPixelBuffers() {
-    if (wantedPerPixelBuffers() == perPixelBuffers) {
-        return;
-    }
-    vkp.deviceWaitIdle(gpu.device);
-    recreateRenderImages();
-}
-
-VkImageView Renderer::displayedHdrView() const {
-    return dlssActive() ? dlssOutputImage.view : radianceImageView;
-}
-
-void Renderer::createDisplayImages() {
+void DisplayPass::createDisplayImage() {
     // The display image gets blitted into the swapchain, which converts the format (RGBA -> BGRA, linear -> sRGB).
     VkFormatProperties swapchainFormatProperties;
     vkGetPhysicalDeviceFormatProperties(gpu.physicalDevice, swapChainImageFormat, &swapchainFormatProperties);
@@ -98,34 +31,12 @@ void Renderer::createDisplayImages() {
     gpu.createImage(outputExtent.width, outputExtent.height, displayFormat,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     displayImage, displayImageMemory, displayImageView, 1, true);
-
-    // DLSS modes: where DLSS writes the denoised, upscaled frame. Stays in GENERAL.
-    if (dlssActive()) {
-        gpu.createImage(outputExtent, dlssOutputFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                        dlssOutputImage);
-        gpu.immediateSubmit([&](VkCommandBuffer cmd) {
-            VkImageMemoryBarrier barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = dlssOutputImage.image;
-            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-        });
-    }
 }
 
-void Renderer::destroyDisplayImages() {
+void DisplayPass::destroyDisplayImage() {
     vkDestroyImageView(gpu.device, displayImageView, nullptr);
     vkDestroyImage(gpu.device, displayImage, nullptr);
     vmaFreeMemory(gpu.allocator, displayImageMemory);
-    if (dlssOutputImage.image != VK_NULL_HANDLE) {
-        gpu.destroyImage(dlssOutputImage);
-    }
 }
 
 // Descriptors: 0 = HDR image (read: DLSS output or the radiance image), 1 = display image (write),
@@ -134,7 +45,7 @@ void Renderer::destroyDisplayImages() {
 // for the fog grain)
 static const uint32_t displayBindingCount = 11;
 
-void Renderer::createDisplayResources() {
+void DisplayPass::createDisplayResources() {
     VkDescriptorSetLayoutBinding bindings[displayBindingCount];
     for (uint32_t i = 0; i < displayBindingCount; i++) {
         VkDescriptorType type = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -195,7 +106,7 @@ void Renderer::createDisplayResources() {
 }
 
 // The images are recreated with the swapchain, the output size and the render mode; called from recreateRenderImages.
-void Renderer::updateDisplayDescriptorSet() {
+void DisplayPass::updateDisplayDescriptorSet() {
     VkImageView views[displayBindingCount] = {
             displayedHdrView(), displayImageView, VK_NULL_HANDLE,
             linearDepthImage.view, motionVectorImage.view, diffuseAlbedoImage.view, specularAlbedoImage.view,
@@ -223,8 +134,8 @@ void Renderer::updateDisplayDescriptorSet() {
 }
 
 // Recorded after the trace and the exposure measurement. displayImage is already in GENERAL (transitioned at the
-// start of the frame, see recordRayTracing); the blit after this pass transitions it again.
-void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
+// start of the frame, see Renderer::recordFrame); the blit after this pass transitions it again.
+void DisplayPass::recordDisplay(VkCommandBuffer commandBuffer) {
     // The HDR image (trace) and the exposure (exposure.comp) must be written before this pass reads them.
     // Compute -> compute only: waiting for transfers here would also wait for the exposure readback copy.
     VkMemoryBarrier memoryBarrier{};
@@ -284,7 +195,7 @@ void Renderer::recordDisplay(VkCommandBuffer commandBuffer) {
     }
 }
 
-void Renderer::destroyDisplayResources() {
+void DisplayPass::destroyDisplayResources() {
     vkDestroyPipeline(gpu.device, displayPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, displayPipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, displayDescriptorPool, nullptr);

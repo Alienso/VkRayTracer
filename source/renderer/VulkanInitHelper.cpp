@@ -206,7 +206,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     }
 
     // Ray trace and blit the result into the swapchain image
-    recordRayTracing(commandBuffer, imageIndex);
+    recordFrame(commandBuffer, imageIndex);
 
     VkRenderPassBeginInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -288,7 +288,7 @@ void Renderer::recreateSwapChain() {
     createImageViews();
     createFramebuffers();
     createRenderFinishedSemaphores();
-    freeDlssResources();  // DLSS can't change its sizes on the fly; it starts over on the next evaluate
+    dlss.freeDlssResources();  // DLSS can't change its sizes on the fly; it starts over on the next evaluate
     recreateRenderImages();
 }
 

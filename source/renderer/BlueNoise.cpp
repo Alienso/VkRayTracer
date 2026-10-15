@@ -108,7 +108,7 @@ static std::vector<int> voidAndCluster(uint32_t seed) {
     return rank;
 }
 
-void Renderer::createBlueNoiseTexture() {
+void RayTracer::createBlueNoiseTexture() {
     const int n = blueNoiseSize * blueNoiseSize;
     std::vector<int> channels[4];
     for (uint32_t c = 0; c < 4; c++) {
@@ -128,7 +128,7 @@ void Renderer::createBlueNoiseTexture() {
                                 blueNoiseBuffer, blueNoiseMemory);
 }
 
-void Renderer::destroyBlueNoiseTexture() {
+void RayTracer::destroyBlueNoiseTexture() {
     vkDestroyBuffer(gpu.device, blueNoiseBuffer, nullptr);
     vmaFreeMemory(gpu.allocator, blueNoiseMemory);
 }

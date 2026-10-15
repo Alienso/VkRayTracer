@@ -14,7 +14,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stb_image_write.h>
-#include "renderer/Renderer.h"
+#include "renderer/Capture.h"
 
 // A file name that doesn't exist yet: capture_<date>_<time>.png, with _2, _3, ... for several in the same second
 static std::string captureFileName() {
@@ -31,7 +31,7 @@ static std::string captureFileName() {
 }
 
 // Records the copy display image -> capture buffer. The display image is in TRANSFER_SRC_OPTIMAL (after the blit).
-void Renderer::recordCapture(VkCommandBuffer commandBuffer) {
+void FrameCapture::recordCapture(VkCommandBuffer commandBuffer) {
     if (!captureRequested || captureBuffer != VK_NULL_HANDLE) {
         return;
     }
@@ -62,7 +62,7 @@ void Renderer::recordCapture(VkCommandBuffer commandBuffer) {
 }
 
 // Writes the capture once its frame has finished on the GPU. Called once per loop iteration, before the UI is built.
-void Renderer::finishCapture() {
+void FrameCapture::finishCapture() {
     if (captureBuffer == VK_NULL_HANDLE) {
         return;
     }
