@@ -1,0 +1,9 @@
+{
+  "description": "A light orb in fog, Accumulation",
+  "scene": "../scenes/fog_orb.json",
+  "settings": {"renderMode": "Accumulation"},
+  "camera": {"position": [-0.5032988, 1.6, 4.082685], "yaw": -4.6499968, "pitch": -3.776246, "fov": 60.0},
+  "warmupFrames": 200,
+  "frames": 300,
+  "captures": [1024]
+}

@@ -180,7 +180,7 @@ void Renderer::createDisplayResources() {
         throw std::runtime_error("failed to create display pipeline layout!");
     }
 
-    VkShaderModule shaderModule = createShaderModule(readFile("display.comp.spv"));
+    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("display.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

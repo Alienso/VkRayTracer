@@ -83,7 +83,7 @@ void Renderer::ensureNoiseResources() {
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &noisePipelineLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create noise pipeline layout!");
         }
-        VkShaderModule shaderModule = createShaderModule(readFile("noise.comp.spv"));
+        VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("noise.comp.spv")));
         VkComputePipelineCreateInfo pipelineInfo{};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -174,6 +174,15 @@ void Renderer::updateNoiseDescriptorSets() {
         writes[2].pBufferInfo = &sumInfo;
         vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
     }
+}
+
+// The reference and the measurement in one go, started by the next frame (recordNoise)
+void Renderer::startNoiseRun(int renderMode, int referenceFrames, int measureFrames, glm::ivec4 region) {
+    noiseAutoRun = true;
+    noiseAutoMode = renderMode;
+    noiseReferenceFrames = referenceFrames;
+    noiseMeasureFrames = measureFrames;
+    noiseRegion = region;
 }
 
 // Accumulates the current view for noiseReferenceFrames frames, then keeps a copy (see recordNoise)
@@ -292,9 +301,6 @@ void Renderer::finishNoiseMeasurement() {
         // Error x time: what one frame's noise costs. Halving it = reaching the same quality in half the time.
         std::snprintf(line, sizeof(line), "noise: frame 1 relMSE x ms = %.4e", noiseResults[0].relativeMse * (traceMs + dlssMs));
         std::cout << line << std::endl;
-    }
-    if (noiseAutoExit) {
-        noiseQuitRequested = true;  // the program closes its window
     }
 }
 

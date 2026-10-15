@@ -32,6 +32,11 @@ void Renderer::createExposureResources() {
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, exposureBuffer, exposureMemory);
     immediateSubmit([&](VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, exposureBuffer, 0, VK_WHOLE_SIZE, 0);
+        // The second fill overwrites part of the first: in order
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_WRITE_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
         float one = 1.0f;
         uint32_t oneBits;
         std::memcpy(&oneBits, &one, sizeof(one));
@@ -96,7 +101,7 @@ void Renderer::createExposureResources() {
         throw std::runtime_error("failed to create exposure pipeline layout!");
     }
 
-    VkShaderModule shaderModule = createShaderModule(readFile("exposure.comp.spv"));
+    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("exposure.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

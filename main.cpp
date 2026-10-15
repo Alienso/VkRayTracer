@@ -7,6 +7,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include "app/Application.h"
 #include "core/Configuration.h"
@@ -19,8 +20,10 @@ int main(int argc, char** argv) {
         }
     }
     Application app;
+    std::string benchFile, benchOutput;
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--resources") == 0) {
+        bool hasValue = i + 1 < argc;
+        if (std::strcmp(argv[i], "--resources") == 0 && hasValue) {
             i++;  // (read above)
         } else if (std::strcmp(argv[i], "--no-dlss") == 0) {
             app.setDlssDisabled(true);  // don't load Streamline at all (no driver vsync, no per-frame cost)
@@ -30,20 +33,35 @@ int main(int argc, char** argv) {
             Configuration::enableValidationLayers = true;  // the Vulkan validation layer (default: Debug builds only)
         } else if (std::strcmp(argv[i], "--no-validation") == 0) {
             Configuration::enableValidationLayers = false;
+        } else if (std::strcmp(argv[i], "--sync-validation") == 0) {
+            Configuration::enableValidationLayers = true;  // the layer, with synchronization validation (slow)
+            Configuration::enableSyncValidation = true;
+        } else if (std::strcmp(argv[i], "--shader-dir") == 0 && hasValue) {
+            Configuration::shaderDirectory = argv[++i];  // the .spv files (and their pipeline cache) from there
+        } else if (std::strcmp(argv[i], "--bench") == 0 && hasValue) {
+            benchFile = argv[++i];  // runs the bench, writes its results, exits (app/Bench.h)
+        } else if (std::strcmp(argv[i], "--bench-out") == 0 && hasValue) {
+            benchOutput = argv[++i];  // where (default: bench_results/<bench name>)
         } else if (argv[i][0] != '-') {
             app.setStartScene(argv[i]);  // a scene file to open
         } else {
             std::cerr << "unknown option " << argv[i]
-                      << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, --resources <dir>, a scene file)"
+                      << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, --sync-validation, --resources <dir>, "
+                         "--shader-dir <dir>, --bench <file.json>, --bench-out <dir>, a scene file)"
                       << std::endl;
         }
     }
 
     try {
-        app.run();
+        if (!benchFile.empty()) {
+            if (benchOutput.empty()) {
+                benchOutput = (std::filesystem::path("bench_results") / std::filesystem::path(benchFile).stem()).string();
+            }
+            app.setBench(std::make_unique<Bench>(benchFile, benchOutput));
+        }
+        return app.run();
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-    return EXIT_SUCCESS;
 }

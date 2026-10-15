@@ -29,7 +29,8 @@ public:
     void build();
 
     // Opens a scene file (the command line's): the scene becomes the file's, or the error shows in the Log panel
-    void openSceneFile(const std::string& path);
+    // (false)
+    bool openSceneFile(const std::string& path);
     // The window's close button: false while the scene has unsaved changes (it asks first, then closes the window)
     bool allowClose();
 

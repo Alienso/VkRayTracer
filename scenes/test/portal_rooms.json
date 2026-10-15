@@ -1,0 +1,265 @@
+{
+ "format": "vulkanDemo scene",
+ "version": 1,
+ "nextEntityId": 8,
+ "portalPairsMade": 2,
+ "camera": {
+  "position": [
+   -1.2,
+   1.6,
+   1.7
+  ],
+  "yaw": 0,
+  "pitch": 0,
+  "fov": 70
+ },
+ "environment": {
+  "sunEnabled": true,
+  "sunAzimuth": 35.0,
+  "sunElevation": 50.0,
+  "sunAngularRadius": 2.0,
+  "sunColor": [
+   1.0,
+   0.95,
+   0.85
+  ],
+  "sunIntensity": 1.0,
+  "background": "sky",
+  "skyZenithColor": [
+   0.08,
+   0.36,
+   0.72
+  ],
+  "skyHorizonColor": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "groundColor": [
+   0.35,
+   0.3,
+   0.35
+  ],
+  "skyIntensity": 0.6,
+  "map": null,
+  "mapRotation": 0.0,
+  "mapIntensity": 1.0
+ },
+ "entities": [
+  {
+   "id": 1,
+   "name": "Floor",
+   "parent": 0,
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "rotation": [
+    0,
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "visible": false,
+   "model": {
+    "builtIn": "Floor"
+   }
+  },
+  {
+   "id": 2,
+   "name": "Dark room",
+   "parent": 0,
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "rotation": [
+    0,
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "model": {
+    "builtIn": "Cornell box (classic, with blocks)",
+    "hide": [
+     6
+    ],
+    "show": [
+     5
+    ]
+   }
+  },
+  {
+   "id": 3,
+   "name": "Lit room",
+   "parent": 0,
+   "position": [
+    20,
+    0,
+    0
+   ],
+   "rotation": [
+    0,
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "model": {
+    "builtIn": "Cornell box (classic, with blocks)",
+    "show": [
+     5
+    ]
+   }
+  },
+  {
+   "id": 4,
+   "name": "Lamp window A",
+   "parent": 0,
+   "position": [
+    0.9,
+    2.6,
+    -1.95
+   ],
+   "rotation": [
+    0,
+    0,
+    0,
+    1
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "portal": {
+    "other": 5,
+    "endA": true,
+    "shape": "rectangle",
+    "size": [
+     1.2,
+     1.2
+    ],
+    "rim": false,
+    "rimWidth": 0.06,
+    "rimDepth": 0.04
+   }
+  },
+  {
+   "id": 5,
+   "name": "Lamp window B",
+   "parent": 0,
+   "position": [
+    20,
+    2.2,
+    1.95
+   ],
+   "rotation": [
+    0,
+    1,
+    0,
+    0
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "portal": {
+    "other": 4,
+    "endA": false,
+    "shape": "rectangle",
+    "size": [
+     1.2,
+     1.2
+    ],
+    "rim": false,
+    "rimWidth": 0.06,
+    "rimDepth": 0.04
+   }
+  },
+  {
+   "id": 6,
+   "name": "Sky window A",
+   "parent": 0,
+   "position": [
+    1.95,
+    2.6,
+    -0.5
+   ],
+   "rotation": [
+    0,
+    -0.70710678,
+    0,
+    0.70710678
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "portal": {
+    "other": 7,
+    "endA": true,
+    "shape": "rectangle",
+    "size": [
+     1.0,
+     1.0
+    ],
+    "rim": false,
+    "rimWidth": 0.06,
+    "rimDepth": 0.04
+   }
+  },
+  {
+   "id": 7,
+   "name": "Sky window B",
+   "parent": 0,
+   "position": [
+    0,
+    3,
+    30
+   ],
+   "rotation": [
+    -0.70710678,
+    0,
+    0,
+    0.70710678
+   ],
+   "scale": [
+    1,
+    1,
+    1
+   ],
+   "portal": {
+    "other": 6,
+    "endA": false,
+    "shape": "rectangle",
+    "size": [
+     1.0,
+     1.0
+    ],
+    "rim": false,
+    "rimWidth": 0.06,
+    "rimDepth": 0.04
+   }
+  }
+ ],
+ "models": []
+}

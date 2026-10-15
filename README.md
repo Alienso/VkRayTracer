@@ -132,10 +132,34 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
    - `--no-dlss`: don't load Streamline (starts ~3 s faster; Accumulation only)
    - `--dlss-cnn`: the DLSS version that still has the CNN models
    - `--validation` / `--no-validation`: the Vulkan validation layer (default: on in Debug builds, off in Release)
+   - `--sync-validation`: the validation layer with synchronization validation (missing or wrong barriers; slow). Four
+     messages from inside DLSS (`nv.ngx.dlssd`) each time it starts are NVIDIA's, not ours.
    - `--resources <dir>`: read models/ and environments/ from another folder
+   - `--shader-dir <dir>`: read the compiled shaders (.spv) from another folder (it keeps its own pipeline cache)
+   - `--bench <file.json>` (and `--bench-out <dir>`): run a bench and exit, see below
 
 Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
 for fullscreen, F1 to hide the UI, Ctrl+S to save the scene.
+
+## Benches
+
+A bench (`benches/*.json`, format in `source/app/Bench.h`) is a scene, renderer settings, a camera (or a camera path),
+warm-up and measured frame counts, frames to capture and optionally a noise measurement. `vulkanDemo.exe --bench
+benches/sponza.json` runs it and writes `results.json` (GPU time per pass with mean/median/min/max, wall time per frame,
+process and GPU memory, load times, the trace shader's statistics from the driver, noise results) and the captures into
+`bench_results/<name>/`, then exits (exit code 1 if it failed: a typo in a setting, a scene that doesn't open, a DLSS
+mode without DLSS). Frames count from the first one after the scene has loaded, and the renderer is told a fixed time
+step, so captures are taken at the same point in every run.
+
+`tools/bench.py` runs benches against one or two builds, taking turns, and prints a table of medians and spreads:
+```bash
+python tools/bench.py run benches/sponza.json benches/bistro_night.json --a cmake-build-release --b ../other/cmake-build-release
+```
+For a shader change, the same build with `--b-args "--shader-dir <folder with the new .spv files>"`. It also compares
+the captures of A and B (and against stored references: `--save-reference DIR`, `--reference DIR`), with a tolerance
+that passes the run-to-run differences of DLSS frames. GPU times move by about 0.4 ms between runs: use `--runs 3` (the
+default) and trust differences larger than the spread. The standard benches: Sponza (Accumulation, DLAA, a noise
+measurement), Bistro at night, Jungle Ruins, the fog orb and two rooms joined by portals (`scenes/test/`).
 
 The editor's panels (Outliner, Details, Rendering, Lighting, ...) dock around the image and can be dragged into other
 places, tabbed together or closed; View > Reset layout puts them back. The layout is kept in `imgui.ini` next to the

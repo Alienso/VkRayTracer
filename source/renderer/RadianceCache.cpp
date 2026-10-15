@@ -98,7 +98,7 @@ void Renderer::createRadianceCache() {
     if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &cachePipelineLayout) != VK_SUCCESS) {
         throw std::runtime_error("failed to create radiance cache pipeline layout!");
     }
-    VkShaderModule shaderModule = createShaderModule(readFile("cache_resolve.comp.spv"));
+    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("cache_resolve.comp.spv")));
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

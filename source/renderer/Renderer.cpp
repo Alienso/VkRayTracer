@@ -70,7 +70,9 @@ RendererStats Renderer::stats() const {
     stats.gpuMemory = gpuMemory();
     for (int i = 0; i < 6; i++) {
         stats.gpuPassMs[i] = gpuPassTimes[i];
+        stats.lastGpuPassMs[i] = lastPassTimes[i];
     }
+    stats.gpuTimesRead = timestampFramesRead;
     stats.triangles = primitiveCount;
     stats.instances = frameInstances.size();
     stats.meshes = gpuAssets.meshInfos.size();

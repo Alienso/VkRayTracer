@@ -54,7 +54,7 @@ add_executable(vulkanDemo main.cpp
         include/stb_image_write.cpp include/stb_image_write.h
         include/vma/vk_mem_alloc.cpp include/vma/vk_mem_alloc.h
         source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
-        source/app/CameraController.cpp source/app/CameraController.h
+        source/app/CameraController.cpp source/app/CameraController.h source/app/Bench.cpp source/app/Bench.h
         source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp source/editor/EditorFile.cpp source/editor/EditorLayout.cpp
         source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneFile.cpp source/scene/SceneEnvironment.h source/scene/Camera.cpp
         source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
@@ -66,10 +66,11 @@ add_executable(vulkanDemo main.cpp
         source/renderer/Dlss.cpp source/renderer/Exposure.cpp source/renderer/Capture.cpp source/renderer/Noise.cpp
         source/renderer/RadianceCache.cpp source/renderer/BlueNoise.cpp source/renderer/Volumes.cpp source/renderer/ImGuiInit.cpp
         source/renderer/VulkanExtensions.cpp source/renderer/VulkanExtensions.h source/renderer/VulkanInitHelper.cpp
+        source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h
         source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
         include/cgltf/cgltf.h)
 
-target_link_libraries(vulkanDemo glfw3 gdi32 Vulkan::Vulkan)
+target_link_libraries(vulkanDemo glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
 
 # Models and HDR environments are read from the project's resource folder, shared by all builds (copied next to each
 # executable they took 5.8 GB per build folder, and ~15 s of every build). --resources <dir> overrides it.

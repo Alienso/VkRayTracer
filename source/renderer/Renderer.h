@@ -611,11 +611,20 @@ struct GpuMemory {
     uint32_t allocations = 0;
 };
 
+// What the driver says about one compiled pipeline (VK_KHR_pipeline_executable_properties): registers, binary size,
+// local memory, ... as name and value
+struct PipelineStatistics {
+    std::string pipeline;
+    std::vector<std::pair<std::string, std::string>> values;
+};
+
 // What the renderer reports for the UI (Renderer::stats)
 struct RendererStats {
     std::string deviceName;
     GpuMemory gpuMemory;
     float gpuPassMs[6] = {};  // GPU time per pass: cache, ReSTIR, trace, DLSS, exposure, display (smoothed)
+    float lastGpuPassMs[6] = {};  // the same, of the last frame read back (Configuration::maxFramesInFlight ago)
+    uint64_t gpuTimesRead = 0;    // frames whose GPU times were read back so far
     uint64_t triangles = 0;   // over all instances
     size_t instances = 0;
     size_t meshes = 0;
@@ -656,7 +665,27 @@ public:
 
     RendererStats stats() const;
     GpuMemory gpuMemory() const;
-    void requestCapture() { captureRequested = true; }  // the next frame's image, without the UI, as a PNG
+    // The next frame's image, without the UI, as a PNG: into fileName, or capture_<date>_<time>.png when empty.
+    // Written at the start of the frame after (beginFrame).
+    void requestCapture(const std::string& fileName = "") {
+        captureRequested = true;
+        captureFileRequested = fileName;
+    }
+    [[nodiscard]] bool capturePending() const { return captureRequested || captureBuffer != VK_NULL_HANDLE; }
+
+    // The settings the UI edits; a bench sets them from a file (RenderSettingsFile.h)
+    [[nodiscard]] const RenderSettings& renderSettings() const { return settings; }
+    void setRenderSettings(const RenderSettings& newSettings) { settings = newSettings; }
+
+    // The noise tool, run from code: accumulates a reference of the current view for referenceFrames, then measures
+    // measureFrames in renderMode (see Noise.cpp). Busy until the results are in noiseResultList.
+    void startNoiseRun(int renderMode, int referenceFrames, int measureFrames, glm::ivec4 region);
+    [[nodiscard]] bool noiseRunBusy() const {
+        return noiseAutoRun || noiseAutoContinue || noiseState != NoiseState::Idle;
+    }
+    [[nodiscard]] const std::vector<NoiseResult>& noiseResultList() const { return noiseResults; }
+    // The trace shader's pipelines, as the driver compiled them (empty without VK_KHR_pipeline_executable_properties)
+    [[nodiscard]] const std::vector<PipelineStatistics>& tracePipelineStatistics() const { return rtPipelineStatisticsList; }
 
     // The renderer's settings panels, for the editor's window (ImGuiInit.cpp, Environment.cpp, Lights.cpp)
     void buildRenderingUi();
@@ -667,8 +696,6 @@ public:
 
     // The window's framebuffer changed size: the swapchain is remade after this frame
     void resize() { framebufferResized = true; }
-    // The noise tool's scripted run is over and wants the program to end
-    bool quitRequested() const { return noiseQuitRequested; }
     void setDlssDisabled(bool disabled) {  // --no-dlss
         dlssDisabledByFlag = disabled;
     }
@@ -879,8 +906,9 @@ private:
     glm::mat4 frameViewProjection = glm::mat4(1.0f);
     glm::mat4 framePreviousViewProjection = glm::mat4(1.0f);
 
-    // The compiled pipelines, kept on disk between runs (pipelineCacheFile, next to the executable): compiling the
-    // trace shader's 21 pipelines takes seconds; from the cache, a fraction of that. Passed to every pipeline creation.
+    // The compiled pipelines, kept on disk between runs (pipelineCacheFile, next to the shaders: the working directory
+    // unless --shader-dir): compiling the trace shader's 21 pipelines takes seconds; from the cache, a fraction of
+    // that. Passed to every pipeline creation.
     static constexpr const char* pipelineCacheFile = "pipeline_cache.bin";
     VkPipelineCache pipelineCache = VK_NULL_HANDLE;
     uint64_t pipelineCacheShaderHash = 0;  // of the shaders it was made from: written before the cache in the file
@@ -909,7 +937,8 @@ private:
     // What the driver reports about the compiled trace shaders (VK_KHR_pipeline_executable_properties, if the driver
     // has it): registers per thread etc., for the Debug panel. Empty if not available.
     bool pipelineStatisticsSupported = false;
-    std::string rtPipelineStatistics;
+    std::string rtPipelineStatistics;  // as text, for the UI
+    std::vector<PipelineStatistics> rtPipelineStatisticsList;
     bool memoryBudgetSupported = false;  // VK_EXT_memory_budget (gpuMemory)
 
     // Radiance cache (RadianceCache.cpp): hash table of surface cells, on the GPU only
@@ -995,13 +1024,10 @@ private:
     uint32_t noiseRestartsAtStart = 0;
     std::vector<NoiseResult> noiseResults;
     std::string noiseStatus;
-    // Scripted run (set before the first frame, e.g. in init): reference, measure in
-    // noiseAutoMode, print the results, then close the window if noiseAutoExit.
+    // Run from code (startNoiseRun): reference, then measure in noiseAutoMode
     bool noiseAutoRun = false;
     int noiseAutoMode = 0;
-    bool noiseAutoExit = false;
-    bool noiseQuitRequested = false;  // set when the scripted run is done and noiseAutoExit
-    bool noiseAutoContinue = false;  // the scripted run's reference is being built
+    bool noiseAutoContinue = false;  // the run's reference is being built
 
     // Display pass (Display.cpp): exposure + tone mapping into an 8-bit image at output size, blitted to the swapchain
     VkImage displayImage;
@@ -1020,6 +1046,7 @@ private:
     std::vector<bool> timestampsWritten;
     float gpuPassTimes[timestampsPerFrame - 1] = {};
     float lastPassTimes[timestampsPerFrame - 1] = {};  // the same, unsmoothed, of the frame last read back
+    uint64_t timestampFramesRead = 0;
 
     // Updated every frame with vkCmdUpdateBuffer
     VkBuffer uniformBuffer;
@@ -1029,6 +1056,8 @@ private:
     // Frame capture (Capture.cpp): the button sets captureRequested, the frame copies the display image into
     // captureBuffer, the next loop iteration writes it as a PNG
     bool captureRequested = false;
+    std::string captureFileRequested;  // "": a name from the date and time
+    std::string captureFile;           // of the copy recorded
     VkBuffer captureBuffer = VK_NULL_HANDLE;
     VmaAllocation captureMemory = VK_NULL_HANDLE;
     VkExtent2D captureExtent{};
@@ -1239,7 +1268,7 @@ private:
     void createTracePipelines(bool basic);
     void destroyTracePipelines();
     void updateTracePipelines();
-    std::string readPipelineStatistics(VkPipeline pipeline);
+    std::vector<std::pair<std::string, std::string>> readPipelineStatistics(VkPipeline pipeline);
     SceneUniforms buildSceneUniforms();
     void recordInstanceUpload(VkCommandBuffer commandBuffer);
     void recordCapture(VkCommandBuffer commandBuffer);

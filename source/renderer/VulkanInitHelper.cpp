@@ -78,9 +78,21 @@ void Renderer::createInstance(){
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());;
     createInfo.ppEnabledExtensionNames = extensions.data();
 
+    // Synchronization validation: switched on through the layer (VK_EXT_validation_features, which the layer provides)
+    VkValidationFeatureEnableEXT syncValidation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validationFeatures{};
+    validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+    validationFeatures.enabledValidationFeatureCount = 1;
+    validationFeatures.pEnabledValidationFeatures = &syncValidation;
     if (Configuration::enableValidationLayers) {
         createInfo.enabledLayerCount = static_cast<uint32_t>(Configuration::validationLayers.size());
         createInfo.ppEnabledLayerNames = Configuration::validationLayers.data();
+        if (Configuration::enableSyncValidation) {
+            extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+            createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+            createInfo.ppEnabledExtensionNames = extensions.data();
+            createInfo.pNext = &validationFeatures;
+        }
     } else {
         createInfo.enabledLayerCount = 0;
     }
@@ -275,7 +287,7 @@ static uint64_t shaderBinariesHash() {
     uint64_t hash = 0xcbf29ce484222325ull;
     for (const char* name : {"raytrace.comp.spv", "display.comp.spv", "exposure.comp.spv", "noise.comp.spv",
                              "cache_resolve.comp.spv"}) {
-        std::ifstream file(name, std::ios::binary);
+        std::ifstream file(Configuration::shaderPath(name), std::ios::binary);
         for (std::istreambuf_iterator<char> it(file), end; it != end; ++it) {
             hash = (hash ^ static_cast<uint8_t>(*it)) * 0x100000001b3ull;
         }
@@ -291,7 +303,7 @@ static uint64_t shaderBinariesHash() {
 void Renderer::createPipelineCache() {
     pipelineCacheShaderHash = shaderBinariesHash();
     std::vector<char> data;
-    std::ifstream file(pipelineCacheFile, std::ios::binary | std::ios::ate);
+    std::ifstream file(Configuration::shaderPath(pipelineCacheFile), std::ios::binary | std::ios::ate);
     if (file) {
         size_t size = static_cast<size_t>(file.tellg());
         uint64_t shaderHash = 0;
@@ -335,7 +347,8 @@ void Renderer::savePipelineCache() {
     if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS) {
         return;
     }
-    std::string temporary = std::string(pipelineCacheFile) + ".tmp";
+    std::string path = Configuration::shaderPath(pipelineCacheFile);
+    std::string temporary = path + ".tmp";
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(&pipelineCacheShaderHash), sizeof(pipelineCacheShaderHash));
@@ -344,8 +357,8 @@ void Renderer::savePipelineCache() {
             return;
         }
     }
-    std::remove(pipelineCacheFile);
-    std::rename(temporary.c_str(), pipelineCacheFile);
+    std::remove(path.c_str());
+    std::rename(temporary.c_str(), path.c_str());
 }
 
 void Renderer::createSwapChain() {
@@ -859,7 +872,8 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
         const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
         void* pUserData) {
 
-    std::cerr << "validation layer: " << pCallbackData->pMessage << std::endl;
+    std::cerr << "validation layer: " << (pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "") << ": "
+              << pCallbackData->pMessage << std::endl;
 
     return VK_FALSE;
 }

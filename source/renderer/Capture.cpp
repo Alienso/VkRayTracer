@@ -1,6 +1,6 @@
 //
 // Frame capture: the "Capture" button saves the displayed image (after exposure and tone mapping, without the UI)
-// as a PNG next to the executable, e.g. capture_2026-10-07_14-32-05.png.
+// as a PNG next to the executable, e.g. capture_2026-10-07_14-32-05.png (benches give a file name of their own).
 //
 // The display image is copied into a host-visible buffer in the frame's own command buffer, right after the blit
 // to the swapchain reads it. Once that frame's fence has signaled (at the start of the next loop iteration), the
@@ -16,12 +16,27 @@
 #include <stb_image_write.h>
 #include "renderer/Renderer.h"
 
+// A file name that doesn't exist yet: capture_<date>_<time>.png, with _2, _3, ... for several in the same second
+static std::string captureFileName() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_s(&local, &now);
+    char stamp[64];
+    std::strftime(stamp, sizeof(stamp), "capture_%Y-%m-%d_%H-%M-%S", &local);
+    std::string name = std::string(stamp) + ".png";
+    for (int i = 2; std::filesystem::exists(name); i++) {
+        name = std::string(stamp) + "_" + std::to_string(i) + ".png";
+    }
+    return name;
+}
+
 // Records the copy display image -> capture buffer. The display image is in TRANSFER_SRC_OPTIMAL (after the blit).
 void Renderer::recordCapture(VkCommandBuffer commandBuffer) {
     if (!captureRequested || captureBuffer != VK_NULL_HANDLE) {
         return;
     }
     captureRequested = false;
+    captureFile = captureFileRequested.empty() ? captureFileName() : captureFileRequested;
     captureExtent = outputExtent;
     captureFrame = currentFrame;
     createBuffer(static_cast<VkDeviceSize>(captureExtent.width) * captureExtent.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -44,20 +59,6 @@ void Renderer::recordCapture(VkCommandBuffer commandBuffer) {
     barrier.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                          0, 0, nullptr, 1, &barrier, 0, nullptr);
-}
-
-// A file name that doesn't exist yet: capture_<date>_<time>.png, with _2, _3, ... for several in the same second
-static std::string captureFileName() {
-    std::time_t now = std::time(nullptr);
-    std::tm local{};
-    localtime_s(&local, &now);
-    char stamp[64];
-    std::strftime(stamp, sizeof(stamp), "capture_%Y-%m-%d_%H-%M-%S", &local);
-    std::string name = std::string(stamp) + ".png";
-    for (int i = 2; std::filesystem::exists(name); i++) {
-        name = std::string(stamp) + "_" + std::to_string(i) + ".png";
-    }
-    return name;
 }
 
 // Writes the capture once its frame has finished on the GPU. Called once per loop iteration, before the UI is built.
@@ -92,7 +93,7 @@ void Renderer::finishCapture() {
     vmaFreeMemory(allocator, captureMemory);
     captureBuffer = VK_NULL_HANDLE;
 
-    std::string name = captureFileName();
+    const std::string& name = captureFile;
     if (stbi_write_png(name.c_str(), static_cast<int>(captureExtent.width), static_cast<int>(captureExtent.height), 4,
                        pixels.data(), static_cast<int>(captureExtent.width) * 4)) {
         captureMessage = "saved " + name;

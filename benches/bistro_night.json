@@ -1,0 +1,9 @@
+{
+  "description": "Bistro at night (thousands of small lights), Accumulation",
+  "scene": "../scenes/bistro_night.json",
+  "settings": {"renderMode": "Accumulation"},
+  "camera": {"position": [0.0, 1.6, 4.0], "yaw": 0.0, "pitch": -9.926247, "fov": 60.0},
+  "warmupFrames": 200,
+  "frames": 300,
+  "captures": [512]
+}

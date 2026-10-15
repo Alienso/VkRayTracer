@@ -1,0 +1,9 @@
+{
+  "description": "Sponza: noise of DLAA frames against a 4096-frame reference (noise tool)",
+  "scene": "../scenes/sponza.json",
+  "settings": {"renderMode": "DlssDlaa"},
+  "camera": {"position": [-10.0, 2.2, 0.8], "yaw": 83.85337, "pitch": 3.501259, "fov": 60.0},
+  "warmupFrames": 100,
+  "frames": 100,
+  "noise": {"mode": "DlssDlaa", "referenceFrames": 4096, "frames": 256}
+}

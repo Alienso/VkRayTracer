@@ -30,6 +30,9 @@ std::string Configuration::resourceDirectory = VULKANDEMO_RESOURCE_DIR;
 std::string Configuration::resourceDirectory = "resource";
 #endif
 
+std::string Configuration::shaderDirectory;
+bool Configuration::enableSyncValidation = false;
+
 #ifdef NDEBUG
 bool Configuration::enableValidationLayers = false;
 #else

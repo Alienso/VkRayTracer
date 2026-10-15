@@ -22,9 +22,19 @@ public:
     // The Vulkan validation layer: on in Debug builds, off in Release; --validation / --no-validation (main.cpp)
     // override it. It slows the CPU side (every Vulkan call is checked): off for timing runs.
     static bool enableValidationLayers;
+    // With the validation layer: also synchronization validation (missing or wrong barriers, read/write hazards),
+    // --sync-validation. Much slower; for checking barriers.
+    static bool enableSyncValidation;
     // Where the models and HDR environments are (models/, environments/): the project's resource folder, shared by
     // all builds (VULKANDEMO_RESOURCE_DIR, set by CMakeLists.txt); --resources <dir> (main.cpp) points elsewhere.
     static std::string resourceDirectory;
+    // Where the compiled shaders (.spv) are read from, and the pipeline cache kept: "" = the working directory (the
+    // build folder, where CMake compiles them); --shader-dir <dir> (main.cpp) runs another version of them, e.g. for
+    // an A/B timing of a shader change without swapping files (each folder keeps its own pipeline cache)
+    static std::string shaderDirectory;
+    static std::string shaderPath(const std::string& fileName) {
+        return shaderDirectory.empty() ? fileName : shaderDirectory + "/" + fileName;
+    }
     static const int maxFramesInFlight;
 
     Configuration()= default;

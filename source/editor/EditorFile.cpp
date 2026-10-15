@@ -67,7 +67,7 @@ void Editor::perform(FileAction action, const std::string& path) {
     unsaved = false;
 }
 
-void Editor::openSceneFile(const std::string& path) {
+bool Editor::openSceneFile(const std::string& path) {
     try {
         std::vector<std::string> warnings = scene.load(path);
         scenePath = path;
@@ -79,9 +79,11 @@ void Editor::openSceneFile(const std::string& path) {
             std::cerr << path << ": " << warning << std::endl;
             log(LogLevel::Warning, path + ": " + warning);
         }
+        return true;
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;  // the scene is unchanged
         log(LogLevel::Error, e.what());
+        return false;
     }
 }
 

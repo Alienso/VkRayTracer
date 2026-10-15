@@ -7,3 +7,5 @@ resource/environments/
 lib/streamline/
 # PLANS
 *_PLAN.md
+# Bench runs (tools/bench.py)
+bench_runs/

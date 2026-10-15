@@ -1,0 +1,9 @@
+{
+  "description": "Two Cornell boxes joined by portals (sun and lamp through them), Accumulation",
+  "scene": "../scenes/test/portal_rooms.json",
+  "settings": {"renderMode": "Accumulation"},
+  "camera": {"position": [-1.2, 1.6, 1.7], "yaw": 0, "pitch": 0, "fov": 70},
+  "warmupFrames": 200,
+  "frames": 300,
+  "captures": [1024]
+}

@@ -488,9 +488,11 @@ void Renderer::createRayTracingImages() {
             barriers[i].image = images[i];
             barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             barriers[i].srcAccessMask = 0;
-            barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         }
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        // (the transfer stage too: the clear below must wait for the layout change)
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, imageCount, barriers);
         // The history starts out black (the reprojection view shows an error for one frame, not garbage)
         VkClearColorValue black{};
@@ -759,7 +761,7 @@ void Renderer::createRayTracingPipeline() {
 }
 
 void Renderer::createTracePipelines(bool basic) {
-    VkShaderModule shaderModule = createShaderModule(readFile("raytrace.comp.spv"));
+    VkShaderModule shaderModule = createShaderModule(readFile(Configuration::shaderPath("raytrace.comp.spv")));
 
     // Seven pipelines from the one shader: the image (both constants 0), the radiance cache's update paths
     // (CACHE_UPDATE_PASS = 1), ReSTIR's camera rays and DI candidates (RESTIR_PASS = 1), DI's spatial reuse
@@ -810,17 +812,27 @@ void Renderer::createTracePipelines(bool basic) {
     basicTraceShader = basic;
 
     if (pipelineStatisticsSupported) {
-        rtPipelineStatistics = "Image paths:\n" + readPipelineStatistics(rtPipeline) +
-                               "Cache update paths:\n" + readPipelineStatistics(rtCacheUpdatePipeline) +
-                               "ReSTIR candidates:\n" + readPipelineStatistics(rtRestirPipeline) +
-                               "ReSTIR spatial reuse:\n" + readPipelineStatistics(rtRestirSpatialPipeline) +
-                               "ReSTIR GI shading:\n" + readPipelineStatistics(rtRestirGiShadePipeline) +
-                               "ReSTIR GI temporal reuse:\n" + readPipelineStatistics(rtRestirGiTemporalPipeline) +
-                               "ReSTIR GI spatial reuse:\n" + readPipelineStatistics(rtRestirGiSpatialPipeline) +
-                               "Image paths with fog:\n" + readPipelineStatistics(rtFogPipelines[0][0]) +
-                               "Cache update paths with fog:\n" + readPipelineStatistics(rtFogPipelines[0][1]) +
-                               "Image paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][0]) +
-                               "Cache update paths with varying fog:\n" + readPipelineStatistics(rtFogPipelines[1][1]);
+        std::pair<const char*, VkPipeline> pipelines[] = {
+            {"Image paths", rtPipeline},
+            {"Cache update paths", rtCacheUpdatePipeline},
+            {"ReSTIR candidates", rtRestirPipeline},
+            {"ReSTIR spatial reuse", rtRestirSpatialPipeline},
+            {"ReSTIR GI shading", rtRestirGiShadePipeline},
+            {"ReSTIR GI temporal reuse", rtRestirGiTemporalPipeline},
+            {"ReSTIR GI spatial reuse", rtRestirGiSpatialPipeline},
+            {"Image paths with fog", rtFogPipelines[0][0]},
+            {"Cache update paths with fog", rtFogPipelines[0][1]},
+            {"Image paths with varying fog", rtFogPipelines[1][0]},
+            {"Cache update paths with varying fog", rtFogPipelines[1][1]}};
+        rtPipelineStatisticsList.clear();
+        rtPipelineStatistics.clear();
+        for (const auto& [name, pipeline] : pipelines) {
+            rtPipelineStatisticsList.push_back({name, readPipelineStatistics(pipeline)});
+            rtPipelineStatistics += std::string(name) + ":\n";
+            for (const auto& [statistic, value] : rtPipelineStatisticsList.back().values) {
+                rtPipelineStatistics += "  " + statistic + ": " + value + "\n";
+            }
+        }
         std::cout << "Trace shader statistics (from the driver"
                   << (basic ? ", basic shader" : "") << "):\n" << rtPipelineStatistics << std::flush;
     }
@@ -866,14 +878,14 @@ VkPipeline Renderer::tracePipeline(VkPipeline plain) const {
 
 // The driver's statistics about a compiled pipeline, one "name: value" line each (on NVIDIA e.g. the registers per
 // thread, which limit how many threads an SM can run at once: fewer threads hide the waits for rays and memory worse).
-std::string Renderer::readPipelineStatistics(VkPipeline pipeline) {
+std::vector<std::pair<std::string, std::string>> Renderer::readPipelineStatistics(VkPipeline pipeline) {
+    std::vector<std::pair<std::string, std::string>> values;
     if (vkext::vkGetPipelineExecutablePropertiesKHR == nullptr || vkext::vkGetPipelineExecutableStatisticsKHR == nullptr) {
-        return "";
+        return values;
     }
     VkPipelineInfoKHR pipelineInfo{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
     uint32_t executableCount = 0;
     vkext::vkGetPipelineExecutablePropertiesKHR(device, &pipelineInfo, &executableCount, nullptr);
-    std::string text;
     for (uint32_t executable = 0; executable < executableCount; executable++) {
         VkPipelineExecutableInfoKHR executableInfo{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, executable};
         uint32_t statisticCount = 0;
@@ -889,10 +901,10 @@ std::string Renderer::readPipelineStatistics(VkPipeline pipeline) {
                 case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: value = std::to_string(statistic.value.f64); break;
                 default: value = "?"; break;
             }
-            text += std::string("  ") + statistic.name + ": " + value + "\n";
+            values.emplace_back(statistic.name, value);
         }
     }
-    return text;
+    return values;
 }
 
 SceneUniforms Renderer::buildSceneUniforms() {
@@ -1343,6 +1355,7 @@ void Renderer::readTimestamps() {
         lastPassTimes[i] = ms;
         gpuPassTimes[i] = gpuPassTimes[i] == 0.0f ? ms : gpuPassTimes[i] * 0.95f + ms * 0.05f;
     }
+    timestampFramesRead++;
 }
 
 // Bottom of pipe: the moment everything recorded before has finished

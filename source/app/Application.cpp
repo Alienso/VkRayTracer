@@ -11,7 +11,10 @@
 
 static const char* defaultModel = "DamagedHelmet.glb";
 
-void Application::run() {
+int Application::run() {
+    if (bench) {
+        startScene = bench->sceneFile();
+    }
     window.create(Configuration::wWidth, Configuration::wHeight, "Vulkan");
     window.setCloseCheck([this]() { return editor.allowClose(); });  // asks about unsaved changes
     createDefaultScene();
@@ -21,12 +24,16 @@ void Application::run() {
     editor.initUi();
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);  // true: install input callbacks, chaining the window's own
     renderer.init(window.handle(), renderList);
+    if (bench) {
+        bench->start(renderer);
+    }
     mainLoop();
     renderer.shutdown();
 
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     window.destroy();
+    return bench && (bench->failed() || !benchDone) ? 1 : 0;
 }
 
 // The model and environment files there are, the floor, and the default model on it; or the scene file given on the
@@ -48,7 +55,10 @@ void Application::createDefaultScene() {
     }
     editor.init(error);
     if (!startScene.empty()) {
-        editor.openSceneFile(startScene);  // on failure the error shows in the Log panel, over the default scene
+        // On failure the error shows in the Log panel, over the default scene
+        if (!editor.openSceneFile(startScene) && bench) {
+            bench->fail("cannot open the scene " + startScene);
+        }
     }
 }
 
@@ -78,6 +88,9 @@ void Application::mainLoop() {
         double now = glfwGetTime();
         float deltaTime = static_cast<float>(now - lastTime);
         lastTime = now;
+        if (bench) {
+            deltaTime = bench->deltaTime(deltaTime);
+        }
 
         renderer.beginFrame(deltaTime);
         assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
@@ -90,14 +103,19 @@ void Application::mainLoop() {
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
         glm::vec3 cameraFrom = scene.camera().position;
-        cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        if (bench) {
+            bench->beforeRender(scene, renderer, assets);  // the camera is the bench's
+        } else {
+            cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        }
         scene.moveCameraThroughPortals(cameraFrom);
         scene.buildRenderList(renderList);
         if (window.takeResized()) {  // dragged, maximized, fullscreen (F11 or the editor)
             renderer.resize();
         }
         renderer.render(renderList);
-        if (renderer.quitRequested()) {
+        if (bench && !benchDone && bench->afterRender(renderer)) {
+            benchDone = true;
             window.requestClose();
         }
     }

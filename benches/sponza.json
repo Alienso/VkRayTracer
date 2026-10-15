@@ -1,0 +1,9 @@
+{
+  "description": "Sponza, Accumulation: GPU times; frame 1024 as the image check",
+  "scene": "../scenes/sponza.json",
+  "settings": {"renderMode": "Accumulation"},
+  "camera": {"position": [-10.0, 2.2, 0.8], "yaw": 83.85337, "pitch": 3.501259, "fov": 60.0},
+  "warmupFrames": 400,
+  "frames": 300,
+  "captures": [1024]
+}
