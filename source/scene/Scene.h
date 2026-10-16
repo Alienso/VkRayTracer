@@ -12,6 +12,12 @@
 // when the entity is removed); a model no entity shows is kept for a while, then unloaded (see AssetStore.h).
 // Model files load in the background: the entity is there at once, its model shows up when it arrives (update).
 //
+// Render settings: the scene's fields of the program's RenderSettings (SettingsScope::Scene, RenderSettingsFile.h:
+// exposure, bounces, ReSTIR, ...) are this scene's. A scene file holds the ones that differ from the defaults; opening
+// one sets them (the others to their defaults), a new scene resets them. The program's fields (render mode, ...) it
+// never touches. These are the scene's own values: what settings volumes change on top while the camera is inside
+// them (later) is the renderer's per frame, not saved.
+//
 
 #ifndef VULKANDEMO_SCENE_H
 #define VULKANDEMO_SCENE_H
@@ -27,6 +33,7 @@
 #include "scene/Portal.h"
 #include "scene/RenderList.h"
 #include "scene/SceneEnvironment.h"
+#include "renderer/RenderSettings.h"
 
 // Unique in the scene and never reused: what the scene's tree, the components and the render list (motion vectors)
 // know an entity by. 0 = none.
@@ -86,12 +93,12 @@ class Scene {
 public:
     static constexpr float objectSpacing = 2.4f;  // new objects are lined up along X this far apart
 
-    explicit Scene(AssetStore& assets);
+    Scene(AssetStore& assets, RenderSettings& settings);
 
     // The starting scene: the built-in floor, the camera looking at where the first object goes
     void createDefault();
-    // A new scene: everything removed (models released), the default camera and environment, the floor; edits to
-    // the models' materials and lights undone (AssetStore::resetEdits)
+    // A new scene: everything removed (models released), the default camera, environment and scene settings, the
+    // floor; edits to the models' materials and lights undone (AssetStore::resetEdits)
     void clear();
 
     // Scene files (SceneFile.cpp, the format is described there). save writes through a temporary file, so a failed
@@ -186,6 +193,7 @@ public:
 
 private:
     AssetStore& assets;
+    RenderSettings& settings;  // the program's; the scene's fields of it are this scene's (see above)
     std::vector<Entity> entityList;
     std::unordered_map<EntityId, size_t> entityIndex;  // id -> position in entityList
     std::vector<EntityId> rootList;                    // in the order the editor lists them

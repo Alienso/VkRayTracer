@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_glfw.h>
@@ -13,12 +14,32 @@
 static const char* defaultModel = "DamagedHelmet.glb";
 
 int Application::run() {
+    std::vector<std::string> userSettingsProblems;
     if (bench) {
-        startScene = bench->sceneFile();
+        startScene = bench->sceneFile();  // (and the defaults: no user settings)
+    } else {
+        userSettingsProblems = loadUserSettings(userSettingsFile, userSettings, renderSettings);
+        savedUserSettings = userSettingsText(userSettings, renderSettings);
+        savedRenderMode = renderSettings.renderMode;
+        savedDlssModel = renderSettings.dlssModel;
+        // The last scene again, unless the command line names one (and it is still there: else the default scene)
+        if (startScene.empty() && !userSettings.lastScene.empty() && std::filesystem::exists(userSettings.lastScene)) {
+            startScene = userSettings.lastScene;
+        }
     }
-    window.create(Configuration::wWidth, Configuration::wHeight, "Vulkan");
+    window.create(userSettings.windowWidth > 0 ? userSettings.windowWidth : Configuration::wWidth,
+                  userSettings.windowHeight > 0 ? userSettings.windowHeight : Configuration::wHeight, "Vulkan");
+    if (userSettings.maximized) {
+        window.maximize();
+    }
+    if (userSettings.fullscreen) {
+        window.setFullscreen(true);
+    }
     window.setCloseCheck([this]() { return editor.allowClose(); });  // asks about unsaved changes
     createDefaultScene();
+    for (const std::string& problem : userSettingsProblems) {
+        editor.warn(std::string(userSettingsFile) + ": " + problem);
+    }
     scene.buildRenderList(renderList);
     // The UI: ImGui's context and its input from the window are the program's; the renderer adds the Vulkan side
     ImGui::CreateContext();
@@ -29,6 +50,9 @@ int Application::run() {
         bench->start(renderSettings);
     }
     mainLoop();
+    if (!bench) {
+        saveUserSettingsIfChanged();
+    }
     renderer.shutdown();
 
     ImGui_ImplGlfw_Shutdown();
@@ -74,6 +98,34 @@ static uint64_t unusedModelBudget(const GpuMemory& memory, uint64_t unusedMemory
     int64_t spare = static_cast<int64_t>(memory.budget) - static_cast<int64_t>(memory.used) - reserve;  // < 0: short
     int64_t allowed = static_cast<int64_t>(unusedMemory) + spare;
     return static_cast<uint64_t>(std::clamp<int64_t>(allowed, 0, static_cast<int64_t>(AssetStore::defaultUnusedBudget)));
+}
+
+void Application::saveUserSettingsIfChanged() {
+    userSettings.fullscreen = window.isFullscreen();
+    userSettings.maximized = window.isMaximized();
+    if (!window.isFullscreen() && !userSettings.maximized) {  // (else the size it comes back to is kept)
+        window.windowedSize(userSettings.windowWidth, userSettings.windowHeight);
+    }
+    RenderSettings kept = renderSettings;
+    if (!renderer.stats().dlssSupported) {
+        kept.renderMode = savedRenderMode;
+    }
+    if (!renderer.dlssModelAvailable(savedDlssModel)) {
+        kept.dlssModel = savedDlssModel;
+    }
+    savedRenderMode = kept.renderMode;
+    savedDlssModel = kept.dlssModel;
+    std::string text = userSettingsText(userSettings, kept);
+    if (text == savedUserSettings) {
+        return;
+    }
+    try {
+        saveUserSettings(userSettingsFile, text);
+        savedUserSettings = text;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        savedUserSettings = text;  // (tried once per change, not every second)
+    }
 }
 
 void Application::mainLoop() {
@@ -135,6 +187,10 @@ void Application::mainLoop() {
         if (bench && !benchDone && bench->afterRender(renderer, cpuTimes)) {
             benchDone = true;
             window.requestClose();
+        }
+        if (!bench && now - userSettingsCheckTime >= 1.0) {
+            userSettingsCheckTime = now;
+            saveUserSettingsIfChanged();
         }
     }
 }

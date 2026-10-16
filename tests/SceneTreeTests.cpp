@@ -15,7 +15,7 @@ static const std::string cube = "Cube";
 namespace {  // (each test file has its own TestScene)
 
 struct TestScene : TestAssets {
-    Scene scene{assets};
+    Scene scene{assets, settings};
     TestScene() { scene.createDefault(); }
 
     Transform transform(glm::vec3 position, glm::vec3 degrees, glm::vec3 scale) {

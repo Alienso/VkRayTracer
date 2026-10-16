@@ -6,7 +6,7 @@
 #include <catch_amalgamated.hpp>
 #include <nlohmann/json.hpp>
 #include "renderer/RenderSettingsFile.h"
-#include "renderer/RendererTypes.h"
+#include "renderer/RenderSettings.h"
 
 static std::string text(const RenderSettings& settings) { return renderSettingsToJson(settings).dump(); }
 
@@ -93,4 +93,52 @@ TEST_CASE("RenderSettings JSON: floats are written as the shortest number that r
     RenderSettings settings;
     settings.exposure = 0.3f;
     CHECK(renderSettingsToJson(settings)["exposure"].dump() == "0.3");
+}
+
+TEST_CASE("RenderSettings JSON: the fields are the scene's or the program's", "[RenderSettingsFile]") {
+    CHECK(settingScope("renderMode") == SettingsScope::Program);
+    CHECK(settingScope("dlssModel") == SettingsScope::Program);
+    CHECK(settingScope("exposure") == SettingsScope::Scene);
+    RenderSettings settings;
+    nlohmann::ordered_json all = renderSettingsToJson(settings);
+    nlohmann::ordered_json scene = renderSettingsToJson(settings, SettingsScope::Scene);
+    nlohmann::ordered_json program = renderSettingsToJson(settings, SettingsScope::Program);
+    CHECK(scene.size() + program.size() == all.size());
+    CHECK(program.size() == 6);
+    for (auto& [key, value] : program.items()) {
+        CHECK_FALSE(scene.contains(key));
+    }
+}
+
+TEST_CASE("RenderSettings JSON: onlyChanged leaves out what equals the defaults", "[RenderSettingsFile]") {
+    RenderSettings settings;
+    CHECK(renderSettingsToJson(settings, SettingsScope::All, true).empty());
+    settings.exposure = 2.0f;
+    settings.renderMode = static_cast<int>(RenderMode::DlssDlaa);
+    CHECK(renderSettingsToJson(settings, SettingsScope::All, true).dump() == R"({"exposure":2.0,"renderMode":"DlssDlaa"})");
+    CHECK(renderSettingsToJson(settings, SettingsScope::Scene, true).dump() == R"({"exposure":2.0})");
+}
+
+TEST_CASE("RenderSettings JSON: reading one scope leaves the other's fields alone and says so", "[RenderSettingsFile]") {
+    RenderSettings settings;
+    nlohmann::json json = {{"exposure", 2}, {"renderMode", "DlssDlaa"}};
+    std::vector<std::string> problems = applyRenderSettingsJson(settings, json, SettingsScope::Scene);
+    REQUIRE(problems.size() == 1);
+    CHECK(problems[0].find("renderMode") == 0);
+    CHECK(settings.exposure == 2.0f);
+    CHECK(settings.renderMode == RenderSettings{}.renderMode);
+}
+
+TEST_CASE("RenderSettings JSON: reset and copy one scope", "[RenderSettingsFile]") {
+    RenderSettings a, b;
+    a.exposure = 2.0f;
+    a.renderMode = static_cast<int>(RenderMode::DlssDlaa);
+    b.exposure = 5.0f;
+    b.renderMode = static_cast<int>(RenderMode::DlssQuality);
+    copyRenderSettings(a, b, SettingsScope::Scene);
+    CHECK(a.exposure == 5.0f);
+    CHECK(a.renderMode == static_cast<int>(RenderMode::DlssDlaa));
+    resetRenderSettings(a, SettingsScope::Program);
+    CHECK(a.renderMode == RenderSettings{}.renderMode);
+    CHECK(a.exposure == 5.0f);
 }

@@ -14,6 +14,7 @@
 #include <thread>
 #include <glm/glm.hpp>
 #include "assets/AssetStore.h"
+#include "renderer/RenderSettings.h"
 
 // A folder of its own under the system's temp folder, removed with everything in it afterwards
 struct TempFolder {
@@ -35,10 +36,11 @@ struct TempFolder {
 };
 
 // An asset store whose model and environment folders are an empty scratch folder: only built-in models, and files
-// the test writes there
+// the test writes there. And render settings for the scenes made on it (the program's, Application::renderSettings).
 struct TestAssets {
     TempFolder folder;
     AssetStore assets{folder.path.generic_string(), folder.path.generic_string()};
+    RenderSettings settings;
 };
 
 // Runs AssetStore::update until no load is running or waiting (at most 20 s)

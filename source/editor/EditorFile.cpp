@@ -1,7 +1,8 @@
 //
-// The editor's scene files: the File menu's New, Open, Save, Save As (in the scenes folder next to the executable),
-// the unsaved changes mark (in the menu bar and the window title) and the question before New / Open / closing the
-// window throws them away. The files themselves: Scene::save / load (SceneFile.cpp).
+// The editor's scene files: the File menu's New, Open, Open recent, Save, Save As (in the scenes folder next to the
+// executable), the unsaved changes mark (in the menu bar and the window title) and the question before New / Open /
+// closing the window throws them away. The files themselves: Scene::save / load (SceneFile.cpp). The recent scenes
+// and the last one (opened again at the next start) go into the user settings (app/UserSettings.h).
 //
 
 #include <algorithm>
@@ -51,6 +52,7 @@ void Editor::perform(FileAction action, const std::string& path) {
         case FileAction::New:
             scene.clear();
             scenePath.clear();
+            userSettings.lastScene.clear();  // the default scene at the next start
             savedText = scene.contentText();
             selected = 0;
             log(LogLevel::Info, "New scene");
@@ -71,6 +73,8 @@ bool Editor::openSceneFile(const std::string& path) {
     try {
         std::vector<std::string> warnings = scene.load(path);
         scenePath = path;
+        userSettings.addRecentScene(path);
+        userSettings.lastScene = path;
         savedText = scene.contentText();
         unsaved = false;
         selected = 0;
@@ -91,6 +95,8 @@ bool Editor::saveTo(const std::string& path) {
     try {
         scene.save(path);
         scenePath = path;
+        userSettings.addRecentScene(path);
+        userSettings.lastScene = path;
         savedText = scene.contentText();
         unsaved = false;
         saveError.clear();
@@ -150,6 +156,23 @@ void Editor::buildFileMenu() {
             }
         }
         ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Open recent", !userSettings.recentScenes.empty())) {
+        std::string picked;
+        for (const std::string& path : userSettings.recentScenes) {
+            bool there = std::filesystem::exists(path);
+            if (ImGui::MenuItem(path.c_str(), there ? nullptr : "missing", false, there)) {
+                picked = path;
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Clear the list")) {
+            userSettings.recentScenes.clear();
+        }
+        ImGui::EndMenu();
+        if (!picked.empty()) {
+            request(FileAction::Open, picked);  // (after the loop: opening changes the list)
+        }
     }
     if (ImGui::MenuItem("Save", "Ctrl+S")) {
         if (scenePath.empty()) {

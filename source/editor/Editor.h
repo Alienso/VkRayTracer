@@ -12,6 +12,7 @@
 #include "assets/AssetStore.h"
 #include "app/CameraController.h"
 #include "app/CpuFrameTimes.h"
+#include "app/UserSettings.h"
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 #include "app/Window.h"
@@ -19,7 +20,7 @@
 class Editor {
 public:
     Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
-           RenderSettings& settings, const CpuFrameTimes& cpuTimes, Window& window);
+           RenderSettings& settings, const CpuFrameTimes& cpuTimes, UserSettings& userSettings, Window& window);
 
     // After the scene was made: the last object selected, a load error to show
     void init(const std::string& error);
@@ -35,6 +36,8 @@ public:
     bool openSceneFile(const std::string& path);
     // The window's close button: false while the scene has unsaved changes (it asks first, then closes the window)
     bool allowClose();
+    // A warning for the Log panel (from outside the editor: reading the user settings)
+    void warn(const std::string& text) { log(LogLevel::Warning, text); }
 
 private:
     AssetStore& assets;
@@ -43,6 +46,7 @@ private:
     Renderer& renderer;
     RenderSettings& settings;  // the program's: the renderer renders with them
     const CpuFrameTimes& cpuTimes;  // the main loop's (the overlay)
+    UserSettings& userSettings;     // the program's: the recent scenes and the last one are the editor's to set
     Window& window;
     RendererStats stats;  // fetched at the start of build()
 

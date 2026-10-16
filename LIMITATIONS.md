@@ -446,10 +446,22 @@ window keeps going.
 - The unused models' budget is 1 GiB (`AssetStore::defaultUnusedBudget`), less while the GPU memory left (the
   driver's budget, VK_EXT_memory_budget) is under an eighth of it (`unusedModelBudget` in Application.cpp); the
   models' sizes are estimates (no BLASes). Freed ranges can fragment the buffers (they only grow, never shrink).
-- Fix: upload over several frames without waiting for the GPU (a transfer queue, BLAS builds spread out, deferred
-  releases).
-- Where: `AssetStore::release` / `trimUnused` (source/assets/AssetStore.cpp), `syncSceneGeometry`
-  (source/renderer/SceneGpu.cpp).
+- The wait: `GpuScene::updateScene` (step 1) calls `waitIdle()` whenever `AssetStore::revision()` moved, because
+  unloading shifts the store's lists down (`AssetStore::unload` renumbers the later models' meshes, materials,
+  textures and parts; tests/AssetStoreTests.cpp pins that). BLASes, textures and geometry ranges survive it (matched
+  by mesh / texture id); the material buffer, mesh infos, texture descriptors and the TLAS are remade.
+- The texture array has a fixed size, 1024 (`GpuScene::maxTextures`); the shader's array is unsized already, so
+  only the descriptor set layout and pool would read the device's limit instead.
+- Why it stays: in the editor loads are rare and asked for; one stall then isn't noticed. It matters once models or
+  LODs stream in and out while the camera moves, or loads happen during a measured bench.
+- Fix (stable slots, ~2-3 days): the store's meshes / materials / textures in fixed slots with a free list (a slot
+  is freed, not erased: no renumbering); mesh infos and materials updated slot by slot in the frame's command buffer
+  (as instance ranges already are, StreamedBuffer) instead of remade; texture descriptors written per slot (while
+  frames are in flight that likely needs UPDATE_AFTER_BIND / PARTIALLY_BOUND); releases through DeferredDeletion as
+  now. Then the waitIdle goes; the AssetStore test "unloading moves ... down" becomes "keeps its slots". Do
+  maxTextures with it. Beyond that: upload over several frames (a transfer queue, BLAS builds spread out).
+- Where: `AssetStore::release` / `trimUnused` / `unload` (source/assets/AssetStore.cpp), `updateScene` /
+  `syncSceneGeometry` (source/renderer/SceneGpu.cpp).
 
 ### Unsupported glTF features
 - Second UV set (`TEXCOORD_1`): the first set is used instead (a warning is printed).
@@ -565,7 +577,14 @@ manual hooking Streamline can't track command buffer state, which is why we must
 after `slEvaluateFeature` (our exposure and display passes bind theirs anyway). Expected with manual hooking.
 
 ### Startup takes about 3 seconds longer
-`slInit` queries NGX (the driver's DLSS runtime) for its requirements, which is slow.
+`slInit` queries NGX (the driver's DLSS runtime) for its requirements, which is slow. Measured (Sponza, Release, warm
+pipeline cache): 4.6 s to the first frame with DLSS, 1.6 s with `--no-dlss`. Streamline init 2.0-2.5 s (~1.5 s of it
+NGX checking the DLSS DLL and the GPU), and device creation ~1 s slower with it. Done on every start besides: the fog
+noise (128^3, on the CPU, 0.35-0.5 s) and the specular albedo table (0.14 s).
+- Fix: the fog noise only for scenes with fog, or both on threads (~0.6 s); Streamline init on a thread meanwhile
+  (~0.2-0.7 s); or DLSS loaded only when a DLSS mode is picked (~3 s, but that needs the device made again, or a
+  restart). Jungle Ruins' first frame (3.6 s in updateScene: first upload, BLAS builds) isn't broken down yet.
+- Where: `Dlss::initStreamline` (source/renderer/Dlss.cpp), `Renderer::init`.
 
 ### Leaving a DLSS mode keeps ~326 MB of video memory
 After switching from a DLSS mode to Accumulation, the program uses ~326 MB more than when it starts in
@@ -708,3 +727,48 @@ Tried and dropped (2026-10-14):
 - Fix: a fog layer clean enough for that overlay (our own temporal and spatial filter on it), or the fog composited
   after DLSS.
 - Where: `tracePath` (the camera ray in fog), `recordDlss` (source/renderer/Dlss.cpp).
+
+## Engine and tools
+
+### Barriers are written by hand
+Each pass writes its own `vkCmdPipelineBarrier`s (~40); nothing tracks the images' and buffers' last use. A wrong
+stage mask once cost 1.8 ms, and a missing barrier shows only as an occasional wrong frame.
+- Checked: `--sync-validation` (the validation layer's synchronization checks) over 15 short benches, every render
+  mode, ReSTIR, fog, portals, the noise tool, captures, debug views, model loading (2026-10-15): two hazards in
+  one-time setup, fixed; nothing else of ours. Not covered: window resize, render-mode switches by hand, the basic
+  shader switched while running, model unloading.
+- Fix: a small helper for new passes (named barriers such as computeToCompute / transferToCompute, image layout
+  changes; per resource its last access, a pass declaring what it reads and writes, one batched barrier). Write it
+  with the first new pass that wants it, run that pass with `--sync-validation`; convert old passes only when they
+  are worked on anyway, each checked with sync validation and a timing bench (a wrong conversion costs time silently).
+- Where: the passes' record functions (source/renderer/*.cpp).
+
+### The renderer's parts hold references to each other's members
+`Renderer` is split into parts (GpuContext, GpuScene, RayTracer, RadianceCache, Dlss, ExposurePass, NoiseTool,
+DisplayPass, FrameCapture; Renderer.h). Each takes the renderer state it reads or sets as constructor references,
+and their data is public (other parts and `Renderer::stats` read it). So a part's dependencies are listed, but not
+enforced, and members must be declared in order: a part that binds to another's members comes after it.
+- Why: the split moved code without changing it (byte-identical images); tightening it was left for when a part is
+  worked on.
+- Fix: per part, what others read becomes accessors; references to other parts' members become arguments of the
+  calls that need them.
+
+### Benches: absolute camera paths, and frame times before 2026-10-16
+- A bench's camera path sets absolute positions every frame: the camera doesn't follow portals (each frame's
+  position undoes the jump).
+- `frameMs` (wall time) ended after the next frame's start until 2026-10-16: a capture on the last measured frame
+  put its PNG write in (sponza_dlaa read 21.3 ms, really 19.2). Wall times of such benches from older builds aren't
+  comparable; GPU times are.
+- Bistro at night isn't fully deterministic even in Accumulation without the radiance cache and with fixed exposure
+  (about 1 run in 4 differs, 0.05% of pixels, fireflies), in builds before the Renderer split too: byte-identical
+  checks use Sponza and the fog orb. Cause unknown (light tree build, load timing?).
+- Where: app/Bench.cpp, tools/bench.py.
+
+### The program needs the compiler's libstdc++ first on PATH
+Run from Git Bash (Git's mingw64/bin first on PATH), vulkanDemo.exe loads Git's libstdc++-6.dll and crashes at
+start without a message. tools/bench.py puts the build's compiler folder (from CMakeCache.txt) first; the tests
+executable is linked statically and doesn't care.
+- Fix: link vulkanDemo with `-static-libstdc++ -static-libgcc` too.
+
+### No precompiled header
+Measured: 0.6-0.7 s saved per file (15-20%: most of the time is optimizing, not parsing). Not worth it yet.

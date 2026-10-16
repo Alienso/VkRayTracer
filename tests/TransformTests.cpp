@@ -106,7 +106,7 @@ TEST_CASE("Portals: going through one end comes out of the other, turned half ar
 
 TEST_CASE("Portals: the camera walking through an opening comes out of the other end", "[Portal]") {
     TestAssets test;
-    Scene scene(test.assets);
+    Scene scene(test.assets, test.settings);
     scene.createDefault();
     scene.camera().position = {0, 1, 0};
     scene.camera().yaw = 0.0f;

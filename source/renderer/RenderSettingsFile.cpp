@@ -7,11 +7,11 @@
 #include <set>
 #include <nlohmann/json.hpp>
 #include "renderer/RenderSettingsFile.h"
-#include "renderer/RendererTypes.h"
+#include "renderer/RenderSettings.h"
 
 using Names = std::vector<const char*>;
 
-// The names of the choices, in the order of their values (the enums in Renderer.h)
+// The names of the choices, in the order of their values (the enums in RenderSettings.h)
 static const Names emissiveSamplingNames = {"BouncesOnly", "LightSampling", "Mis"};
 static const Names lightPickingNames = {"Power", "Tree"};
 static const Names skySamplingNames = {"Auto", "On", "Off"};
@@ -26,8 +26,21 @@ static const Names renderModeNames = {"Accumulation", "DlssDlaa", "DlssQuality",
 static const Names outputSizeNames = {"Window", "1080p", "1440p", "2160p"};  // Renderer::outputHeights
 static const Names dlssModelNames = {"TransformerF", "TransformerE", "TransformerD", "CnnA", "CnnB", "CnnC"};
 
-// A new field in RenderSettings changes its size: add it to the list below (and update the size here)
+// A new field in RenderSettings changes its size: add it to the list below (and update the size here), and to
+// programSettings if it isn't the scene's
 static_assert(sizeof(RenderSettings) == 252, "RenderSettings changed: add the new field to forEachSetting");
+
+// The program's fields (RenderSettingsFile.h); every other one is the scene's
+static const std::set<std::string> programSettings = {"samplesPerPixel", "accumulate", "debugView", "renderMode",
+                                                      "outputSize", "dlssModel"};
+
+SettingsScope settingScope(const std::string& name) {
+    return programSettings.count(name) ? SettingsScope::Program : SettingsScope::Scene;
+}
+
+static bool inScope(const char* name, SettingsScope scope) {
+    return scope == SettingsScope::All || settingScope(name) == scope;
+}
 
 // Calls visit(name, field) for every field, visit(name, field, names) for the choices
 template <typename Settings, typename Visitor>
@@ -122,10 +135,14 @@ namespace {
 
 struct Writer {
     nlohmann::ordered_json& json;
-    void operator()(const char* name, bool value) { json[name] = value; }
-    void operator()(const char* name, int value) { json[name] = value; }
-    void operator()(const char* name, float value) { json[name] = shortest(value); }
+    SettingsScope scope;
+    void operator()(const char* name, bool value) { if (inScope(name, scope)) json[name] = value; }
+    void operator()(const char* name, int value) { if (inScope(name, scope)) json[name] = value; }
+    void operator()(const char* name, float value) { if (inScope(name, scope)) json[name] = shortest(value); }
     void operator()(const char* name, int value, const Names& names) {
+        if (!inScope(name, scope)) {
+            return;
+        }
         if (value >= 0 && static_cast<size_t>(value) < names.size()) {
             json[name] = names[value];
         } else {
@@ -137,10 +154,14 @@ struct Writer {
 struct Reader {
     const nlohmann::json& json;
     std::vector<std::string>& problems;
+    SettingsScope scope;
     std::set<std::string> known;
 
-    // The field's value, or null if the object doesn't have it
+    // The field's value, or null if the object doesn't have it (or it is of the other scope)
     const nlohmann::json* find(const char* name) {
+        if (!inScope(name, scope)) {
+            return nullptr;
+        }
         known.insert(name);
         auto it = json.find(name);
         return it == json.end() ? nullptr : &*it;
@@ -191,25 +212,50 @@ struct Reader {
 
 }  // namespace
 
-nlohmann::ordered_json renderSettingsToJson(const RenderSettings& settings) {
+nlohmann::ordered_json renderSettingsToJson(const RenderSettings& settings, SettingsScope scope, bool onlyChanged) {
     nlohmann::ordered_json json = nlohmann::ordered_json::object();
-    Writer writer{json};
+    Writer writer{json, scope};
     forEachSetting(settings, writer);
+    if (onlyChanged) {
+        nlohmann::ordered_json defaults = renderSettingsToJson(RenderSettings{}, scope, false);
+        for (auto it = defaults.begin(); it != defaults.end(); ++it) {
+            if (json[it.key()] == it.value()) {
+                json.erase(it.key());
+            }
+        }
+    }
     return json;
 }
 
-std::vector<std::string> applyRenderSettingsJson(RenderSettings& settings, const nlohmann::json& json) {
+std::vector<std::string> applyRenderSettingsJson(RenderSettings& settings, const nlohmann::json& json,
+                                                 SettingsScope scope) {
     std::vector<std::string> problems;
     if (!json.is_object()) {
         problems.emplace_back("settings: expected an object");
         return problems;
     }
-    Reader reader{json, problems, {}};
+    Reader reader{json, problems, scope, {}};
     forEachSetting(settings, reader);
+    nlohmann::ordered_json all = renderSettingsToJson(settings);  // (for the names)
     for (auto it = json.begin(); it != json.end(); ++it) {
-        if (reader.known.count(it.key()) == 0) {
+        if (reader.known.count(it.key()) > 0) {
+            continue;
+        }
+        if (!all.contains(it.key())) {
             problems.push_back(it.key() + ": no such setting");
+        } else if (settingScope(it.key()) == SettingsScope::Program) {
+            problems.push_back(it.key() + ": the program's setting, not a scene's (ignored)");
+        } else {
+            problems.push_back(it.key() + ": a scene's setting, not the program's (ignored)");
         }
     }
     return problems;
+}
+
+void resetRenderSettings(RenderSettings& settings, SettingsScope scope) {
+    copyRenderSettings(settings, RenderSettings{}, scope);
+}
+
+void copyRenderSettings(RenderSettings& to, const RenderSettings& from, SettingsScope scope) {
+    applyRenderSettingsJson(to, renderSettingsToJson(from, scope), scope);  // (can't fail: every field, as written)
 }

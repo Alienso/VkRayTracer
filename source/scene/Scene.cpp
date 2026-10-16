@@ -14,6 +14,7 @@
 #include <glm/gtx/euler_angles.hpp>
 #include "assets/BuiltInModels.h"
 #include "core/Configuration.h"
+#include "renderer/RenderSettingsFile.h"
 
 glm::mat4 Transform::matrix() const {
     // Read right to left: scale, rotate, then move into place
@@ -60,7 +61,7 @@ static glm::mat4 withoutScale(glm::mat4 m) {
     return m;
 }
 
-Scene::Scene(AssetStore& assets) : assets(assets) {}
+Scene::Scene(AssetStore& assets, RenderSettings& settings) : assets(assets), settings(settings) {}
 
 void Scene::createDefault() {
     sceneCamera.position = {0.0f, 1.6f, 4.0f};
@@ -88,6 +89,7 @@ void Scene::clear() {
     sceneCamera = Camera();
     cameraTeleport = glm::mat4(1.0f);
     sceneEnvironment = SceneEnvironment();
+    resetRenderSettings(settings, SettingsScope::Scene);
     assets.resetEdits();
     layoutRevision++;
     createDefault();

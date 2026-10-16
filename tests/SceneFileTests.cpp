@@ -16,7 +16,7 @@ static const std::string lampBox = "Cornell box (blocks, point light)";
 namespace {  // (each test file has its own TestScene)
 
 struct TestScene : TestAssets {
-    Scene scene{assets};
+    Scene scene{assets, settings};
     TestScene() { scene.createDefault(); }
 
     void write(const std::string& name, const std::string& text) const {
@@ -64,7 +64,7 @@ TEST_CASE("Scene file: a saved scene reads back the same", "[SceneFile]") {
 
     std::string path = t.folder.file("scene.json");
     scene.save(path);
-    Scene loaded(t.assets);
+    Scene loaded(t.assets, t.settings);
     std::vector<std::string> warnings = loaded.load(path);
     CHECK(warnings.empty());
     CHECK(loaded.contentText() == scene.contentText());
@@ -102,7 +102,7 @@ TEST_CASE("Scene file: saving over a file replaces it", "[SceneFile]") {
     t.scene.save(path);
     t.scene.addEmpty("more", 0);
     t.scene.save(path);
-    Scene loaded(t.assets);
+    Scene loaded(t.assets, t.settings);
     loaded.load(path);
     CHECK(loaded.contentText() == t.scene.contentText());
     CHECK_FALSE(std::filesystem::exists(path + ".saving"));
@@ -124,7 +124,7 @@ TEST_CASE("Scene file: material and light edits are saved and put back on load",
 
     t.assets.resetEdits();
     REQUIRE(material.material.roughness == roughness);
-    Scene loaded(t.assets);
+    Scene loaded(t.assets, t.settings);
     CHECK(loaded.load(path).empty());
     CHECK(t.assets.materials()[model.firstMaterial + 1].material.roughness == 0.125f);
     CHECK_FALSE(t.assets.materials()[model.firstMaterial + 1].useBaseColorTexture);
@@ -202,7 +202,7 @@ TEST_CASE("Scene file: an unknown built-in model is refused without starting a l
 // The floor is made by Scene::createDefault; a scene file read into a store that hasn't made it yet must still get it
 TEST_CASE("Scene file: the floor loads into a store that hasn't made it yet", "[SceneFile]") {
     TestAssets test;
-    Scene scene(test.assets);
+    Scene scene(test.assets, test.settings);
     std::ofstream(test.folder.file("floor.json"))
             << header << R"("entities": [{"id": 1, "name": "Floor", "model": {"builtIn": "Floor"}}]})";
     CHECK(scene.load(test.folder.file("floor.json")).empty());
@@ -219,4 +219,68 @@ TEST_CASE("Scene file: a rotation typed in by hand is normalized", "[SceneFile]"
     glm::quat q = t.scene.find(1)->local.rotation;
     CHECK(glm::length(q) == Catch::Approx(1.0f));
     CHECK(q.y == Catch::Approx(1.0f));
+}
+
+TEST_CASE("Scene file: the scene's render settings are saved, only those that differ from the defaults", "[SceneFile][Settings]") {
+    TestScene t;
+    t.settings.exposure = 2.5f;
+    t.settings.maxBounces = 3;
+    t.settings.renderMode = static_cast<int>(RenderMode::DlssDlaa);  // the program's: not saved with the scene
+    std::string text = t.scene.contentText();
+    CHECK(text.find(R"("settings": {"maxBounces":3,"exposure":2.5})") != std::string::npos);
+    CHECK(text.find("renderMode") == std::string::npos);
+}
+
+TEST_CASE("Scene file: opening a scene sets its settings and the others to the defaults, not the program's", "[SceneFile][Settings]") {
+    TestScene t;
+    t.settings.exposure = 2.5f;
+    std::string path = t.folder.file("exposure.json");
+    t.scene.save(path);
+
+    t.settings.exposure = 1.0f;
+    t.settings.maxBounces = 3;  // not in the file: back to the default
+    t.settings.renderMode = static_cast<int>(RenderMode::DlssQuality);
+    t.settings.samplesPerPixel = 4;
+    CHECK(t.scene.load(path).empty());
+    CHECK(t.settings.exposure == 2.5f);
+    CHECK(t.settings.maxBounces == RenderSettings{}.maxBounces);
+    CHECK(t.settings.renderMode == static_cast<int>(RenderMode::DlssQuality));
+    CHECK(t.settings.samplesPerPixel == 4);
+}
+
+TEST_CASE("Scene file: a scene that can't be opened leaves the settings as they were", "[SceneFile][Settings]") {
+    TestScene t;
+    t.settings.exposure = 3.0f;
+    t.write("bad.json", std::string(header) + R"("settings": {"exposure": 9}, "entities": [{"id": 1}, {"id": 1}]})");
+    CHECK_THROWS(t.scene.load(t.folder.file("bad.json")));
+    CHECK(t.settings.exposure == 3.0f);
+}
+
+TEST_CASE("Scene file: settings that can't be read are skipped with a warning", "[SceneFile][Settings]") {
+    TestScene t;
+    t.write("odd.json", std::string(header) +
+                        R"("settings": {"exposure": "bright", "maxBounces": 2, "renderMode": "DlssDlaa", "nope": 1}})");
+    std::vector<std::string> warnings = t.scene.load(t.folder.file("odd.json"));
+    CHECK(warnings.size() == 3);  // the wrong type, the program's setting, the unknown one
+    CHECK(t.settings.maxBounces == 2);
+    CHECK(t.settings.exposure == RenderSettings{}.exposure);
+    CHECK(t.settings.renderMode == RenderSettings{}.renderMode);
+}
+
+TEST_CASE("Scene: a new scene starts from the default scene settings, the program's stay", "[Scene][Settings]") {
+    TestScene t;
+    t.settings.exposure = 2.0f;
+    t.settings.outputSize = 2;
+    t.scene.clear();
+    CHECK(t.settings.exposure == RenderSettings{}.exposure);
+    CHECK(t.settings.outputSize == 2);
+}
+
+TEST_CASE("Scene file: a changed setting is a change to save (the unsaved mark)", "[SceneFile][Settings]") {
+    TestScene t;
+    std::string before = t.scene.contentText();
+    t.settings.debugView = 3;  // the program's
+    CHECK(t.scene.contentText() == before);
+    t.settings.toneMapping = false;
+    CHECK(t.scene.contentText() != before);
 }

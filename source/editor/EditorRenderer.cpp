@@ -8,9 +8,29 @@
 #include <algorithm>
 #include <cmath>
 #include <imgui/imgui.h>
+#include <nlohmann/json.hpp>
 #include "editor/Editor.h"
+#include "renderer/RenderSettingsFile.h"
 
 void Editor::buildRenderingPanel() {
+    // What is the scene's here (saved with it) and what the program's (kept between runs)
+    size_t changed = renderSettingsToJson(settings, SettingsScope::Scene, true).size();
+    if (changed == 0) {
+        ImGui::TextDisabled("Scene settings: the defaults");
+    } else {
+        ImGui::TextDisabled("Scene settings: %zu changed from the defaults", changed);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##sceneSettings")) {
+            resetRenderSettings(settings, SettingsScope::Scene);
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Saved with the scene: everything on this panel and the renderer's parts of the Lighting\n"
+                          "panel, except the renderer, image size, DLSS model, Accumulate and samples per pixel (and\n"
+                          "the debug view): those are the program's, kept between runs. Opening a scene sets its\n"
+                          "settings, a new scene starts from the defaults.");
+    }
+
     ImGui::SeparatorText("Renderer");
     buildRenderModeUi();
     ImGui::BeginDisabled(stats.dlssActive);  // DLSS averages over time itself

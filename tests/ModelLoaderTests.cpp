@@ -108,7 +108,7 @@ TEST_CASE("AssetStore: a model file loads in the background, fitted to the stand
 TEST_CASE("Scene: new objects from files line up 0, +1, -1, +2 spacings along X", "[Scene][ModelLoader]") {
     TestAssets test;
     write(test.folder.file("tri.gltf"), triangleGltf(""));
-    Scene scene(test.assets);
+    Scene scene(test.assets, test.settings);
     scene.createDefault();
     std::vector<float> x;
     for (int i = 0; i < 4; i++) {

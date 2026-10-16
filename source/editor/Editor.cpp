@@ -9,9 +9,9 @@
 #include "editor/Editor.h"
 
 Editor::Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
-               RenderSettings& settings, const CpuFrameTimes& cpuTimes, Window& window)
+               RenderSettings& settings, const CpuFrameTimes& cpuTimes, UserSettings& userSettings, Window& window)
         : assets(assets), scene(scene), cameraController(cameraController), renderer(renderer), settings(settings),
-          cpuTimes(cpuTimes), window(window),
+          cpuTimes(cpuTimes), userSettings(userSettings), window(window),
           panels{{{"Outliner", true, &Editor::buildOutliner},
                   {"Details", true, &Editor::buildDetails},
                   {"Rendering", true, &Editor::buildRenderingPanel},

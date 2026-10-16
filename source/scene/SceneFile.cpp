@@ -7,6 +7,8 @@
 //   "portalPairsMade": 2,             for the next pair's name
 //   "camera": {"position": [x, y, z], "yaw": .., "pitch": .., "fov": ..},
 //   "environment": {"sunEnabled": .., ..., "background": "sky", "map": "file.hdr" or null, ...},
+//   "settings": {"exposure": 2.5, "maxBounces": 4},   the scene's render settings that differ from the defaults
+//                                     (RenderSettingsFile.h; the program's, like the render mode, aren't here)
 //   "entities": [                     parents before their children, children in their order
 //     {"id": 3, "name": "Helmet", "parent": 0, "position": [..], "rotation": [x, y, z, w], "scale": [..],
 //      "visible": false (only when hidden), "uniformScale": false (only when off),
@@ -42,6 +44,7 @@
 #include "scene/Scene.h"
 #include "assets/BuiltInModels.h"
 #include "assets/EditableFields.h"
+#include "renderer/RenderSettingsFile.h"
 
 using Json = nlohmann::ordered_json;
 
@@ -246,6 +249,7 @@ std::string Scene::toText(bool withCamera) const {
     environment["mapRotation"] = number(e.mapRotation);
     environment["mapIntensity"] = number(e.mapIntensity);
     document["environment"] = environment;
+    document["settings"] = renderSettingsToJson(settings, SettingsScope::Scene, true);
 
     Json entities = Json::array();
     std::vector<ModelHandle> models;  // the models shown, in the order of their first entity
@@ -544,7 +548,11 @@ std::vector<std::string> Scene::load(const std::string& path) {
 
     // Built into a scene of its own first: if anything goes wrong, this one stays as it is
     std::vector<std::string> warnings;
-    Scene loaded(assets);
+    // The file's render settings: the scene's fields from the file, the ones it doesn't have at their defaults. Read
+    // into a copy, taken over with the rest.
+    RenderSettings fileSettings = settings;
+    resetRenderSettings(fileSettings, SettingsScope::Scene);
+    Scene loaded(assets, fileSettings);
     try {
         // Entities: parents come before their children
         EntityId highest = 0;
@@ -687,6 +695,13 @@ std::vector<std::string> Scene::load(const std::string& path) {
                 loaded.setEnvironmentMap(map->get<std::string>());  // (a failure comes later, as a message)
             }
         }
+
+        // What can't be read is skipped (warned): settings don't decide whether the scene can be opened
+        if (auto s = document.find("settings"); s != document.end()) {
+            for (const std::string& problem : applyRenderSettingsJson(fileSettings, *s, SettingsScope::Scene)) {
+                warnings.push_back("settings: " + problem);
+            }
+        }
     } catch (...) {
         loaded.releaseAll();
         throw;
@@ -695,6 +710,7 @@ std::vector<std::string> Scene::load(const std::string& path) {
     // Read: this scene becomes the file's. Models both scenes show stay loaded (acquired again above first).
     releaseAll();
     takeFrom(loaded);
+    copyRenderSettings(settings, fileSettings, SettingsScope::Scene);
 
     // Model edits, on top of the files' materials and lights. An edit that no longer fits the model (the file
     // changed) is skipped. Models still loading get theirs when they arrive.

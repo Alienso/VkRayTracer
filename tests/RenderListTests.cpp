@@ -15,7 +15,7 @@ static const std::string lampBox = "Cornell box (blocks, point light)";
 namespace {  // (each test file has its own TestScene)
 
 struct TestScene : TestAssets {
-    Scene scene{assets};
+    Scene scene{assets, settings};
     RenderList list;
     TestScene() { scene.createDefault(); }
 

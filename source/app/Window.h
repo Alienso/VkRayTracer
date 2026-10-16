@@ -27,6 +27,11 @@ public:
     // Borderless fullscreen on the monitor it is on; off: the windowed position and size come back
     void setFullscreen(bool on);
     [[nodiscard]] bool isFullscreen() const { return fullscreen; }
+    void maximize() { glfwMaximizeWindow(window); }
+    // Maximized (when fullscreen: whether it was before), and its size when it is neither maximized nor fullscreen
+    // (what the user settings keep)
+    [[nodiscard]] bool isMaximized() const;
+    void windowedSize(int& width, int& height) const;
 
     // True once after the framebuffer changed size (dragging, maximizing, fullscreen), then false until it changes again
     bool takeResized();

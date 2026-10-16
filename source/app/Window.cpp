@@ -32,6 +32,19 @@ void Window::closeCallback(GLFWwindow* window) {
     }
 }
 
+bool Window::isMaximized() const {
+    return fullscreen ? windowedMaximized : glfwGetWindowAttrib(window, GLFW_MAXIMIZED) == GLFW_TRUE;
+}
+
+void Window::windowedSize(int& width, int& height) const {
+    if (fullscreen) {
+        width = windowedWidth;  // (saved un-maximized when it went fullscreen)
+        height = windowedHeight;
+    } else {
+        glfwGetWindowSize(window, &width, &height);
+    }
+}
+
 bool Window::takeResized() {
     bool was = resized;
     resized = false;

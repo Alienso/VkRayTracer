@@ -51,7 +51,8 @@ add_library(vulkanDemoCore STATIC
         source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
         source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/EditableFields.h source/assets/ModelLoader.cpp
         source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
-        source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h
+        source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h source/renderer/RenderSettings.h
+        source/app/UserSettings.cpp source/app/UserSettings.h
         source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
         source/core/RangeAllocator.h source/core/DeferredDeletion.h
         include/cgltf/cgltf.h)
@@ -99,7 +100,7 @@ add_executable(tests
         include/catch2/catch_amalgamated.cpp include/catch2/catch_amalgamated.hpp
         tests/TestHelpers.h tests/RangeAllocatorTests.cpp tests/DeferredDeletionTests.cpp tests/AssetStoreTests.cpp
         tests/SceneTreeTests.cpp tests/RenderListTests.cpp tests/SceneFileTests.cpp tests/RenderSettingsFileTests.cpp
-        tests/TransformTests.cpp tests/ModelLoaderTests.cpp)
+        tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_link_libraries(tests vulkanDemoCore -static-libgcc -static-libstdc++)
