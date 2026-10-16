@@ -30,8 +30,8 @@ void CameraController::update(Camera& camera, GLFWwindow* window, float deltaTim
         lastCursorY = y;
     }
 
-    // While looking around, the keyboard belongs to the camera even if ImGui has focus.
-    if (!keyboardAvailable && !looking) {
+    // Only while looking around; then the keyboard belongs to the camera even if ImGui has focus
+    if (!looking) {
         return;
     }
 

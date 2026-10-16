@@ -12,6 +12,7 @@
 #include <tuple>
 #include <imgui/imgui.h>
 #include <nlohmann/json.hpp>
+#include <imguizmo/ImGuizmo.h>
 #include "editor/Editor.h"
 #include "assets/BuiltInModels.h"
 
@@ -162,6 +163,9 @@ void Editor::buildEntityNode(EntityId id, TreeEdit& edit) {
     if (id == selected) {
         flags |= ImGuiTreeNodeFlags_Selected;
     }
+    if (revealSelected && id != selected && scene.isUnder(selected, id)) {
+        ImGui::SetNextItemOpen(true);  // (picked in the image: show where it is)
+    }
     const ModelComponent* component = scene.model(id);
     const char* state = component == nullptr     ? ""
                         : component->loading     ? "  (loading)"
@@ -170,6 +174,10 @@ void Editor::buildEntityNode(EntityId id, TreeEdit& edit) {
     // The id keeps entities with the same name apart
     bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(id)), flags, "%s%s%s",
                                   entity.name.c_str(), entity.visible ? "" : "  (hidden)", state);
+    if (revealSelected && id == selected) {
+        ImGui::SetScrollHereY();
+        revealSelected = false;
+    }
     if ((ImGui::IsItemClicked(ImGuiMouseButton_Left) || ImGui::IsItemClicked(ImGuiMouseButton_Right)) &&
         !ImGui::IsItemToggledOpen()) {
         selected = id;
@@ -252,9 +260,11 @@ void Editor::buildEntityUi(EntityId id) {
 
     ImGui::Separator();
     if (ImGui::Button("Reset transform")) {
+        Transform before = entity.local;
         entity.local.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         entity.local.scale = glm::vec3(1.0f);
         entity.local.position.y = 0.0f;
+        transformHistory.record(id, before, entity.local);
     }
     ImGui::SameLine();
     if (ImGui::Button("+ Game")) {
@@ -282,9 +292,19 @@ void Editor::buildEntityUi(EntityId id) {
     ImGui::PopID();
 }
 
+// A transform field taken hold of / let go after a change: one change for undo
+#define RECORD_TRANSFORM_EDIT()                                                       \
+    if (ImGui::IsItemActivated()) {                                                   \
+        detailsBefore = local;                                                        \
+    }                                                                                 \
+    if (ImGui::IsItemDeactivatedAfterEdit()) {                                        \
+        transformHistory.record(entity.id, detailsBefore, local);                     \
+    }
+
 void Editor::buildTransformUi(Entity& entity) {
     Transform& local = entity.local;
     ImGui::DragFloat3("Position", &local.position.x, 0.01f);
+    RECORD_TRANSFORM_EDIT()
 
     if (eulerEntity != entity.id || local.rotation != eulerRotation) {
         eulerEntity = entity.id;
@@ -295,6 +315,7 @@ void Editor::buildTransformUi(Entity& entity) {
         local.rotation = eulerToQuat(eulerDegrees);
         eulerRotation = local.rotation;
     }
+    RECORD_TRANSFORM_EDIT()
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
@@ -307,12 +328,16 @@ void Editor::buildTransformUi(Entity& entity) {
         if (ImGui::DragFloat("Scale", &scale, 0.01f, 0.01f, 100.0f)) {
             local.scale = glm::vec3(scale);
         }
+        RECORD_TRANSFORM_EDIT()
     } else {
         ImGui::DragFloat3("Scale", &local.scale.x, 0.01f, 0.01f, 100.0f);
+        RECORD_TRANSFORM_EDIT()
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Uniform", &entity.uniformScale) && entity.uniformScale) {
+        Transform before = local;
         local.scale = glm::vec3(local.scale.x);
+        transformHistory.record(entity.id, before, local);
     }
 }
 
@@ -747,4 +772,42 @@ void Editor::buildGameUi(EntityId id) {
     if (changed) {
         scene.setGame(id, std::move(components));
     }
+}
+
+// A left click on the image (not on a panel, not while looking around with the right button) asks for a pick
+void Editor::handleImageClicks() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse || ImGui::IsMouseDown(ImGuiMouseButton_Right) || !ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+        ImGuizmo::IsOver() || ImGuizmo::IsUsing()) {
+        return;
+    }
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) {
+        return;
+    }
+    pickMouse = glm::vec2(io.MousePos.x, io.MousePos.y);
+    pickRequest = pickMouse / glm::vec2(io.DisplaySize.x, io.DisplaySize.y);
+}
+
+std::optional<glm::vec2> Editor::takePickRequest() {
+    std::optional<glm::vec2> request = pickRequest;
+    pickRequest.reset();
+    return request;
+}
+
+void Editor::picked(EntityId hit) {
+    bool samePlace = glm::distance(pickMouse, lastPickMouse) <= 4.0f;
+    lastPickMouse = pickMouse;
+    if (hit == 0 || scene.find(hit) == nullptr) {
+        selected = 0;  // the sky, or something that isn't an entity's (a portal's rim): nothing selected
+        return;
+    }
+    // Clicked again where the selection is (it or something under it): its parent, and from the top back to what
+    // was hit (a door's panel, the door, the wall, the panel again)
+    if (samePlace && selected != 0 && scene.find(selected) != nullptr && scene.isUnder(hit, selected)) {
+        EntityId parent = scene.find(selected)->parent;
+        selected = parent != 0 ? parent : hit;
+    } else {
+        selected = hit;
+    }
+    revealSelected = true;
 }

@@ -55,6 +55,14 @@ struct InstanceRange {
     uint32_t count;
 };
 
+// A box in the world: [min, max] in its own space, placed by transform (the editor's selection: where its outline
+// can be on the image)
+struct WorldBox {
+    glm::mat4 transform;
+    glm::vec3 min;
+    glm::vec3 max;
+};
+
 class RenderList {
 public:
     std::vector<RenderInstance> instances;
@@ -78,6 +86,32 @@ public:
     [[nodiscard]] const std::vector<InstanceRange>& changedInstances() const { return changed; }
     // Some motion changed in this build (or the revision went up)
     [[nodiscard]] bool motionsChanged() const { return motionChanged; }
+
+    // The model entity whose parts instance i is (0: none, e.g. a portal rim's bar)
+    [[nodiscard]] uint64_t entityOfInstance(uint32_t instance) const {
+        for (const BuiltEntity& entity : builtEntities) {
+            if (instance >= entity.range.first && instance - entity.range.first < entity.range.count) {
+                return entity.id;
+            }
+        }
+        return 0;
+    }
+    // The instances of the entities for which selected(id) is true, as ranges (merged where they meet: an entity
+    // and the ones under it are next to each other, in tree order)
+    template <typename Selected> [[nodiscard]] std::vector<InstanceRange> instanceRanges(Selected&& selected) const {
+        std::vector<InstanceRange> ranges;
+        for (const BuiltEntity& entity : builtEntities) {
+            if (entity.range.count == 0 || !selected(entity.id)) {
+                continue;
+            }
+            if (!ranges.empty() && ranges.back().first + ranges.back().count == entity.range.first) {
+                ranges.back().count += entity.range.count;
+            } else {
+                ranges.push_back(entity.range);
+            }
+        }
+        return ranges;
+    }
 
 private:
     friend class Scene;

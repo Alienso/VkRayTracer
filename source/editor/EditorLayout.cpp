@@ -139,6 +139,42 @@ void Editor::buildMenuBar() {
         }
         ImGui::EndMenu();
     }
+    // The handles' tool and axes (the keys: EditorGizmo.cpp)
+    if (ImGui::BeginMenu("Tools")) {
+        if (ImGui::MenuItem("Select only", "Q", gizmoTool == GizmoTool::None)) {
+            gizmoTool = GizmoTool::None;
+        }
+        if (ImGui::MenuItem("Move", "W", gizmoTool == GizmoTool::Move)) {
+            gizmoTool = GizmoTool::Move;
+        }
+        if (ImGui::MenuItem("Rotate", "E", gizmoTool == GizmoTool::Rotate)) {
+            gizmoTool = GizmoTool::Rotate;
+        }
+        if (ImGui::MenuItem("Scale", "R", gizmoTool == GizmoTool::Scale)) {
+            gizmoTool = GizmoTool::Scale;
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Local axes", "X", &gizmoLocal);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Frame the selection", "F", false, scene.find(selected) != nullptr)) {
+            frameSelection();
+        }
+        if (ImGui::MenuItem("Undo transform", "Ctrl+Z", false, transformHistory.canUndo())) {
+            undoTransform();
+        }
+        if (ImGui::MenuItem("Redo transform", "Ctrl+Y", false, transformHistory.canRedo())) {
+            redoTransform();
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("Click the image to select; again to select its parent.");
+        ImGui::TextDisabled("Hold Ctrl while dragging a handle to snap. Ctrl+D duplicates, Esc deselects,");
+        ImGui::TextDisabled("Delete deletes. Hold the right mouse button to fly (W/A/S/D, Space, Shift).");
+        ImGui::EndMenu();
+    }
+    const char* toolNames[] = {"Select", "Move", "Rotate", "Scale"};
+    ImGui::TextDisabled("%s%s", toolNames[static_cast<int>(gizmoTool)],
+                        gizmoTool == GizmoTool::None || gizmoTool == GizmoTool::Scale ? "" : gizmoLocal ? " (local)" : " (world)");
+
     bool wasPlaying = playing;  // (clicking changes playing: the color is pushed and popped by what it was)
     if (wasPlaying) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.0f, 0.5f, 1.0f));

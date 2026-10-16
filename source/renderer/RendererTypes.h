@@ -241,8 +241,9 @@ struct DisplayPushConstants {
     float grainStrength;    // fog grain: 0 = off
     float grainSize;        // output pixels
     uint32_t frame;
+    glm::ivec4 outlineRect;  // the editor's selection: where its mask is (SelectionPass::outlineRect); empty: none
 };
-static_assert(sizeof(DisplayPushConstants) == 32, "DisplayPushConstants must match the push constants in shaders/display.comp");
+static_assert(sizeof(DisplayPushConstants) == 48, "DisplayPushConstants must match the push constants in shaders/display.comp");
 
 // Must match the push constants in shaders/noise.comp
 struct NoisePushConstants {

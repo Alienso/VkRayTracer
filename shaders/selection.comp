@@ -1,0 +1,102 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+// The editor's selection (renderer/Selection.cpp): camera rays against the scene, stopping at the first surface the
+// way the path tracer's do (cut-outs, invisible surfaces passed), without shading anything.
+//   Mode 0, the outline's mask: one thread per output pixel of a rectangle (where the selection is on the image):
+//           1 where the first surface belongs to one of the selected instance ranges, else 0. The display pass draws
+//           the outline around the 1s.
+//   Mode 1, a pick: one thread, the ray through the clicked point: the instance it hits (or none) into the pick
+//           buffer's slot of this frame, read back once the frame is done.
+// Not through portals: a ray stops at what is behind an opening in the scene's own space.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// What tracing.glsl expects from raytrace.comp: the trace shader's constants, set so the traversal decides cut-outs
+// and passes invisible surfaces (fog boxes) like a camera ray
+const uint CACHE_UPDATE_PASS = 0;
+const uint RESTIR_PASS = 0;
+const uint FOG = 1;
+const uint FEATURES = ~0u;
+const bool FEATURE_PORTALS = true;
+const bool FEATURE_LAMPS = true;
+const bool FEATURE_GLASS = true;
+const bool FEATURE_CUTOUTS = true;
+const bool FEATURE_DIFFUSE_TRANSMISSION = true;
+const uint PATH_RAY_FLAGS = gl_RayFlagsNoneEXT;
+const uint SHADOW_RAY_FLAGS = gl_RayFlagsNoneEXT;
+
+#include "raytrace/bindings.glsl"
+#include "raytrace/random.glsl"
+#include "raytrace/tracing.glsl"
+
+// Set 1: the selection's own
+layout(set = 1, binding = 0, r8) uniform writeonly image2D selectionMask;  // output size
+layout(set = 1, binding = 1, scalar) readonly buffer SelectedRanges { uvec2 selectedRanges[]; };  // first, count
+layout(set = 1, binding = 2, scalar) buffer PickResults { uvec4 pickResults[]; };  // per frame slot: hit, instance
+
+// Must match SelectionPushConstants in Selection.cpp
+layout(push_constant) uniform SelectionPush {
+    vec4 origin;    // the camera's position
+    vec4 forward;   // its forward axis
+    vec4 right;     // its right axis * tan(fov / 2) * aspect ratio: ndc.x 1 is the image's right edge
+    vec4 up;        // its up axis * tan(fov / 2)
+    ivec4 rect;     // mode 0: the pixels to do, x0, y0, x1, y1 (x1, y1 not included)
+    vec2 pickPoint; // mode 1: the point on the output image, in pixels
+    uint mode;
+    uint rangeCount;
+    uvec2 outputSize;
+    uint pickSlot;
+} push;
+
+vec3 rayDirection(vec2 pixelPosition) {
+    vec2 ndc = pixelPosition / vec2(push.outputSize) * 2.0 - 1.0;  // image y goes down, the camera's up goes up
+    return normalize(push.forward.xyz + ndc.x * push.right.xyz - ndc.y * push.up.xyz);
+}
+
+// The instance the first surface along the ray belongs to; false: nothing
+bool firstHit(vec2 pixelPosition, out uint instance) {
+    uint seed = uint(pixelPosition.x) * 1973u + uint(pixelPosition.y) * 9277u;  // (see-through blend surfaces)
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, tlas, PATH_RAY_FLAGS, 0xFF, push.origin.xyz, 0.0, rayDirection(pixelPosition),
+                          RAY_FAR);
+    traverse(rayQuery, seed, false, uvec4(~0u));
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        return false;
+    }
+    instance = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true);
+    return true;
+}
+
+bool selected(uint instance) {
+    for (uint i = 0; i < push.rangeCount; i++) {
+        uvec2 range = selectedRanges[i];
+        if (instance >= range.x && instance - range.x < range.y) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void main() {
+    if (push.mode == 1) {
+        if (gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0) {
+            uint instance = 0;
+            bool hit = firstHit(push.pickPoint, instance);
+            pickResults[push.pickSlot] = uvec4(hit ? 1u : 0u, instance, 0u, 0u);
+        }
+        return;
+    }
+    ivec2 pixel = push.rect.xy + ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= push.rect.z || pixel.y >= push.rect.w) {
+        return;
+    }
+    uint instance = 0;
+    bool inside = firstHit(vec2(pixel) + 0.5, instance) && selected(instance);
+    imageStore(selectionMask, pixel, vec4(inside ? 1.0 : 0.0));
+}

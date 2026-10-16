@@ -28,6 +28,7 @@
 #include "renderer/Display.h"
 #include "renderer/RadianceCache.h"
 #include "renderer/RayTracer.h"
+#include "renderer/Selection.h"
 #include "renderer/Dlss.h"
 #include "core/Configuration.h"
 
@@ -95,6 +96,15 @@ public:
     [[nodiscard]] double dlssMemoryMegabytes() const { return dlss.memoryMegabytes(); }  // 0 if it can't tell
     // RenderSettings::outputSize -> rows of the output image (0: the window's)
     static constexpr uint32_t outputHeights[] = {0, 1080, 1440, 2160};
+
+    // The editor's selection (Selection.h). A click at point (0..1 over the image, from the top left): its answer
+    // (the instance hit, for the render list of that revision) from takePick a frame or two later.
+    void requestPick(glm::vec2 point, uint64_t instanceRevision) { selection.requestPick(point, instanceRevision); }
+    std::optional<PickResult> takePick() { return selection.takePick(); }
+    // The instances to outline and the boxes around them in the world (both empty: no outline). Every frame.
+    void setSelection(std::vector<InstanceRange> ranges, std::vector<WorldBox> boxes) {
+        selection.setSelection(std::move(ranges), std::move(boxes));
+    }
 
     // The window's framebuffer changed size: the swapchain is remade after this frame
     void resize() { framebufferResized = true; }
@@ -197,12 +207,15 @@ private:
                     resetAccumulation, cache.cacheQueriesSuspended, dlssReset, lastPassTimes,
                     [this]() { return displayedHdrView(); }, [this]() { return dlssActive(); },
                     [this]() { vkp.deviceWaitIdle(gpu.device); }};
+    // The editor's picks and selection outline (Selection.h), through the trace pass's descriptor set
+    SelectionPass selection{gpu, trace, outputExtent, currentFrame};
     // Display pass (Display.h): exposure + tone mapping into an 8-bit image at output size, blitted to the swapchain
     DisplayPass display{gpu, settings, swapChainImageFormat, outputExtent, renderExtent, fogLevel, frameNumber,
                         trace.perPixelBuffers, exposure.exposureBuffer, trace.radianceImageView,
                         trace.linearDepthImage, trace.motionVectorImage, trace.diffuseAlbedoImage,
                         trace.specularAlbedoImage, trace.normalRoughnessImage, trace.specularHitDistanceImage,
-                        trace.guideHistoryImage, [this]() { return displayedHdrView(); }};
+                        trace.guideHistoryImage, selection.maskImage, selection.outlineRect,
+                        [this]() { return displayedHdrView(); }};
     // Frame capture (Capture.h): the display image of a frame as a PNG
     FrameCapture capture{gpu, inFlightFences, currentFrame, display.displayImage, outputExtent};
 

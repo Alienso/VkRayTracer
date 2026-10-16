@@ -55,6 +55,8 @@ struct SceneModel {
     std::vector<SceneMaterial> fileMaterials;
     std::vector<PunctualLight> fileLights;
     glm::mat4 fit = glm::mat4(1.0f);  // scales the model to a standard size and stands it on y = 0 (unless originalSize)
+    glm::vec3 boundsMin = glm::vec3(0.0f);  // around all its parts, in the file's space (before fit)
+    glm::vec3 boundsMax = glm::vec3(0.0f);
     // The model's meshes, materials and textures are these ranges of the store's lists (they move down when an
     // earlier model is unloaded)
     uint32_t firstMesh = 0;

@@ -824,3 +824,33 @@ The Details panel edits a component's properties as JSON text; it doesn't know t
 ### An older build drops game components
 The scene file's version stayed 1 (`"game"` is a new optional field): a build from before game components opens a
 newer scene without complaint, and saving it there drops them.
+
+## Editor
+
+### Clicking selects whole entities
+A click selects the model entity whose part was hit: in Sponza or Bistro (one model each) that is the whole scene.
+The pick knows the part (the TLAS instance), so selecting a part (to hide it, or see its material) could follow.
+Clicking a portal's rim selects nothing (the rims' bars aren't entities').
+- Where: Application::updateSelection, RenderList::entityOfInstance.
+
+### Picks and the outline don't go through portals
+The selection's rays stop at the first surface in the scene's own space: what is seen through a portal opening is
+neither clickable nor outlined there (the click selects what is behind the opening's plane instead).
+- Fix: follow the openings in shaders/selection.comp as intersectClosest does.
+
+### The outline's cost grows with what it covers
+It traces a first-hit ray per output pixel inside the rectangle the selection covers on the image (0.07 ms for
+the display pass with it, the helmet selected). A selection covering the whole image (all of Jungle Ruins, its
+alpha-tested plants) traces the whole image once more per frame: not measured.
+- Fix if it shows: trace it at a lower resolution, or only when the camera or the selection changed.
+
+### Undo covers transforms only
+Ctrl+Z / Ctrl+Y undo and redo moves, turns and scales (handles, the Details panel's fields, Reset transform).
+Adding, deleting (Delete has no undo), duplicating, re-parenting, materials, components and settings aren't
+undone. The history is cleared when another scene opens and at Play and Stop.
+- Fix: a general undo, e.g. scene snapshots (Scene::text, as Play keeps) per change, cheap enough for small scenes.
+
+### Handles under a scaled, turned parent
+A handle works in the world and the result is turned back into the entity's own transform. Under a parent that is
+scaled differently along its axes and turned, the entity's transform can't hold what the handle did exactly
+(it would need shear): rotating or scaling there drifts slightly from what the handle showed.

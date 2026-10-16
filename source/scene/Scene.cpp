@@ -412,6 +412,23 @@ bool Scene::visibleInWorld(EntityId id) const {
     return true;
 }
 
+std::vector<WorldBox> Scene::selectionBoxes(EntityId id) const {
+    std::vector<WorldBox> boxes;
+    if (find(id) == nullptr) {
+        return boxes;
+    }
+    for (EntityId e : subtree(id)) {
+        const ModelComponent* component = model(e);
+        if (component == nullptr || !assets.isLoaded(component->model) || !visibleInWorld(e)) {
+            continue;
+        }
+        const SceneModel& sceneModel = assets.model(component->model);
+        glm::mat4 placed = worldTransform(e) * (component->originalSize ? glm::mat4(1.0f) : sceneModel.fit);
+        boxes.push_back({placed, sceneModel.boundsMin, sceneModel.boundsMax});
+    }
+    return boxes;
+}
+
 ModelComponent* Scene::model(EntityId id) {
     auto it = modelTable.find(id);
     return it == modelTable.end() ? nullptr : &it->second;

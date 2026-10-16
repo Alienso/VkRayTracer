@@ -164,8 +164,15 @@ general engine: one game, in C++, whose behaviours are listed in `source/game/Ga
    - `--play`: start playing the game once the scene is open (see Game logic)
    - `--bench <file.json>` (and `--bench-out <dir>`): run a bench and exit, see below
 
-Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
-for fullscreen, F1 to hide the UI, Ctrl+S to save the scene, F5 to play / stop, E to open a door while playing.
+Controls (as in Unity and Unreal):
+- Flying: hold the right mouse button to look around; while it is held, W/A/S/D move, Space/Shift up and down, Ctrl
+  faster.
+- Selecting: click an object in the image (outlined in orange); click the same spot again to select its parent
+  (a door's panel, the door, the wall). Esc selects nothing.
+- Handles on the selection: Q none, W move, E rotate, R scale, X world / local axes; hold Ctrl while dragging to
+  snap. F frames the selection, Ctrl+D duplicates, Delete deletes, Ctrl+Z / Ctrl+Y undo / redo a transform change
+  (the Tools menu lists them).
+- F11 fullscreen, F1 hides the UI, Ctrl+S saves the scene, F5 plays / stops, E opens a door while playing.
 
 ## Benches
 
@@ -189,4 +196,5 @@ measurement), Bistro at night, Jungle Ruins, the fog orb and two rooms joined by
 
 The editor's panels (Outliner, Details, Rendering, Lighting, ...) dock around the image and can be dragged into other
 places, tabbed together or closed; View > Reset layout puts them back. The layout is kept in `imgui.ini` next to the
-program. The UI is Dear ImGui (docking branch, include/imgui, MIT license).
+program. The UI is Dear ImGui (docking branch, include/imgui, MIT license); the move / rotate / scale handles
+are ImGuizmo (include/imguizmo, MIT license).

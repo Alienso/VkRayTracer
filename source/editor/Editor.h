@@ -8,6 +8,7 @@
 #define VULKANDEMO_EDITOR_H
 
 #include <array>
+#include <optional>
 #include <string>
 #include "assets/AssetStore.h"
 #include "app/CameraController.h"
@@ -16,6 +17,7 @@
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 #include "app/Window.h"
+#include "editor/TransformHistory.h"
 
 class Editor {
 public:
@@ -43,6 +45,12 @@ public:
     void play();
     void stop();
     [[nodiscard]] bool isPlaying() const { return playing; }
+    // Selecting in the image (EditorScene.cpp). The selected entity (0: none), outlined in the image.
+    [[nodiscard]] EntityId selectedEntity() const { return selected; }
+    // A click on the image to pick at (0..1 over it, from the top left): the program asks the renderer
+    std::optional<glm::vec2> takePickRequest();
+    // What the click hit: the model entity (0: nothing). Selects it; clicking the same spot again goes up its parents.
+    void picked(EntityId hit);
     // View > "Blend game steps": things the game moves are shown between its steps (StepInterpolation)
     [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
     // What the game says over the image while playing ("Pickups: 2 / 5"; "": nothing)
@@ -50,6 +58,7 @@ public:
     // A warning for the Log panel (from outside the editor: reading the user settings)
     void warn(const std::string& text) { log(LogLevel::Warning, text); }
     void info(const std::string& text) { log(LogLevel::Info, text); }
+    [[nodiscard]] bool showsUi() const { return !uiHidden; }  // F1 hides it (and the selection outline)
 
 private:
     AssetStore& assets;
@@ -84,6 +93,21 @@ private:
 
     // Outliner and Details (EditorScene.cpp)
     EntityId selected = 0;  // 0: none
+    std::optional<glm::vec2> pickRequest;  // a click waiting for the renderer
+    glm::vec2 pickMouse = glm::vec2(-1.0f);  // where it was (window pixels)
+    glm::vec2 lastPickMouse = glm::vec2(-1.0f);  // the click before: the same place again goes up the parents
+    bool revealSelected = false;  // the Outliner opens the selected entity's parents and scrolls to it once
+    // The handles on the selection (EditorGizmo.cpp)
+    enum class GizmoTool { None, Move, Rotate, Scale };
+    GizmoTool gizmoTool = GizmoTool::Move;
+    bool gizmoLocal = false;  // move and rotate along the entity's own axes (else the world's)
+    bool gizmoDragging = false;
+    EntityId gizmoDragEntity = 0;
+    Transform gizmoDragBefore;
+    // Undo / redo of transform changes; the Details panel's transform fields record into it too (the value when a
+    // field was taken hold of)
+    TransformHistory transformHistory;
+    Transform detailsBefore;
     // The selected entity's rotation as the editor shows it (degrees): kept between frames, not recomputed from the
     // quaternion while it is being edited, so the angles don't jump (a rotation has several Euler forms). Recomputed
     // when another entity is selected or the rotation was changed elsewhere.
@@ -176,6 +200,14 @@ private:
     void buildOutliner();
     void buildDetails();
     void buildEntityTree();
+    void handleImageClicks();  // picks, from build()
+    // EditorGizmo.cpp
+    void buildGizmo();
+    void finishGizmoDrag();
+    void frameSelection();
+    void handleEditorKeys();
+    void undoTransform();
+    void redoTransform();
     void buildEntityNode(EntityId id, TreeEdit& edit);
     void buildEntityUi(EntityId id);
     void buildTransformUi(Entity& entity);

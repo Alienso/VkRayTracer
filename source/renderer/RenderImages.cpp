@@ -79,6 +79,8 @@ VkImageView Renderer::displayedHdrView() const {
 
 void Renderer::createDisplayImages() {
     display.createDisplayImage();
+    selection.createMaskImage();
+    selection.updateDescriptorSet();  // (before createResources: it writes the set then)
 
     // DLSS modes: where DLSS writes the denoised, upscaled frame. Stays in GENERAL.
     if (dlssActive()) {
@@ -102,6 +104,7 @@ void Renderer::createDisplayImages() {
 
 void Renderer::destroyDisplayImages() {
     display.destroyDisplayImage();
+    selection.destroyMaskImage();
     if (dlssOutputImage.image != VK_NULL_HANDLE) {
         gpu.destroyImage(dlssOutputImage);
     }

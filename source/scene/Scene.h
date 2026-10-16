@@ -161,6 +161,9 @@ public:
     [[nodiscard]] glm::mat4 worldTransform(EntityId id) const;
     // Visible, and so are all its parents
     [[nodiscard]] bool visibleInWorld(EntityId id) const;
+    // Boxes around the models shown by the entity and everything under it (those visible in the world, loaded), in
+    // the world: where the editor's selection outline can be on the image
+    [[nodiscard]] std::vector<WorldBox> selectionBoxes(EntityId id) const;
 
     // The entity's components, or nullptr. Pointers stay valid while the component exists.
     ModelComponent* model(EntityId id);

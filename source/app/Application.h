@@ -90,6 +90,8 @@ private:
     void saveUserSettingsIfChanged();
     // This frame's keyboard and mouse for the game; a device the editor uses (ImGui) reads as idle
     InputState readInput(bool keyboard, bool mouse);
+    // The editor's selection to the renderer (its outline), its clicks to the renderer and their answers back
+    void updateSelection();
     // Starts or stops the game as the editor plays or stops, and runs this frame's steps
     void updateGame(float deltaTime, const InputState& input);
 };

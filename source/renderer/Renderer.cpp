@@ -50,6 +50,7 @@ void Renderer::init(GLFWwindow* targetWindow, const RenderList& list) {
     trace.createRayTracingDescriptors();
     trace.createRayTracingPipeline();
     display.createDisplayResources();  // reads the radiance image and the exposure buffer
+    selection.createResources();  // binds the trace pass's descriptor set layout
     createTimestampQueries();
 
     initImGui();

@@ -38,7 +38,11 @@ layout(push_constant) uniform DisplaySettings {
     float grainStrength;  // fog grain: 0 = off, else how far it moves a pixel's brightness (see fogGrain)
     float grainSize;      // in output pixels
     uint frame;           // a new grain pattern every frame
+    ivec4 outlineRect;    // the editor's selection: where selectionMask was written (x0, y0, x1, y1); empty: none
 } display;
+
+// The editor's selection (shaders/selection.comp): 1 where the first surface is selected, inside outlineRect
+layout(binding = 11, r8) uniform readonly image2D selectionMask;
 
 // Must match DisplayView in Renderer.h
 const uint VIEW_COLOR = 0;
@@ -154,6 +158,31 @@ vec3 fogGrain(vec3 color, ivec2 pixel, ivec2 renderPixel) {
     return clamp(color * (1.0 + display.grainStrength * fog * noise), 0.0, 1.0);
 }
 
+float selectedAt(ivec2 pixel) {
+    ivec4 r = display.outlineRect;
+    if (pixel.x < r.x || pixel.y < r.y || pixel.x >= r.z || pixel.y >= r.w) {
+        return 0.0;
+    }
+    return imageLoad(selectionMask, pixel).r;
+}
+
+// The selection's outline: 2 pixels wide just outside the selected pixels (none: 0)
+float outlineAt(ivec2 pixel) {
+    ivec4 r = display.outlineRect;
+    if (r.x >= r.z || pixel.x < r.x - 2 || pixel.y < r.y - 2 || pixel.x >= r.z + 2 || pixel.y >= r.w + 2 ||
+        selectedAt(pixel) > 0.5) {
+        return 0.0;
+    }
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            if (abs(x) + abs(y) <= 2 && (x != 0 || y != 0) && selectedAt(pixel + ivec2(x, y)) > 0.5) {
+                return 1.0;
+            }
+        }
+    }
+    return 0.0;
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(displayImage);
@@ -178,6 +207,9 @@ void main() {
         if (display.grainStrength > 0.0) {
             color = fogGrain(color, pixel, renderPixel);
         }
+    }
+    if (outlineAt(pixel) > 0.0) {
+        color = vec3(1.0, 0.33, 0.02);  // orange (linear)
     }
     // Linear values; values above 1 are clamped when stored as 8 bit. The blit to the sRGB swapchain encodes them.
     imageStore(displayImage, pixel, vec4(color, 1.0));

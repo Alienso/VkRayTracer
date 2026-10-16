@@ -263,6 +263,7 @@ SceneUniforms Renderer::buildSceneUniforms() {
 void Renderer::recordFrame(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
     VkImageSubresourceRange colorRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     readTimestamps();
+    selection.readPick();  // (this slot's fence was waited: a pick it traced last time is in)
     vkCmdResetQueryPool(commandBuffer, timestampQueryPool, currentFrame * timestampsPerFrame, timestampsPerFrame);
 
     // Lights uploaded this frame may have new indices: ReSTIR can't reuse last frame's samples then. Glowing
@@ -348,6 +349,7 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
     exposure.recordExposure(commandBuffer);
     noise.recordNoise(commandBuffer);  // noise measurement, if one is running (not timed: part of "exposure")
     writeTimestamp(commandBuffer, 5);
+    selection.record(commandBuffer, renderList->camera, frameViewProjection);  // the editor's pick and outline
     display.recordDisplay(commandBuffer);
     writeTimestamp(commandBuffer, 6);
     timestampsWritten[currentFrame] = true;
@@ -444,6 +446,7 @@ void Renderer::cleanupRayTracing() {
     exposure.destroyExposureResources();
     noise.destroyNoiseResources();
     display.destroyDisplayResources();
+    selection.destroyResources();
     vkDestroyQueryPool(gpu.device, timestampQueryPool, nullptr);
 
     vkDestroyBuffer(gpu.device, trace.uniformBuffer, nullptr);

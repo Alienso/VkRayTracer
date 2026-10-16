@@ -4,6 +4,7 @@
 
 #include "assets/AssetStore.h"
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -112,6 +113,12 @@ ModelHandle AssetStore::addFloor() {
     contents.materials.push_back(floorMaterial);
     contents.meshes.push_back(createFloorMesh());
     contents.instances.push_back({0, glm::mat4(1.0f)});
+    contents.boundsMin = glm::vec3(std::numeric_limits<float>::max());
+    contents.boundsMax = glm::vec3(std::numeric_limits<float>::lowest());
+    for (const SceneVertex& vertex : contents.meshes[0].vertices) {
+        contents.boundsMin = glm::min(contents.boundsMin, vertex.position);
+        contents.boundsMax = glm::max(contents.boundsMax, vertex.position);
+    }
 
     SceneModel sceneModel;
     sceneModel.name = "Floor";
@@ -278,6 +285,8 @@ void AssetStore::finishLoad(LoadResult result) {
 // Appends the model's meshes, materials and textures to the shared lists, its parts and ranges into the slot. The
 // model's indices are relative to its own lists; they are shifted to where its data lands.
 void AssetStore::add(uint32_t index, SceneModel sceneModel, Model& contents) {
+    sceneModel.boundsMin = contents.boundsMin;
+    sceneModel.boundsMax = contents.boundsMax;
     // Unused models make room first (unloading moves the lists, so before the ranges below are taken)
     while (textureList.size() + contents.textures.size() > textureLimit && unloadOldestUnused()) {
     }

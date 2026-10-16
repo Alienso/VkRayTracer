@@ -42,8 +42,8 @@ void DisplayPass::destroyDisplayImage() {
 // Descriptors: 0 = HDR image (read: DLSS output or the radiance image), 1 = display image (write),
 // 2 = exposure state (read), 3-9 = the DLSS input images and the history image (read, for the guide debug views),
 // 10 = the radiance image at render size (read, for the trace shader's debug views and, in its alpha, the fog amount
-// for the fog grain)
-static const uint32_t displayBindingCount = 11;
+// for the fog grain), 11 = the selection mask (read, for the outline)
+static const uint32_t displayBindingCount = 12;
 
 void DisplayPass::createDisplayResources() {
     VkDescriptorSetLayoutBinding bindings[displayBindingCount];
@@ -111,7 +111,7 @@ void DisplayPass::updateDisplayDescriptorSet() {
             displayedHdrView(), displayImageView, VK_NULL_HANDLE,
             linearDepthImage.view, motionVectorImage.view, diffuseAlbedoImage.view, specularAlbedoImage.view,
             normalRoughnessImage.view, specularHitDistanceImage.view, guideHistoryImage.view,
-            radianceImageView,
+            radianceImageView, selectionMask.view,
     };
     VkDescriptorImageInfo imageInfos[displayBindingCount]{};
     VkDescriptorBufferInfo exposureInfo{exposureBuffer, 0, VK_WHOLE_SIZE};
@@ -165,6 +165,7 @@ void DisplayPass::recordDisplay(VkCommandBuffer commandBuffer) {
     push.grainStrength = settings.fogGrain && fogLevel > 0 ? settings.fogGrainStrength : 0.0f;
     push.grainSize = std::max(settings.fogGrainSize, 1.0f);
     push.frame = static_cast<uint32_t>(frameNumber);
+    push.outlineRect = outlineRect;
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, displayPipelineLayout, 0, 1,

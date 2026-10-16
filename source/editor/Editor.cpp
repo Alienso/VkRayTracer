@@ -7,6 +7,7 @@
 #include <imgui/imgui.h>
 #include <imgui/imgui_internal.h>  // MarkIniSettingsDirty
 #include "editor/Editor.h"
+#include <imguizmo/ImGuizmo.h>
 
 Editor::Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
                RenderSettings& settings, const CpuFrameTimes& cpuTimes, UserSettings& userSettings, Window& window)
@@ -38,6 +39,14 @@ void Editor::build() {
         hasUnsavedChanges();
     }
 
+    ImGuizmo::BeginFrame();
+    if (!uiHidden) {
+        buildGizmo();  // (before the clicks: a click on a handle isn't a pick)
+    } else {
+        finishGizmoDrag();
+    }
+    handleImageClicks();
+    handleEditorKeys();
     // Keys that work wherever the mouse is (but not while typing into a field)
     if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
         uiHidden = !uiHidden;
@@ -87,8 +96,8 @@ void Editor::build() {
 
 
 void Editor::buildCameraUi() {
-    ImGui::TextDisabled("WASD move, Space/LShift up/down, LCtrl faster,");
-    ImGui::TextDisabled("hold right mouse button to look around");
+    ImGui::TextDisabled("Hold the right mouse button: look around, WASD move,");
+    ImGui::TextDisabled("Space/LShift up/down, LCtrl faster");
     bool fullscreenChecked = window.isFullscreen();
     if (ImGui::Checkbox("Fullscreen (F11)", &fullscreenChecked)) {
         window.setFullscreen(fullscreenChecked);

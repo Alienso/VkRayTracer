@@ -1,6 +1,7 @@
 //
-// Fly camera controls: WASD to move, Space/Left Shift up/down, Left Ctrl to go faster, hold right mouse button to
-// look around. Moves a Camera (the scene's); the program owns the controller, since it owns the window's input.
+// Fly camera controls, while the right mouse button is held (as in Unity and Unreal: the letters are the editor's
+// otherwise): the mouse looks around, WASD moves, Space/Left Shift up/down, Left Ctrl faster. Moves a Camera (the
+// scene's); the program owns the controller, since it owns the window's input.
 //
 
 #ifndef VULKANDEMO_CAMERACONTROLLER_H

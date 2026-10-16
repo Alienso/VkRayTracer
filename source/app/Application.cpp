@@ -161,6 +161,28 @@ InputState Application::readInput(bool keyboard, bool mouse) {
     return input;
 }
 
+void Application::updateSelection() {
+    // The outline: not in benches, captures (File > Capture image) or with the UI hidden
+    EntityId selected = editor.selectedEntity();
+    std::vector<InstanceRange> ranges;
+    std::vector<WorldBox> boxes;
+    if (!bench && editor.showsUi() && !renderer.capturePending() && scene.find(selected) != nullptr) {
+        ranges = renderList.instanceRanges([&](uint64_t id) { return scene.isUnder(id, selected); });
+        boxes = scene.selectionBoxes(selected);
+    }
+    renderer.setSelection(std::move(ranges), std::move(boxes));
+
+    if (std::optional<glm::vec2> click = editor.takePickRequest()) {
+        renderer.requestPick(*click, renderList.instanceRevision());
+    }
+    if (std::optional<PickResult> pick = renderer.takePick()) {
+        // (Traced on a list that has since been remade: its instance numbers are another list's. Rare: the click is lost.)
+        if (pick->instanceRevision == renderList.instanceRevision()) {
+            editor.picked(pick->hit ? renderList.entityOfInstance(pick->instance) : 0);
+        }
+    }
+}
+
 void Application::updateGame(float deltaTime, const InputState& input) {
     bool playing = editor.isPlaying() && !bench;
     if (playing && !game.running()) {
@@ -238,6 +260,7 @@ void Application::mainLoop() {
         }
         scene.moveCameraThroughPortals(cameraFrom);
         scene.buildRenderList(renderList);
+        updateSelection();
         if (window.takeResized()) {  // dragged, maximized, fullscreen (F11 or the editor)
             renderer.resize();
         }

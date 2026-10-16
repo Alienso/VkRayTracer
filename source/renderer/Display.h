@@ -1,7 +1,7 @@
 //
 // Display pass: the last step before the screen. The linear HDR image (the radiance image, or DLSS's output) with
 // exposure and tone mapping (shaders/display.comp) into an 8-bit image at output size, which the renderer blits into
-// the swapchain; or one of the debug views. See Display.cpp.
+// the swapchain; or one of the debug views. The editor's selection outline is drawn here too. See Display.cpp.
 //
 
 #ifndef VULKANDEMO_DISPLAY_H
@@ -23,6 +23,7 @@ public:
                 const RenderImage& motionVectorImage, const RenderImage& diffuseAlbedoImage,
                 const RenderImage& specularAlbedoImage, const RenderImage& normalRoughnessImage,
                 const RenderImage& specularHitDistanceImage, const RenderImage& guideHistoryImage,
+                const RenderImage& selectionMask, const glm::ivec4& outlineRect,
                 std::function<VkImageView()> displayedHdrView)
         : gpu(gpu), settings(settings), swapChainImageFormat(swapChainImageFormat), outputExtent(outputExtent),
           renderExtent(renderExtent), fogLevel(fogLevel), frameNumber(frameNumber), perPixelBuffers(perPixelBuffers),
@@ -30,7 +31,7 @@ public:
           motionVectorImage(motionVectorImage), diffuseAlbedoImage(diffuseAlbedoImage),
           specularAlbedoImage(specularAlbedoImage), normalRoughnessImage(normalRoughnessImage),
           specularHitDistanceImage(specularHitDistanceImage), guideHistoryImage(guideHistoryImage),
-          displayedHdrView(std::move(displayedHdrView)) {}
+          selectionMask(selectionMask), outlineRect(outlineRect), displayedHdrView(std::move(displayedHdrView)) {}
 
     // The display image, at output size (recreated with it)
     void createDisplayImage();
@@ -67,6 +68,8 @@ private:
     const RenderImage& normalRoughnessImage;
     const RenderImage& specularHitDistanceImage;
     const RenderImage& guideHistoryImage;
+    const RenderImage& selectionMask;  // the editor's outline (SelectionPass)
+    const glm::ivec4& outlineRect;
     std::function<VkImageView()> displayedHdrView;
 };
 

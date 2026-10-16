@@ -91,8 +91,12 @@ add_executable(vulkanDemo main.cpp
         source/renderer/Display.h source/renderer/RenderImages.cpp
         source/renderer/RadianceCache.h
         source/renderer/RayTracer.h source/renderer/Frame.cpp
-        source/renderer/Dlss.h
+        source/renderer/Dlss.h source/renderer/Selection.cpp source/renderer/Selection.h
+        source/editor/EditorGizmo.cpp source/editor/TransformHistory.h
+        include/imguizmo/ImGuizmo.cpp include/imguizmo/ImGuizmo.h
         )
+# ImGuizmo (include/imguizmo, MIT license): the editor's move / rotate / scale handles. Not our code: no warnings.
+set_source_files_properties(include/imguizmo/ImGuizmo.cpp PROPERTIES COMPILE_OPTIONS "-w")
 
 target_link_libraries(vulkanDemo vulkanDemoGame vulkanDemoCore glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
 
@@ -109,7 +113,7 @@ add_executable(tests
         tests/SceneTreeTests.cpp tests/RenderListTests.cpp tests/SceneFileTests.cpp tests/RenderSettingsFileTests.cpp
         tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp tests/GameComponentTests.cpp
         tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
-        tests/GameInteractionTests.cpp)
+        tests/GameInteractionTests.cpp tests/SelectionTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes
