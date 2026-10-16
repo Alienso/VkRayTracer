@@ -123,6 +123,12 @@ void Editor::buildMenuBar() {
             ImGui::MarkIniSettingsDirty();
         }
         ImGui::MenuItem("Hide the UI", "F1", &uiHidden);
+        ImGui::MenuItem("Blend game steps", nullptr, &blendSteps);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("While playing: the game moves things 60 times a second. On, they are shown\n"
+                              "between its steps every frame (smooth, up to a step behind); off, as each\n"
+                              "step left them (they hold still in some frames and jump in others).");
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset layout")) {
             resetLayout = true;
@@ -133,9 +139,28 @@ void Editor::buildMenuBar() {
         }
         ImGui::EndMenu();
     }
+    bool wasPlaying = playing;  // (clicking changes playing: the color is pushed and popped by what it was)
+    if (wasPlaying) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 1.0f, 0.5f, 1.0f));
+    }
+    bool clicked = ImGui::MenuItem(wasPlaying ? "Stop" : "Play", "F5");
+    if (wasPlaying) {
+        ImGui::PopStyleColor();
+    }
+    if (clicked) {
+        wasPlaying ? stop() : play();
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(wasPlaying ? "Puts the scene back as it was at Play." :
+                                    "Runs the game on the scene. Stop puts the scene back as it was:\n"
+                                    "what changes while playing, also by hand, isn't kept.");
+    }
 
     // Right-aligned: what is loading, the open scene, and whether it has unsaved changes
     std::string name = scenePath.empty() ? "new scene" : std::filesystem::path(scenePath).filename().string();
+    if (playing) {
+        name = "PLAYING (changes are undone by Stop)    " + name;
+    }
     if (unsaved) {
         name += "  (unsaved changes)";
     }
@@ -176,9 +201,16 @@ void Editor::buildOverlay() {
                     stats.gpuPassMs[0], stats.gpuPassMs[1], stats.gpuPassMs[2], stats.gpuPassMs[3],
                     stats.gpuPassMs[4], stats.gpuPassMs[5]);
         // CPU work without the waits for the GPU and the display (those fill the frame up to the slower of them)
-        ImGui::Text("CPU: %.2f ms (update %.2f, UI %.2f, render %.2f), waiting %.2f", cpuTimes.workMs(),
-                    cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Ui],
-                    cpuTimes.ms[CpuFrameTimes::Render], cpuTimes.ms[CpuFrameTimes::Wait]);
+        if (playing) {
+            ImGui::Text("CPU: %.2f ms (update %.2f, game %.2f, UI %.2f, render %.2f), waiting %.2f",
+                        cpuTimes.workMs(), cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Game],
+                        cpuTimes.ms[CpuFrameTimes::Ui], cpuTimes.ms[CpuFrameTimes::Render],
+                        cpuTimes.ms[CpuFrameTimes::Wait]);
+        } else {
+            ImGui::Text("CPU: %.2f ms (update %.2f, UI %.2f, render %.2f), waiting %.2f", cpuTimes.workMs(),
+                        cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Ui],
+                        cpuTimes.ms[CpuFrameTimes::Render], cpuTimes.ms[CpuFrameTimes::Wait]);
+        }
         if (stats.accumulating) {
             ImGui::Text("%u frames accumulated", stats.accumulatedFrames);
         }

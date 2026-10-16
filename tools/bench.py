@@ -150,7 +150,7 @@ def numbers(results):
         mean = results.get('gpuMs', {}).get(p, {}).get('mean')
         if mean is not None and (mean > 0.005 or p == 'total'):
             row[f'gpu {p} ms'] = mean
-    for phase in ['work', 'update', 'ui', 'render', 'wait']:
+    for phase in ['work', 'update', 'game', 'ui', 'render', 'wait']:
         mean = results.get('cpuMs', {}).get(phase, {}).get('mean')
         if mean is not None:
             row[f'cpu {phase} ms'] = mean

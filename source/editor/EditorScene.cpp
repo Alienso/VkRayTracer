@@ -1,7 +1,7 @@
 //
 // The editor's Outliner and Details panels: adding models, groups and portals (the Add menu), the tree of entities
 // (drag one onto another to move it under it; right click for more), and the selected entity: its transform, model
-// (parts, materials, lights) and portal end. It changes the Scene and the assets' materials and lights; the renderer
+// (parts, materials, lights), portal end and game components. It changes the Scene and the assets' materials and lights; the renderer
 // picks the changes up through the render list and the asset store's revisions.
 //
 
@@ -11,6 +11,7 @@
 #include <map>
 #include <tuple>
 #include <imgui/imgui.h>
+#include <nlohmann/json.hpp>
 #include "editor/Editor.h"
 #include "assets/BuiltInModels.h"
 
@@ -180,6 +181,10 @@ void Editor::buildEntityNode(EntityId id, TreeEdit& edit) {
         if (ImGui::MenuItem("Duplicate")) {
             edit = {TreeEdit::Duplicate, id, 0};
         }
+        if (ImGui::MenuItem("Add game component")) {
+            addGameComponent(id);  // (adds no entity: done now)
+            selected = id;
+        }
         if (entity.parent != 0 && ImGui::MenuItem("Unparent")) {
             edit = {TreeEdit::Move, id, 0};
         }
@@ -235,12 +240,23 @@ void Editor::buildEntityUi(EntityId id) {
     if (scene.portal(id) != nullptr) {
         buildPortalUi(id);
     }
+    if (scene.game(id) != nullptr) {
+        buildGameUi(id);
+    }
 
     ImGui::Separator();
     if (ImGui::Button("Reset transform")) {
         entity.local.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         entity.local.scale = glm::vec3(1.0f);
         entity.local.position.y = 0.0f;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Game")) {
+        addGameComponent(id);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Adds a game component: a type and its properties (JSON),\n"
+                          "which the game reads when Play starts.");
     }
     // The ones below add or remove entities: entity is no longer valid after them
     ImGui::SameLine();
@@ -579,3 +595,150 @@ void Editor::buildPunctualLightUi(SceneModel& model) {
     ImGui::TreePop();
 }
 
+
+// ImGui text fields for a std::string (the buffer grows as text is typed)
+static int resizeString(ImGuiInputTextCallbackData* data) {
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        auto* text = static_cast<std::string*>(data->UserData);
+        text->resize(data->BufTextLen);
+        data->Buf = text->data();
+    }
+    return 0;
+}
+
+static bool inputText(const char* label, std::string& text) {
+    return ImGui::InputText(label, text.data(), text.capacity() + 1, ImGuiInputTextFlags_CallbackResize, resizeString,
+                            &text);
+}
+
+static bool inputTextMultiline(const char* label, std::string& text, const ImVec2& size) {
+    return ImGui::InputTextMultiline(label, text.data(), text.capacity() + 1, size, ImGuiInputTextFlags_CallbackResize,
+                                     resizeString, &text);
+}
+
+// A component's properties as the editor shows them: over lines, indented ("" stays "")
+static std::string prettyProperties(const std::string& properties) {
+    if (properties.empty()) {
+        return "";
+    }
+    try {
+        return nlohmann::ordered_json::parse(properties).dump(2);
+    } catch (const std::exception&) {
+        return properties;  // (the scene only holds valid JSON: not expected)
+    }
+}
+
+// The field's text as a component's properties: compact, "" for nothing or {}. Returns why it can't be ("": it can).
+static std::string compactProperties(const std::string& text, std::string& properties) {
+    if (text.find_first_not_of(" \t\r\n") == std::string::npos) {
+        properties.clear();
+        return "";
+    }
+    try {
+        nlohmann::ordered_json json = nlohmann::ordered_json::parse(text);
+        if (!json.is_object()) {
+            return "expected an object: { \"name\": value, ... }";
+        }
+        properties = json.empty() ? "" : json.dump();
+        return "";
+    } catch (const nlohmann::json::exception& e) {
+        std::string message = e.what();  // "[json.exception.parse_error.101] parse error at line 2, ..."
+        size_t start = message.find("] ");
+        return start == std::string::npos ? message : message.substr(start + 2);
+    }
+}
+
+void Editor::addGameComponent(EntityId id) {
+    const std::vector<GameComponent>* existing = scene.game(id);
+    std::vector<GameComponent> components = existing != nullptr ? *existing : std::vector<GameComponent>();
+    components.emplace_back();
+    scene.setGame(id, std::move(components));
+}
+
+// The entity's game components: a type and properties (JSON) each, in their order. The editor doesn't know the
+// types: the game reads them when Play starts (GAME_PLAN.md). Properties are applied while they are valid JSON.
+void Editor::buildGameUi(EntityId id) {
+    std::vector<GameComponent> components = *scene.game(id);
+    bool fresh = gameEditEntity != id || gameEdits.size() != components.size();
+    for (size_t i = 0; !fresh && i < components.size(); i++) {
+        fresh = gameEdits[i].applied != components[i].properties;
+    }
+    if (fresh) {
+        gameEditEntity = id;
+        gameEdits.clear();
+        for (const GameComponent& component : components) {
+            gameEdits.push_back({prettyProperties(component.properties), component.properties, ""});
+        }
+    }
+
+    ImGui::SeparatorText("Game");
+    bool changed = false;
+    int removed = -1;
+    int swapped = -1;  // with the one before it
+    for (size_t i = 0; i < components.size(); i++) {
+        GameComponent& component = components[i];
+        GameEdit& edit = gameEdits[i];
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::TreeNodeEx("component", ImGuiTreeNodeFlags_DefaultOpen, "%s",
+                              component.type.empty() ? "(no type)" : component.type.c_str())) {
+            changed |= inputText("Type", component.type);
+            int lines = static_cast<int>(std::count(edit.properties.begin(), edit.properties.end(), '\n')) + 2;
+            float height = static_cast<float>(std::clamp(lines, 3, 16)) * ImGui::GetTextLineHeight() +
+                           ImGui::GetStyle().FramePadding.y * 2.0f;
+            bool invalid = !edit.error.empty();
+            if (invalid) {
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
+            }
+            if (inputTextMultiline("##properties", edit.properties, ImVec2(-FLT_MIN, height))) {
+                std::string properties;
+                edit.error = compactProperties(edit.properties, properties);
+                if (edit.error.empty() && properties != component.properties) {
+                    component.properties = properties;
+                    edit.applied = properties;
+                    changed = true;
+                }
+            }
+            if (invalid) {
+                ImGui::PopStyleColor();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Properties as a JSON object, e.g. { \"speed\": 90, \"axis\": [0, 1, 0] }.\n"
+                                  "Applied while the text is valid; the type decides what it reads.");
+            }
+            if (!edit.error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                ImGui::TextWrapped("Not applied: %s", edit.error.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::SmallButton("Up")) {
+                swapped = static_cast<int>(i);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(i + 1 == components.size());
+            if (ImGui::SmallButton("Down")) {
+                swapped = static_cast<int>(i + 1);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) {
+                removed = static_cast<int>(i);
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    if (removed >= 0) {
+        components.erase(components.begin() + removed);
+        gameEdits.erase(gameEdits.begin() + removed);
+        changed = true;
+    } else if (swapped > 0) {
+        std::swap(components[swapped - 1], components[swapped]);
+        std::swap(gameEdits[swapped - 1], gameEdits[swapped]);
+        changed = true;
+    }
+    if (changed) {
+        scene.setGame(id, std::move(components));
+    }
+}

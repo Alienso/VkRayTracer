@@ -84,6 +84,7 @@ void Scene::clear() {
     rootList.clear();
     modelTable.clear();
     portalTable.clear();
+    gameTable.clear();
     entitiesMade = 0;
     portalPairsMade = 0;
     sceneCamera = Camera();
@@ -120,6 +121,7 @@ void Scene::takeFrom(Scene& other) {
     rootList = std::move(other.rootList);
     modelTable = std::move(other.modelTable);
     portalTable = std::move(other.portalTable);
+    gameTable = std::move(other.gameTable);
     entitiesMade = other.entitiesMade;
     portalPairsMade = other.portalPairsMade;
     rimModel = other.rimModel;
@@ -136,6 +138,7 @@ void Scene::takeFrom(Scene& other) {
     other.rootList.clear();
     other.modelTable.clear();
     other.portalTable.clear();
+    other.gameTable.clear();
     other.sceneEnvironment.map = EnvironmentHandle();
     other.pendingMap = EnvironmentHandle();
     other.pendingModelEdits.clear();
@@ -301,6 +304,9 @@ EntityId Scene::duplicate(EntityId id) {
             }
             portalTable[copyOf[original]] = component;
         }
+        if (auto it = gameTable.find(original); it != gameTable.end()) {
+            gameTable[copyOf[original]] = it->second;  // (entity ids in properties still name the originals)
+        }
     }
     return top;
 }
@@ -338,6 +344,7 @@ void Scene::remove(EntityId id) {
             }
             portalTable.erase(it);
         }
+        gameTable.erase(e);
     }
     entityList.erase(std::remove_if(entityList.begin(), entityList.end(),
                                     [&](const Entity& entity) { return removed.count(entity.id) > 0; }),
@@ -423,6 +430,19 @@ PortalComponent* Scene::portal(EntityId id) {
 const PortalComponent* Scene::portal(EntityId id) const {
     auto it = portalTable.find(id);
     return it == portalTable.end() ? nullptr : &it->second;
+}
+
+const std::vector<GameComponent>* Scene::game(EntityId id) const {
+    auto it = gameTable.find(id);
+    return it == gameTable.end() ? nullptr : &it->second;
+}
+
+void Scene::setGame(EntityId id, std::vector<GameComponent> components) {
+    if (components.empty()) {
+        gameTable.erase(id);
+    } else {
+        gameTable[id] = std::move(components);
+    }
 }
 
 void Scene::setPartHidden(EntityId id, size_t part, bool hidden) {

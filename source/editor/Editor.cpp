@@ -42,7 +42,10 @@ void Editor::build() {
     if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
         uiHidden = !uiHidden;
     }
-    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+    if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
+        playing ? stop() : play();
+    }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && !playing) {
         if (scenePath.empty()) {
             askSaveAs = true;
         } else {

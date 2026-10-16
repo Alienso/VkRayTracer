@@ -34,10 +34,20 @@ public:
     // Opens a scene file (the command line's): the scene becomes the file's, or the error shows in the Log panel
     // (false)
     bool openSceneFile(const std::string& path);
-    // The window's close button: false while the scene has unsaved changes (it asks first, then closes the window)
+    // The window's close button: false while the scene has unsaved changes (it asks first, then closes the window).
+    // While playing it stops first.
     bool allowClose();
+    // Play / Stop (F5, the menu bar; EditorFile.cpp). Play keeps the scene as it is (Scene::text); Stop loads that
+    // back, so what changed while playing (by the game or by hand) is undone. While playing the scene's file
+    // actions (New, Open, Save) are off, and the unsaved mark stays as it was at Play.
+    void play();
+    void stop();
+    [[nodiscard]] bool isPlaying() const { return playing; }
+    // View > "Blend game steps": things the game moves are shown between its steps (StepInterpolation)
+    [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
     // A warning for the Log panel (from outside the editor: reading the user settings)
     void warn(const std::string& text) { log(LogLevel::Warning, text); }
+    void info(const std::string& text) { log(LogLevel::Info, text); }
 
 private:
     AssetStore& assets;
@@ -79,6 +89,16 @@ private:
     glm::vec3 eulerDegrees = glm::vec3(0.0f);
     glm::quat eulerRotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);  // the rotation eulerDegrees stand for
     bool addAtOriginalSize = false;  // new objects keep the file's size (whole scenes like Sponza)
+    // The selected entity's game components as their text fields show them: the properties as typed (laid out over
+    // lines), applied to the scene while they are valid JSON. Taken from the scene again when another entity is
+    // selected or the components were changed elsewhere (applied differs).
+    struct GameEdit {
+        std::string properties;  // the field's text
+        std::string applied;     // the component's properties when the text was last applied or taken
+        std::string error;       // why the text isn't valid ("": it is)
+    };
+    EntityId gameEditEntity = 0;
+    std::vector<GameEdit> gameEdits;
     // Scene files (EditorFile.cpp)
     static constexpr const char* scenesDirectory = "scenes";  // next to the executable (CMakeLists.txt copies scenes/)
     std::string scenePath;   // the open scene's file; empty: not saved yet
@@ -88,6 +108,9 @@ private:
     std::vector<std::string> sceneFiles;  // .json files in scenesDirectory (scanned when File > Open opens)
     char saveAsName[128] = "";
     bool askSaveAs = false;     // open the Save As question this frame
+    bool playing = false;
+    bool blendSteps = true;
+    std::string playSnapshot;   // Scene::text at Play
     std::string saveError;      // why the last save failed (also in the log), shown in the save questions
     // New / Open / Exit wait for the unsaved-changes question
     enum class FileAction { None, New, Open, Exit };
@@ -155,6 +178,8 @@ private:
     void buildTransformUi(Entity& entity);
     void buildModelUi(EntityId id);
     void buildPortalUi(EntityId id);
+    void buildGameUi(EntityId id);
+    void addGameComponent(EntityId id);
     void buildMaterialUi(const SceneModel& model);
     void buildPunctualLightUi(SceneModel& model);
 };

@@ -1,7 +1,7 @@
 //
 // The editor's scene files: the File menu's New, Open, Open recent, Save, Save As (in the scenes folder next to the
 // executable), the unsaved changes mark (in the menu bar and the window title) and the question before New / Open /
-// closing the window throws them away. The files themselves: Scene::save / load (SceneFile.cpp). The recent scenes
+// closing the window throws them away; Play / Stop, which keep the scene and put it back. The files themselves: Scene::save / load (SceneFile.cpp). The recent scenes
 // and the last one (opened again at the next start) go into the user settings (app/UserSettings.h).
 //
 
@@ -24,12 +24,15 @@ void Editor::scanSceneFiles() {
 }
 
 bool Editor::hasUnsavedChanges() {
-    unsaved = scene.contentText() != savedText;
+    if (!playing) {  // (while playing: as it was at Play, which is what Stop puts back)
+        unsaved = scene.contentText() != savedText;
+    }
     unsavedCheckTime = ImGui::GetTime();
     return unsaved;
 }
 
 bool Editor::allowClose() {
+    stop();
     if (!hasUnsavedChanges()) {
         return true;
     }
@@ -38,6 +41,7 @@ bool Editor::allowClose() {
 }
 
 void Editor::request(FileAction action, const std::string& path) {
+    stop();  // (the menu has these off while playing; Exit stops)
     if (hasUnsavedChanges()) {
         pendingAction = action;
         pendingPath = path;
@@ -130,6 +134,9 @@ void Editor::updateTitle() {
     if (unsaved) {
         title += " *";
     }
+    if (playing) {
+        title += "  [playing]";
+    }
     if (title != shownTitle) {
         window.setTitle(title);
         shownTitle = title;
@@ -137,6 +144,7 @@ void Editor::updateTitle() {
 }
 
 void Editor::buildFileMenu() {
+    ImGui::BeginDisabled(playing);
     if (ImGui::MenuItem("New")) {
         request(FileAction::New);
     }
@@ -186,6 +194,10 @@ void Editor::buildFileMenu() {
     }
     if (ImGui::MenuItem("Save as...")) {
         askSaveAs = true;
+    }
+    ImGui::EndDisabled();
+    if (playing) {
+        ImGui::TextDisabled("(Stop first: the scene is being played)");
     }
     ImGui::Separator();
     if (ImGui::MenuItem("Capture image")) {
@@ -279,4 +291,31 @@ void Editor::buildUnsavedQuestion() {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", saveError.c_str());
     }
     ImGui::EndPopup();
+}
+
+void Editor::play() {
+    if (playing) {
+        return;
+    }
+    hasUnsavedChanges();  // the mark as it is now: kept while playing
+    playSnapshot = scene.text();
+    playing = true;
+    log(LogLevel::Info, "Playing: what changes now is undone by Stop");
+}
+
+void Editor::stop() {
+    if (!playing) {
+        return;
+    }
+    playing = false;
+    try {
+        // Warnings would be the ones opening the scene gave (the text is the scene's own): not logged again
+        scene.loadText(playSnapshot, "the scene at Play");
+        log(LogLevel::Info, "Stopped: the scene is back as it was at Play");
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;  // not expected: the text is the scene's own
+        log(LogLevel::Error, std::string("Stop couldn't put the scene back: ") + e.what());
+    }
+    playSnapshot.clear();
+    hasUnsavedChanges();
 }

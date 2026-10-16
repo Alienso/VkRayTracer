@@ -58,6 +58,13 @@ add_library(vulkanDemoCore STATIC
         include/cgltf/cgltf.h)
 target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
 
+# The game (GAME_PLAN.md): uses the scene, never the renderer, the editor or the window; it links only the core
+add_library(vulkanDemoGame STATIC
+        source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
+        source/game/GameProperties.h source/game/StepInterpolation.cpp source/game/StepInterpolation.h
+        source/core/Input.h)
+target_link_libraries(vulkanDemoGame vulkanDemoCore)
+
 add_executable(vulkanDemo main.cpp
         include/imgui/imgui.cpp include/imgui/imgui.h
         include/imgui/imgui_draw.cpp include/imgui/imgui_demo.cpp
@@ -87,7 +94,7 @@ add_executable(vulkanDemo main.cpp
         source/renderer/Dlss.h
         )
 
-target_link_libraries(vulkanDemo vulkanDemoCore glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
+target_link_libraries(vulkanDemo vulkanDemoGame vulkanDemoCore glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
 
 # Models and HDR environments are read from the project's resource folder, shared by all builds (copied next to each
 # executable they took 5.8 GB per build folder, and ~15 s of every build). --resources <dir> overrides it. (The
@@ -100,10 +107,11 @@ add_executable(tests
         include/catch2/catch_amalgamated.cpp include/catch2/catch_amalgamated.hpp
         tests/TestHelpers.h tests/RangeAllocatorTests.cpp tests/DeferredDeletionTests.cpp tests/AssetStoreTests.cpp
         tests/SceneTreeTests.cpp tests/RenderListTests.cpp tests/SceneFileTests.cpp tests/RenderSettingsFileTests.cpp
-        tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp)
+        tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp tests/GameComponentTests.cpp
+        tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
-target_link_libraries(tests vulkanDemoCore -static-libgcc -static-libstdc++)
+target_link_libraries(tests vulkanDemoGame vulkanDemoCore -static-libgcc -static-libstdc++)
 enable_testing()
 add_test(NAME unit COMMAND tests)
 

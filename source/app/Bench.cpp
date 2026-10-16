@@ -352,7 +352,8 @@ void Bench::writeResults(const Renderer& renderer) {
     nlohmann::ordered_json cpu = nlohmann::ordered_json::object();
     std::vector<float> work;
     for (const auto& phases : cpuPhaseTimes) {
-        work.push_back(phases[CpuFrameTimes::Update] + phases[CpuFrameTimes::Ui] + phases[CpuFrameTimes::Render]);
+        work.push_back(phases[CpuFrameTimes::Update] + phases[CpuFrameTimes::Game] + phases[CpuFrameTimes::Ui] +
+                       phases[CpuFrameTimes::Render]);
     }
     for (int phase = 0; phase < CpuFrameTimes::PhaseCount; phase++) {
         std::vector<float> values;

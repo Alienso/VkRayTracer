@@ -19,6 +19,10 @@
 #include "scene/Scene.h"
 #include "app/Window.h"
 #include "core/Configuration.h"
+#include "core/Input.h"
+#include "game/Game.h"
+#include "game/GameLoop.h"
+#include "game/StepInterpolation.h"
 
 class Application {
 public:
@@ -34,6 +38,9 @@ public:
     void setStartScene(const std::string& path) {  // a scene file on the command line: opened instead of the last one
         startScene = path;
     }
+    void setPlayAtStart(bool play) {  // --play: Play once the scene is open (not with a bench)
+        playAtStart = play;
+    }
     // --bench: runs it (its scene instead of startScene), then closes
     void setBench(std::unique_ptr<Bench> newBench) {
         bench = std::move(newBench);
@@ -45,6 +52,7 @@ private:
     std::unique_ptr<Bench> bench;
     bool benchDone = false;  // its results are written (else the window was closed before)
     bool fullscreenKeyDown = false;  // F11 toggles once per press
+    bool playAtStart = false;
     // Kept between runs (not with a bench): read at start, written a second after a change and on exit
     static constexpr const char* userSettingsFile = "user_settings.json";
     UserSettings userSettings;
@@ -66,11 +74,24 @@ private:
     CpuFrameTimes cpuTimes;  // measured by mainLoop, shown by the editor, recorded by a bench
     Renderer renderer{assets, renderSettings};
     Editor editor{assets, scene, cameraController, renderer, renderSettings, cpuTimes, userSettings, window};
+    // The game: runs while the editor plays (started and stopped by updateGame), in fixed steps (gameLoop), with
+    // the window's input (readInput, which keeps the last frame's keys to find presses)
+    Game game;
+    GameLoop gameLoop;
+    StepInterpolation interpolation;  // what is shown between the steps (the editor's View menu turns it off)
+    std::bitset<Key::Count> lastKeys;
+    std::array<bool, MouseButton::Count> lastMouseButtons{};
+    double lastCursorX = 0.0, lastCursorY = 0.0;
+    bool cursorRead = false;
 
     void createDefaultScene();
     void mainLoop();
     // The window's state into userSettings, and the file written when its text changed
     void saveUserSettingsIfChanged();
+    // This frame's keyboard and mouse for the game; a device the editor uses (ImGui) reads as idle
+    InputState readInput(bool keyboard, bool mouse);
+    // Starts or stops the game as the editor plays or stops, and runs this frame's steps
+    void updateGame(float deltaTime, const InputState& input);
 };
 
 #endif //VULKANDEMO_APPLICATION_H

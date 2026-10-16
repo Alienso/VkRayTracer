@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
             Configuration::enableSyncValidation = true;
         } else if (std::strcmp(argv[i], "--shader-dir") == 0 && hasValue) {
             Configuration::shaderDirectory = argv[++i];  // the .spv files (and their pipeline cache) from there
+        } else if (std::strcmp(argv[i], "--play") == 0) {
+            app.setPlayAtStart(true);  // Play once the scene is open (GAME_PLAN.md)
         } else if (std::strcmp(argv[i], "--bench") == 0 && hasValue) {
             benchFile = argv[++i];  // runs the bench, writes its results, exits (app/Bench.h)
         } else if (std::strcmp(argv[i], "--bench-out") == 0 && hasValue) {
@@ -47,7 +49,7 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "unknown option " << argv[i]
                       << " (known: --no-dlss, --dlss-cnn, --validation, --no-validation, --sync-validation, --resources <dir>, "
-                         "--shader-dir <dir>, --bench <file.json>, --bench-out <dir>, a scene file)"
+                         "--play, --shader-dir <dir>, --bench <file.json>, --bench-out <dir>, a scene file)"
                       << std::endl;
         }
     }

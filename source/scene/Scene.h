@@ -83,6 +83,17 @@ struct ModelComponent {
     std::string missingEntry;
 };
 
+// The game's data on an entity (GAME_PLAN.md): the scene stores, copies and saves it, the game gives it meaning when
+// Play starts. An entity has a list of them, in the order the editor shows them.
+struct GameComponent {
+    std::string type;        // what the game makes of it ("spin", "door", ...; "": nothing yet)
+    std::string properties;  // a JSON object as text, compact ("" is no properties): what that type reads
+
+    bool operator==(const GameComponent& other) const {
+        return type == other.type && properties == other.properties;
+    }
+};
+
 // What happened while models and maps loaded (Scene::takeMessages): for the editor's log
 struct SceneMessage {
     enum class Level { Info, Warning, Error } level;
@@ -109,6 +120,10 @@ public:
     // ModelComponent::missingFile), edits that don't fit the model any more. Models and maps not loaded yet arrive
     // later (update), with their hidden parts and edits; what goes wrong then comes as messages.
     std::vector<std::string> load(const std::string& path);
+    // The same with the file's text (name: for the errors). With text(), the scene as its file would have it, camera
+    // included: Play keeps it and Stop loads it back (GAME_PLAN.md).
+    std::vector<std::string> loadText(const std::string& text, const std::string& name);
+    [[nodiscard]] std::string text() const;
     // The scene as its file would have it, without the camera (moving around isn't a change to save): when this
     // differs from the text at the last save or load, there is something to save
     [[nodiscard]] std::string contentText() const;
@@ -152,6 +167,11 @@ public:
     [[nodiscard]] const ModelComponent* model(EntityId id) const;
     PortalComponent* portal(EntityId id);
     [[nodiscard]] const PortalComponent* portal(EntityId id) const;
+    // The entity's game components, or nullptr when it has none. Changed only through setGame (a copy edited and set
+    // back): the pointer is valid until then, or until entities are removed.
+    [[nodiscard]] const std::vector<GameComponent>* game(EntityId id) const;
+    // Replaces the entity's game components; an empty list removes them
+    void setGame(EntityId id, std::vector<GameComponent> components);
     // Shows or hides one part of a model entity
     void setPartHidden(EntityId id, size_t part, bool hidden);
     // After editing a portal end's shape, size or rim: the same for its other end
@@ -199,6 +219,7 @@ private:
     std::vector<EntityId> rootList;                    // in the order the editor lists them
     std::unordered_map<EntityId, ModelComponent> modelTable;
     std::unordered_map<EntityId, PortalComponent> portalTable;
+    std::unordered_map<EntityId, std::vector<GameComponent>> gameTable;  // never an empty list
     EntityId entitiesMade = 0;  // for their ids
     int portalPairsMade = 0;    // for their names
     ModelHandle rimModel;       // the built-in portal rim, while there are pairs

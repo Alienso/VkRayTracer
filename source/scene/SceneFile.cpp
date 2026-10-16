@@ -15,7 +15,9 @@
 //      "model": {"file": "DamagedHelmet.glb" or "builtIn": "Floor", "originalSize": true (only when on),
 //                "hide": [parts hidden that the model shows], "show": [parts shown that the model hides]},
 //      "portal": {"other": 7, "endA": true, "shape": "rectangle", "size": [w, h], "rim": true, "rimWidth": ..,
-//                 "rimDepth": ..}},
+//                 "rimDepth": ..},
+//      "game": [{"type": "door", "properties": {"openAngle": 95}}, ...]},   (only when it has some; GameComponent:
+//                                     the scene doesn't read the properties, the game does)
 //     ...],
 //   "models": [                       edits to models' materials and lights: only what differs from the file
 //     {"file": "Bistro/BistroExterior.gltf", "materials": [{"index": 12, "name": "Glass", "roughness": 0.1}],
@@ -308,6 +310,18 @@ std::string Scene::toText(bool withCamera) const {
                            {"rim", portal->rim}, {"rimWidth", number(portal->rimWidth)},
                            {"rimDepth", number(portal->rimDepth)}};
         }
+        if (const std::vector<GameComponent>* components = game(id)) {
+            Json list = Json::array();
+            for (const GameComponent& component : *components) {
+                Json g;
+                g["type"] = component.type;
+                if (!component.properties.empty()) {
+                    g["properties"] = Json::parse(component.properties);
+                }
+                list.push_back(g);
+            }
+            j["game"] = list;
+        }
         entities.push_back(j);
     }
     document["entities"] = entities;
@@ -359,6 +373,10 @@ std::string Scene::toText(bool withCamera) const {
 
 std::string Scene::contentText() const {
     return toText(false);
+}
+
+std::string Scene::text() const {
+    return toText(true);
 }
 
 void Scene::save(const std::string& path) const {
@@ -525,24 +543,65 @@ std::vector<std::string> Scene::applyPendingEdits(const std::string& modelName) 
     return warnings;
 }
 
+// An entity's "game" list. What can't be read is a warning (the game's data isn't the scene's to refuse a file
+// for): a component that isn't an object is left out, properties that aren't an object are dropped.
+static std::vector<GameComponent> readGameComponents(const Json& list, std::vector<std::string>& warnings) {
+    std::vector<GameComponent> components;
+    if (!list.is_array()) {
+        warnings.push_back("\"game\": expected a list; left out");
+        return components;
+    }
+    for (size_t i = 0; i < list.size(); i++) {
+        const Json& g = list[i];
+        std::string where = "game component " + std::to_string(i + 1);
+        if (!g.is_object()) {
+            warnings.push_back(where + ": expected an object; left out");
+            continue;
+        }
+        GameComponent component;
+        if (auto type = g.find("type"); type != g.end()) {
+            if (type->is_string()) {
+                component.type = type->get<std::string>();
+            } else {
+                warnings.push_back(where + ": \"type\" isn't text; left empty");
+            }
+        }
+        if (auto properties = g.find("properties"); properties != g.end()) {
+            if (properties->is_object()) {
+                component.properties = properties->empty() ? "" : properties->dump();
+            } else {
+                warnings.push_back(where + " (" + component.type + "): \"properties\" isn't an object; dropped");
+            }
+        }
+        components.push_back(std::move(component));
+    }
+    return components;
+}
+
 std::vector<std::string> Scene::load(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         throw std::runtime_error("can't open " + path);
     }
+    std::stringstream text;
+    text << file.rdbuf();
+    return loadText(text.str(), path);
+}
+
+std::vector<std::string> Scene::loadText(const std::string& text, const std::string& name) {
     Json document;
     try {
-        document = Json::parse(file);
+        document = Json::parse(text);
     } catch (const Json::exception& e) {
-        throw std::runtime_error(path + " isn't valid JSON: " + e.what());
+        throw std::runtime_error(name + " isn't valid JSON: " + e.what());
     }
     if (!document.is_object() || document.value("format", std::string()) != formatName) {
-        throw std::runtime_error(path + " isn't a scene file (no \"format\": \"" + formatName + "\")");
+        throw std::runtime_error(name + " isn't a scene file (no \"format\": \"" + formatName + "\")");
     }
     int version = 0;
     readOptional(document, "version", version);
     if (version < 1 || version > fileVersion) {
-        throw std::runtime_error(path + " is version " + std::to_string(version) + ", this program reads up to " +
+        throw std::runtime_error(name + " is version " + std::to_string(version) + ", this program reads up to " +
                                  std::to_string(fileVersion));
     }
 
@@ -627,6 +686,15 @@ std::vector<std::string> Scene::load(const std::string& path) {
                     readOptional(*p, "rimWidth", portal.rimWidth);
                     readOptional(*p, "rimDepth", portal.rimDepth);
                     loaded.portalTable[id] = portal;
+                }
+
+                if (auto g = j.find("game"); g != j.end()) {
+                    std::vector<std::string> gameWarnings;
+                    std::vector<GameComponent> components = readGameComponents(*g, gameWarnings);
+                    for (const std::string& warning : gameWarnings) {
+                        warnings.push_back(where + " (" + name + "): " + warning);
+                    }
+                    loaded.setGame(id, std::move(components));
                 }
             } catch (const std::exception& e) {
                 throw std::runtime_error(where + ": " + e.what());
