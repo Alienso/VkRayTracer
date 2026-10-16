@@ -16,7 +16,8 @@
 //   "deltaTime": 0.016667,              seconds per frame the renderer is told (auto exposure, fog drift), so runs
 //                                       are the same however fast they go; 0: the real time
 //   "warmupFrames": 400,                frames before measuring (radiance cache, exposure and DLSS settle)
-//   "frames": 300,                      frames measured: GPU time per pass, wall time per frame, memory
+//   "frames": 300,                      frames measured: GPU time per pass, CPU time per phase (and waiting), wall
+//                                       time per frame, memory
 //   "captures": [1024],                 frames to save as PNG (capture_<frame>.png)
 //   "noise": {"mode": "DlssDlaa", "referenceFrames": 4096, "frames": 256, "region": [x0, y0, x1, y1]}
 //                                       after the measured frames: the noise tool (Noise.cpp) against a reference
@@ -37,6 +38,7 @@
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
 #include "assets/AssetStore.h"
+#include "app/CpuFrameTimes.h"
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 
@@ -54,7 +56,7 @@ public:
     // Each frame before the render list is made: the camera, captures, the noise run
     void beforeRender(Scene& scene, Renderer& renderer, const AssetStore& assets);
     // Each frame after it was drawn: reads the measurements. True once the bench is over (results written).
-    bool afterRender(Renderer& renderer);
+    bool afterRender(Renderer& renderer, const CpuFrameTimes& cpuTimes);
     // The scene file didn't open: the bench fails
     void fail(const std::string& error);
     [[nodiscard]] bool failed() const { return !error.empty(); }
@@ -98,6 +100,7 @@ private:
     bool noiseStarted = false;
     uint64_t gpuTimesRead = 0;
     std::vector<std::array<float, 6>> passTimes;  // per measured frame: cache, ReSTIR, trace, DLSS, exposure, display
+    std::vector<std::array<float, CpuFrameTimes::PhaseCount>> cpuPhaseTimes;  // per measured frame (CpuFrameTimes)
     std::chrono::steady_clock::time_point measureStart;
     double frameMs = 0.0;
     nlohmann::ordered_json memory;

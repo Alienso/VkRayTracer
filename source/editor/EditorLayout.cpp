@@ -161,7 +161,7 @@ void Editor::buildMenuBar() {
     ImGui::EndMainMenuBar();
 }
 
-// Frame time and GPU passes in the image's top left corner; the mouse goes through it to the camera
+// Frame time, CPU phases and GPU passes in the image's top left corner; the mouse goes through it to the camera
 void Editor::buildOverlay() {
     const ImGuiDockNode* middle = ImGui::DockBuilderGetCentralNode(dockSpaceId());
     ImVec2 corner = middle != nullptr ? middle->Pos : ImGui::GetMainViewport()->WorkPos;
@@ -175,6 +175,10 @@ void Editor::buildOverlay() {
         ImGui::Text("GPU: cache %.2f ms, ReSTIR %.2f, trace %.2f, DLSS %.2f, exposure %.2f, display %.2f",
                     stats.gpuPassMs[0], stats.gpuPassMs[1], stats.gpuPassMs[2], stats.gpuPassMs[3],
                     stats.gpuPassMs[4], stats.gpuPassMs[5]);
+        // CPU work without the waits for the GPU and the display (those fill the frame up to the slower of them)
+        ImGui::Text("CPU: %.2f ms (update %.2f, UI %.2f, render %.2f), waiting %.2f", cpuTimes.workMs(),
+                    cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Ui],
+                    cpuTimes.ms[CpuFrameTimes::Render], cpuTimes.ms[CpuFrameTimes::Wait]);
         if (stats.accumulating) {
             ImGui::Text("%u frames accumulated", stats.accumulatedFrames);
         }

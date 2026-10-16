@@ -54,6 +54,9 @@ public:
     void shutdown();
 
     RendererStats stats() const;
+    // How long the last render() was blocked: on the frame slot's fence (the GPU is behind), acquiring the swapchain
+    // image or presenting (the display: vsync). The rest of render() is CPU work.
+    [[nodiscard]] float lastWaitMs() const { return frameWaitMs; }
     GpuMemory gpuMemory() const;
     // The next frame's image, without the UI, as a PNG: into fileName, or capture_<date>_<time>.png when empty.
     // Written at the start of the frame after (beginFrame).
@@ -141,6 +144,7 @@ private:
 
     // This frame: its number, the uniforms and their inputs (Frame.cpp)
     uint64_t frameNumber = 0;  // submitted frames (currentFrame is only the slot)
+    float frameWaitMs = 0.0f;  // this render()'s blocked time (lastWaitMs)
     uint32_t frameIndex = 0;
     uint32_t fogLevel = 0;     // this frame's FOG (buildSceneUniforms): which of the trace pipelines are used
     float frameDeltaTime = 0.0f;  // seconds, given to beginFrame

@@ -239,12 +239,8 @@ void Bench::beforeRender(Scene& scene, Renderer& renderer, const AssetStore& ass
         if (renderer.renderSettings().renderMode != requestedRenderMode) {
             fail("the render mode asked for is not available (DLSS: --no-dlss, no NVIDIA RTX GPU, or no Streamline DLLs)");
         }
-        measureStart = std::chrono::steady_clock::now();
     }
     if (frame == warmupFrames + measuredFrames + 1) {
-        if (measuredFrames > 0) {
-            frameMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - measureStart).count() / measuredFrames;
-        }
         PROCESS_MEMORY_COUNTERS_EX counters{};
         counters.cb = sizeof(counters);
         if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
@@ -262,10 +258,24 @@ void Bench::beforeRender(Scene& scene, Renderer& renderer, const AssetStore& ass
     }
 }
 
-bool Bench::afterRender(Renderer& renderer) {
+bool Bench::afterRender(Renderer& renderer, const CpuFrameTimes& cpuTimes) {
     if (!error.empty()) {
         writeResults(renderer);
         return true;
+    }
+    // Wall time from the end of the last warm-up frame's render to the end of the last measured one's: the same
+    // frames as the CPU phases (a capture's PNG, written at the start of the frame after, isn't in it)
+    if (frame == warmupFrames) {
+        measureStart = std::chrono::steady_clock::now();
+    }
+    if (frame == warmupFrames + measuredFrames && measuredFrames > 0) {
+        frameMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - measureStart).count() /
+                  measuredFrames;
+    }
+    if (frame > warmupFrames && frame <= warmupFrames + measuredFrames) {
+        std::array<float, CpuFrameTimes::PhaseCount> phases{};
+        std::copy(std::begin(cpuTimes.lastMs), std::end(cpuTimes.lastMs), phases.begin());
+        cpuPhaseTimes.push_back(phases);
     }
     RendererStats stats = renderer.stats();
     if (stats.gpuTimesRead != gpuTimesRead) {
@@ -338,6 +348,21 @@ void Bench::writeResults(const Renderer& renderer) {
     }
     gpu["total"] = summary(total);
     results["gpuMs"] = gpu;
+    // CPU time per phase; "work" is all but "wait" (blocked on the GPU's fence, acquire and present)
+    nlohmann::ordered_json cpu = nlohmann::ordered_json::object();
+    std::vector<float> work;
+    for (const auto& phases : cpuPhaseTimes) {
+        work.push_back(phases[CpuFrameTimes::Update] + phases[CpuFrameTimes::Ui] + phases[CpuFrameTimes::Render]);
+    }
+    for (int phase = 0; phase < CpuFrameTimes::PhaseCount; phase++) {
+        std::vector<float> values;
+        for (const auto& phases : cpuPhaseTimes) {
+            values.push_back(phases[phase]);
+        }
+        cpu[CpuFrameTimes::phaseNames[phase]] = summary(values);
+    }
+    cpu["work"] = summary(work);
+    results["cpuMs"] = cpu;
     // Wall time per frame: the slowest of the CPU's work, the GPU's, and the display's refresh (with DLSS loaded,
     // Streamline makes the driver wait for vsync)
     results["frameMs"] = frameMs;

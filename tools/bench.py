@@ -150,6 +150,10 @@ def numbers(results):
         mean = results.get('gpuMs', {}).get(p, {}).get('mean')
         if mean is not None and (mean > 0.005 or p == 'total'):
             row[f'gpu {p} ms'] = mean
+    for phase in ['work', 'update', 'ui', 'render', 'wait']:
+        mean = results.get('cpuMs', {}).get(phase, {}).get('mean')
+        if mean is not None:
+            row[f'cpu {phase} ms'] = mean
     row['frame ms (wall)'] = results.get('frameMs')
     memory = results.get('memory', {})
     if 'privateBytes' in memory:

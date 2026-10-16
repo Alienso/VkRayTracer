@@ -11,6 +11,7 @@
 #include <string>
 #include "assets/AssetStore.h"
 #include "app/CameraController.h"
+#include "app/CpuFrameTimes.h"
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 #include "app/Window.h"
@@ -18,7 +19,7 @@
 class Editor {
 public:
     Editor(AssetStore& assets, Scene& scene, CameraController& cameraController, Renderer& renderer,
-           RenderSettings& settings, Window& window);
+           RenderSettings& settings, const CpuFrameTimes& cpuTimes, Window& window);
 
     // After the scene was made: the last object selected, a load error to show
     void init(const std::string& error);
@@ -41,6 +42,7 @@ private:
     CameraController& cameraController;
     Renderer& renderer;
     RenderSettings& settings;  // the program's: the renderer renders with them
+    const CpuFrameTimes& cpuTimes;  // the main loop's (the overlay)
     Window& window;
     RendererStats stats;  // fetched at the start of build()
 

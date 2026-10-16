@@ -11,6 +11,7 @@
 #include "assets/AssetStore.h"
 #include "app/Bench.h"
 #include "app/CameraController.h"
+#include "app/CpuFrameTimes.h"
 #include "editor/Editor.h"
 #include "scene/RenderList.h"
 #include "renderer/Renderer.h"
@@ -50,8 +51,9 @@ private:
     RenderList renderList;  // what this frame draws (Scene::buildRenderList), given to the renderer
     CameraController cameraController;  // moves scene.camera()
     RenderSettings renderSettings;  // the renderer renders with them, the editor edits them, a bench sets them
+    CpuFrameTimes cpuTimes;  // measured by mainLoop, shown by the editor, recorded by a bench
     Renderer renderer{assets, renderSettings};
-    Editor editor{assets, scene, cameraController, renderer, renderSettings, window};
+    Editor editor{assets, scene, cameraController, renderer, renderSettings, cpuTimes, window};
 
     void createDefaultScene();
     void mainLoop();

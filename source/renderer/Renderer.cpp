@@ -4,6 +4,7 @@
 
 #include <vulkan/vulkan.h>
 #include <stdexcept>
+#include <chrono>
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_vulkan.h>
 #include <imgui/backends/imgui_impl_glfw.h>
@@ -140,6 +141,7 @@ GpuMemory Renderer::gpuMemory() const {
 }
 
 void Renderer::render(const RenderList& list) {
+    frameWaitMs = 0.0f;
     renderList = &list;
     scene.update(list, frameNumber);  // the render list's changes on the GPU (new models, instances, lights, sky)
     applySceneChanges();
@@ -194,13 +196,27 @@ void Renderer::applySceneChanges() {
     changes = {};
 }
 
+// The time spent in a call that blocks (the frame slot's fence, acquire, present) goes to frameWaitMs
+template <typename Call>
+static auto timedWait(float& waitMs, Call call) {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    auto result = call();
+    waitMs += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return result;
+}
+
 void Renderer::drawFrame() {
-    vkWaitForFences(gpu.device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+    timedWait(frameWaitMs, [&]() {
+        return vkWaitForFences(gpu.device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+    });
     scene.beginFrame(currentFrame, frameNumber);  // the frame that last used this slot is done
     trace.updateTracePipelines();
 
     uint32_t imageIndex;
-    VkResult result = vkp.acquireNextImage(gpu.device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+    VkResult result = timedWait(frameWaitMs, [&]() {
+        return vkp.acquireNextImage(gpu.device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame],
+                                    VK_NULL_HANDLE, &imageIndex);
+    });
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapChain();
         return;
@@ -243,7 +259,7 @@ void Renderer::drawFrame() {
     presentInfo.pImageIndices = &imageIndex;
     presentInfo.pResults = nullptr;
 
-    result = vkp.queuePresent(gpu.presentQueue, &presentInfo);
+    result = timedWait(frameWaitMs, [&]() { return vkp.queuePresent(gpu.presentQueue, &presentInfo); });
     if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
         framebufferResized = false;
         recreateSwapChain();

@@ -3,6 +3,7 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <imgui/imgui.h>
 #include <imgui/backends/imgui_impl_glfw.h>
@@ -76,7 +77,12 @@ static uint64_t unusedModelBudget(const GpuMemory& memory, uint64_t unusedMemory
 }
 
 void Application::mainLoop() {
+    using Clock = std::chrono::steady_clock;
+    auto msBetween = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<float, std::milli>(to - from).count();
+    };
     double lastTime = glfwGetTime();
+    Clock::time_point frameStart = Clock::now();  // the last frame's render returned (all of the loop is in a phase)
     while (!window.shouldClose()) {
         glfwPollEvents();
         bool fullscreenKey = glfwGetKey(window.handle(), GLFW_KEY_F11) == GLFW_PRESS;
@@ -96,10 +102,12 @@ void Application::mainLoop() {
         assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
         assets.update();  // a model or map loaded in the background arrives
         scene.update();   // and shows up
+        Clock::time_point uiStart = Clock::now();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         editor.build();  // may change the scene
         ImGui::Render();
+        Clock::time_point uiEnd = Clock::now();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
         glm::vec3 cameraFrom = scene.camera().position;
@@ -113,8 +121,18 @@ void Application::mainLoop() {
         if (window.takeResized()) {  // dragged, maximized, fullscreen (F11 or the editor)
             renderer.resize();
         }
+        Clock::time_point renderStart = Clock::now();
         renderer.render(renderList);
-        if (bench && !benchDone && bench->afterRender(renderer)) {
+        Clock::time_point renderEnd = Clock::now();
+        float waitMs = renderer.lastWaitMs();
+        float phases[CpuFrameTimes::PhaseCount];
+        phases[CpuFrameTimes::Update] = msBetween(frameStart, uiStart) + msBetween(uiEnd, renderStart);
+        phases[CpuFrameTimes::Ui] = msBetween(uiStart, uiEnd);
+        phases[CpuFrameTimes::Render] = std::max(0.0f, msBetween(renderStart, renderEnd) - waitMs);
+        phases[CpuFrameTimes::Wait] = waitMs;
+        cpuTimes.add(phases);
+        frameStart = renderEnd;
+        if (bench && !benchDone && bench->afterRender(renderer, cpuTimes)) {
             benchDone = true;
             window.requestClose();
         }
