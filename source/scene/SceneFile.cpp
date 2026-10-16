@@ -391,8 +391,12 @@ static ModelHandle loadModel(AssetStore& assets, const Json& reference) {
     if (auto it = reference.find("builtIn"); it != reference.end()) {
         std::string name;
         fromJson(*it, name);
-        handle = name == "Floor" ? assets.floor() : assets.requestModel(name);
-        if (name != "Floor" && !isBuiltInModel(name)) {
+        if (name == "Floor") {
+            handle = assets.isLoaded(assets.floor()) ? assets.floor() : assets.addFloor();  // as createDefault
+        } else if (isBuiltInModel(name)) {
+            handle = assets.requestModel(name);
+        } else {
+            // (Checked before asking the store: it would take the name for a model file and start loading it)
             throw std::runtime_error("no built-in model \"" + name + "\"");
         }
     } else if (auto file = reference.find("file"); file != reference.end()) {

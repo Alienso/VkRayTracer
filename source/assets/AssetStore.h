@@ -95,7 +95,9 @@ public:
     [[nodiscard]] ModelHandle floor() const { return floorModel; }
 
     // The model of that file (or built-in name): the loaded one, the one loading, or a new load (see above). Built-in
-    // models are made at once (throws if there is no such one). Takes no reference: the caller acquires it.
+    // models are made at once; any other name is taken for a file (one that doesn't exist fails in the background).
+    // Throws only when a built-in model's textures don't fit (setTextureLimit). Takes no reference: the caller
+    // acquires it.
     ModelHandle requestModel(const std::string& fileName);
     // Once per frame on the main thread: a finished load joins the lists (or fails), the next one starts. True when
     // something arrived or failed.

@@ -43,6 +43,20 @@ if (NOT glslc_executable)
     message(FATAL_ERROR "glslc not found: install the Vulkan SDK (it sets VULKAN_SDK)")
 endif()
 
+# What doesn't need Vulkan or a window (the scene, the asset store and model loading, render settings as JSON): a
+# library the program and the tests both link
+add_library(vulkanDemoCore STATIC
+        include/stb_image.cpp include/stb_image.h
+        source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneFile.cpp source/scene/SceneEnvironment.h source/scene/Camera.cpp
+        source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
+        source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/EditableFields.h source/assets/ModelLoader.cpp
+        source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
+        source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h
+        source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
+        source/core/RangeAllocator.h source/core/DeferredDeletion.h
+        include/cgltf/cgltf.h)
+target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
+
 add_executable(vulkanDemo main.cpp
         include/imgui/imgui.cpp include/imgui/imgui.h
         include/imgui/imgui_draw.cpp include/imgui/imgui_demo.cpp
@@ -50,16 +64,11 @@ add_executable(vulkanDemo main.cpp
         include/imgui/backends/imgui_impl_glfw.h include/imgui/backends/imgui_impl_glfw.cpp
         include/imgui/backends/imgui_impl_vulkan.h include/imgui/backends/imgui_impl_vulkan.cpp
 
-        include/stb_image.cpp include/stb_image.h
         include/stb_image_write.cpp include/stb_image_write.h
         include/vma/vk_mem_alloc.cpp include/vma/vk_mem_alloc.h
         source/app/Application.cpp source/app/Application.h source/app/Window.cpp source/app/Window.h
         source/app/CameraController.cpp source/app/CameraController.h source/app/Bench.cpp source/app/Bench.h source/app/CpuFrameTimes.h
         source/editor/Editor.cpp source/editor/Editor.h source/editor/EditorScene.cpp source/editor/EditorFile.cpp source/editor/EditorLayout.cpp source/editor/EditorRenderer.cpp
-        source/scene/Scene.cpp source/scene/Scene.h source/scene/SceneFile.cpp source/scene/SceneEnvironment.h source/scene/Camera.cpp
-        source/scene/Camera.h source/scene/RenderList.h source/scene/Portal.h
-        source/assets/AssetStore.cpp source/assets/AssetStore.h source/assets/EditableFields.h source/assets/ModelLoader.cpp
-        source/assets/ModelLoader.h source/assets/BuiltInModels.cpp source/assets/BuiltInModels.h
         source/renderer/Renderer.cpp source/renderer/Renderer.h source/renderer/GpuAssets.h
         source/renderer/RayTracer.cpp source/renderer/SceneGpu.cpp source/renderer/Materials.cpp
         source/renderer/Lights.cpp source/renderer/Portals.cpp source/renderer/Environment.cpp source/renderer/Display.cpp
@@ -75,15 +84,27 @@ add_executable(vulkanDemo main.cpp
         source/renderer/RadianceCache.h
         source/renderer/RayTracer.h source/renderer/Frame.cpp
         source/renderer/Dlss.h
-        source/renderer/RenderSettingsFile.cpp source/renderer/RenderSettingsFile.h
-        source/core/Configuration.cpp source/core/Configuration.h source/core/Handles.h
-        include/cgltf/cgltf.h)
+        )
 
-target_link_libraries(vulkanDemo glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
+target_link_libraries(vulkanDemo vulkanDemoCore glfw3 gdi32 psapi Vulkan::Vulkan)  # psapi: the process's memory (benches)
 
 # Models and HDR environments are read from the project's resource folder, shared by all builds (copied next to each
-# executable they took 5.8 GB per build folder, and ~15 s of every build). --resources <dir> overrides it.
-target_compile_definitions(vulkanDemo PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
+# executable they took 5.8 GB per build folder, and ~15 s of every build). --resources <dir> overrides it. (The
+# default is Configuration.cpp's, in vulkanDemoCore above.)
+
+# Unit tests (tests/, Catch2 from include/catch2, Boost license): the pure pieces, no GPU. Run with ctest, or the
+# tests executable itself (--help for Catch2's options: a test by name, tags, ...). Linked with static libstdc++ so it
+# runs whatever is first on PATH (Git's libstdc++ crashes the program).
+add_executable(tests
+        include/catch2/catch_amalgamated.cpp include/catch2/catch_amalgamated.hpp
+        tests/TestHelpers.h tests/RangeAllocatorTests.cpp tests/DeferredDeletionTests.cpp tests/AssetStoreTests.cpp
+        tests/SceneTreeTests.cpp tests/RenderListTests.cpp tests/SceneFileTests.cpp tests/RenderSettingsFileTests.cpp
+        tests/TransformTests.cpp tests/ModelLoaderTests.cpp)
+target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
+set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
+target_link_libraries(tests vulkanDemoCore -static-libgcc -static-libstdc++)
+enable_testing()
+add_test(NAME unit COMMAND tests)
 
 # Scene files (scenes/): the editor opens and saves them in the scenes folder next to the executable. Copied there
 # when CMake runs, and only those that aren't there yet: a build never overwrites a scene saved there. To keep a

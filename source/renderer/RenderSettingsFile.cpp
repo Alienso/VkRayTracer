@@ -7,7 +7,7 @@
 #include <set>
 #include <nlohmann/json.hpp>
 #include "renderer/RenderSettingsFile.h"
-#include "renderer/Renderer.h"
+#include "renderer/RendererTypes.h"
 
 using Names = std::vector<const char*>;
 

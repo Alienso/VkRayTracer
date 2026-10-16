@@ -193,7 +193,7 @@ void Scene::reindex() {
 
 EntityId Scene::addObject(const std::string& fileName, bool originalSize) {
     ModelComponent component;
-    component.model = assets.requestModel(fileName);  // (throws only for a missing built-in: nothing changed yet)
+    component.model = assets.requestModel(fileName);  // (before anything changes: it may throw, see AssetStore.h)
     component.originalSize = originalSize && !isBuiltInModel(fileName);
     if (assets.isLoaded(component.model)) {
         for (const MeshInstance& part : assets.model(component.model).parts) {
@@ -355,8 +355,13 @@ bool Scene::setParent(EntityId id, EntityId parent, bool keepWorld) {
     entity->parent = parent;
     siblings(parent).push_back(id);
     layoutRevision++;  // the tree order changed
-    if (keepWorld) {
-        entity->local = toTransform(parent == 0 ? world : glm::inverse(worldTransform(parent)) * world);
+    glm::mat4 parentWorld = parent == 0 ? glm::mat4(1.0f) : worldTransform(parent);
+    // Flattened (a scale of 0 in it or above it) there is no transform that keeps it in place: inverting the parent,
+    // or splitting a flat matrix into scale and rotation, gives NaNs (and a scene file that can't be read back:
+    // JSON has no NaN). It keeps its local transform then.
+    auto invertible = [](const glm::mat4& m) { return std::abs(glm::determinant(glm::mat3(m))) > 1e-12f; };
+    if (keepWorld && invertible(parentWorld) && invertible(world)) {
+        entity->local = toTransform(parent == 0 ? world : glm::inverse(parentWorld) * world);
     }
     return true;
 }

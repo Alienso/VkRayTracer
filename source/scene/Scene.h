@@ -108,8 +108,8 @@ public:
 
     // A new root entity showing that model file (loading it in the background if it isn't loaded yet). Fitted to the
     // standard size and lined up next to the others, or (originalSize) in the file's own size and place, hiding the
-    // floor. Throws only for a built-in model that doesn't exist; a file that can't be loaded leaves the entity
-    // without its model (missingFile), reported by update.
+    // floor (built-in models: at the middle, their own size). A file that can't be loaded leaves the entity without
+    // its model (missingFile), reported by update.
     EntityId addObject(const std::string& fileName, bool originalSize);
     // A new entity without components (a group), under parent (0: a root)
     EntityId addEmpty(const std::string& name, EntityId parent);
@@ -123,7 +123,8 @@ public:
     void remove(EntityId id);
     // Moves the entity under parent (0: to the roots), last among its children. keepWorld: its local transform is
     // changed so it stays where it is (as far as a transform can: a rotated non-uniform scale above it can't be
-    // matched exactly); else it keeps its local transform and moves with the new parent. False (nothing changed)
+    // matched exactly; under a parent scaled to 0, or scaled to 0 itself, not at all: it keeps its local transform);
+    // else it keeps its local transform and moves with the new parent. False (nothing changed)
     // when parent is the entity itself or under it.
     bool setParent(EntityId id, EntityId parent, bool keepWorld = true);
 
