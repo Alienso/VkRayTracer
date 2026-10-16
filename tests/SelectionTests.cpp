@@ -1,12 +1,10 @@
 //
 // The editor's selection, the parts without the GPU: which entity an instance belongs to and the instance ranges of
-// a selection (RenderList), the boxes the outline is looked for in (Scene::selectionBoxes), and the transform undo
-// (editor/TransformHistory.h).
+// a selection (RenderList), the boxes the outline is looked for in (Scene::selectionBoxes). Undo: EditHistoryTests.cpp.
 //
 
 #include <catch_amalgamated.hpp>
 #include "TestHelpers.h"
-#include "editor/TransformHistory.h"
 #include "scene/Scene.h"
 
 static const std::string cornellBox = "Cornell box";
@@ -19,12 +17,6 @@ struct TestScene : TestAssets {
     RenderList list;
     TestScene() { scene.createDefault(); }
 };
-
-Transform at(float x) {
-    Transform t;
-    t.position = {x, 0.0f, 0.0f};
-    return t;
-}
 
 }  // namespace
 
@@ -115,71 +107,3 @@ TEST_CASE("Selection: the floor has a box too", "[Selection]") {
     CHECK(boxes[0].max.z > boxes[0].min.z);
 }
 
-// ---------------------------------------------------------------------------------------------
-// TransformHistory
-
-TEST_CASE("Transform history: undo and redo put the transforms back, in order", "[Selection][Undo]") {
-    TestScene t;
-    EntityId a = t.scene.addEmpty("A", 0);
-    EntityId b = t.scene.addEmpty("B", 0);
-    TransformHistory history;
-    t.scene.find(a)->local = at(1.0f);
-    history.record(a, at(0.0f), at(1.0f));
-    t.scene.find(b)->local = at(5.0f);
-    history.record(b, at(0.0f), at(5.0f));
-    t.scene.find(a)->local = at(2.0f);
-    history.record(a, at(1.0f), at(2.0f));
-
-    EntityId changed = 0;
-    REQUIRE(history.undo(t.scene, changed));
-    CHECK(changed == a);
-    CHECK(t.scene.find(a)->local.position.x == 1.0f);
-    REQUIRE(history.undo(t.scene, changed));
-    CHECK(changed == b);
-    CHECK(t.scene.find(b)->local.position.x == 0.0f);
-    REQUIRE(history.redo(t.scene, changed));
-    CHECK(t.scene.find(b)->local.position.x == 5.0f);
-    REQUIRE(history.undo(t.scene, changed));
-    REQUIRE(history.undo(t.scene, changed));
-    CHECK(t.scene.find(a)->local.position.x == 0.0f);
-    CHECK_FALSE(history.undo(t.scene, changed));
-    CHECK(history.canRedo());
-}
-
-TEST_CASE("Transform history: a new change drops the redo; no change, no entry", "[Selection][Undo]") {
-    TestScene t;
-    EntityId a = t.scene.addEmpty("A", 0);
-    TransformHistory history;
-    history.record(a, at(0.0f), at(0.0f));
-    CHECK_FALSE(history.canUndo());
-    history.record(a, at(0.0f), at(1.0f));
-    EntityId changed = 0;
-    history.undo(t.scene, changed);
-    CHECK(history.canRedo());
-    history.record(a, at(0.0f), at(3.0f));
-    CHECK_FALSE(history.canRedo());
-}
-
-TEST_CASE("Transform history: changes of removed entities are skipped; it keeps the last 200", "[Selection][Undo]") {
-    TestScene t;
-    EntityId a = t.scene.addEmpty("A", 0);
-    EntityId gone = t.scene.addEmpty("Gone", 0);
-    TransformHistory history;
-    history.record(a, at(0.0f), at(1.0f));
-    history.record(gone, at(0.0f), at(2.0f));
-    t.scene.remove(gone);
-    EntityId changed = 0;
-    REQUIRE(history.undo(t.scene, changed));
-    CHECK(changed == a);  // (the removed one's change went)
-
-    TransformHistory many;
-    for (int i = 0; i < 250; i++) {
-        many.record(a, at(static_cast<float>(i)), at(static_cast<float>(i + 1)));
-    }
-    int undone = 0;
-    while (many.undo(t.scene, changed)) {
-        undone++;
-    }
-    CHECK(undone == static_cast<int>(TransformHistory::maxChanges));
-    CHECK(t.scene.find(a)->local.position.x == 50.0f);  // as far back as it keeps
-}

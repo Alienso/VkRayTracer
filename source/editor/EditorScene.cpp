@@ -23,6 +23,7 @@ void Editor::init(const std::string& error) {
         log(LogLevel::Error, error);
     }
     savedText = scene.contentText();  // the starting scene counts as saved: nothing to ask about yet
+    editHistory.reset(scene);
 }
 
 // Adds an object for the UI and selects it. Its model may still be loading: the log says when it arrives (or why
@@ -123,7 +124,7 @@ void Editor::buildEntityTree() {
     if (ImGui::IsItemClicked()) {
         selected = 0;
     }
-    if (selected != 0 && ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput &&
+    if (selected != 0 && ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput && !deleteKeyUsed &&
         ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
         edit = {TreeEdit::Delete, selected, 0};
     }
@@ -260,11 +261,9 @@ void Editor::buildEntityUi(EntityId id) {
 
     ImGui::Separator();
     if (ImGui::Button("Reset transform")) {
-        Transform before = entity.local;
         entity.local.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         entity.local.scale = glm::vec3(1.0f);
         entity.local.position.y = 0.0f;
-        transformHistory.record(id, before, entity.local);
     }
     ImGui::SameLine();
     if (ImGui::Button("+ Game")) {
@@ -292,19 +291,9 @@ void Editor::buildEntityUi(EntityId id) {
     ImGui::PopID();
 }
 
-// A transform field taken hold of / let go after a change: one change for undo
-#define RECORD_TRANSFORM_EDIT()                                                       \
-    if (ImGui::IsItemActivated()) {                                                   \
-        detailsBefore = local;                                                        \
-    }                                                                                 \
-    if (ImGui::IsItemDeactivatedAfterEdit()) {                                        \
-        transformHistory.record(entity.id, detailsBefore, local);                     \
-    }
-
 void Editor::buildTransformUi(Entity& entity) {
     Transform& local = entity.local;
     ImGui::DragFloat3("Position", &local.position.x, 0.01f);
-    RECORD_TRANSFORM_EDIT()
 
     if (eulerEntity != entity.id || local.rotation != eulerRotation) {
         eulerEntity = entity.id;
@@ -315,7 +304,6 @@ void Editor::buildTransformUi(Entity& entity) {
         local.rotation = eulerToQuat(eulerDegrees);
         eulerRotation = local.rotation;
     }
-    RECORD_TRANSFORM_EDIT()
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
@@ -328,16 +316,12 @@ void Editor::buildTransformUi(Entity& entity) {
         if (ImGui::DragFloat("Scale", &scale, 0.01f, 0.01f, 100.0f)) {
             local.scale = glm::vec3(scale);
         }
-        RECORD_TRANSFORM_EDIT()
     } else {
         ImGui::DragFloat3("Scale", &local.scale.x, 0.01f, 0.01f, 100.0f);
-        RECORD_TRANSFORM_EDIT()
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Uniform", &entity.uniformScale) && entity.uniformScale) {
-        Transform before = local;
         local.scale = glm::vec3(local.scale.x);
-        transformHistory.record(entity.id, before, local);
     }
 }
 

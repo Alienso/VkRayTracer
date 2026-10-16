@@ -17,7 +17,7 @@
 #include "renderer/Renderer.h"
 #include "scene/Scene.h"
 #include "app/Window.h"
-#include "editor/TransformHistory.h"
+#include "editor/EditHistory.h"
 
 class Editor {
 public:
@@ -102,12 +102,11 @@ private:
     GizmoTool gizmoTool = GizmoTool::Move;
     bool gizmoLocal = false;  // move and rotate along the entity's own axes (else the world's)
     bool gizmoDragging = false;
-    EntityId gizmoDragEntity = 0;
-    Transform gizmoDragBefore;
-    // Undo / redo of transform changes; the Details panel's transform fields record into it too (the value when a
-    // field was taken hold of)
-    TransformHistory transformHistory;
-    Transform detailsBefore;
+    // Undo / redo (EditHistory.h): committed after every edit; an edit ends when a widget is let go (any panel:
+    // itemWasActive), a handle drag ends, or a key changed the scene
+    EditHistory editHistory;
+    bool itemWasActive = false;
+    bool deleteKeyUsed = false;  // this frame's Delete deleted over the image (the Outliner leaves it alone then)
     // The selected entity's rotation as the editor shows it (degrees): kept between frames, not recomputed from the
     // quaternion while it is being edited, so the angles don't jump (a rotation has several Euler forms). Recomputed
     // when another entity is selected or the rotation was changed elsewhere.
@@ -206,8 +205,9 @@ private:
     void finishGizmoDrag();
     void frameSelection();
     void handleEditorKeys();
-    void undoTransform();
-    void redoTransform();
+    void undoEdit();
+    void redoEdit();
+    void commitEdit();  // after a change made outside the widgets (keys, handles)
     void buildEntityNode(EntityId id, TreeEdit& edit);
     void buildEntityUi(EntityId id);
     void buildTransformUi(Entity& entity);

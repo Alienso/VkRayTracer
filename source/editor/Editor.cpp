@@ -91,6 +91,13 @@ void Editor::build() {
     // Also with the panels hidden: closing the window asks about unsaved changes
     buildSaveAsQuestion();
     buildUnsavedQuestion();
+    // A widget let go (a field, slider, checkbox, button, menu item, a drag in the Outliner): what it changed is one
+    // change for undo
+    bool itemActive = ImGui::IsAnyItemActive();
+    if (itemWasActive && !itemActive) {
+        commitEdit();
+    }
+    itemWasActive = itemActive;
     updateTitle();
 }
 

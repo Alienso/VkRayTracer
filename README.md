@@ -170,7 +170,8 @@ Controls (as in Unity and Unreal):
 - Selecting: click an object in the image (outlined in orange); click the same spot again to select its parent
   (a door's panel, the door, the wall). Esc selects nothing.
 - Handles on the selection: Q none, W move, E rotate, R scale, X world / local axes; hold Ctrl while dragging to
-  snap. F frames the selection, Ctrl+D duplicates, Delete deletes, Ctrl+Z / Ctrl+Y undo / redo a transform change
+  snap. F frames the selection, Ctrl+D duplicates, Delete deletes (with the mouse over the image), Ctrl+Z / Ctrl+Y
+  undo / redo any change to the scene: moves, deletes, re-parenting, components, materials, lights, the environment
   (the Tools menu lists them).
 - F11 fullscreen, F1 hides the UI, Ctrl+S saves the scene, F5 plays / stops, E opens a door while playing.
 

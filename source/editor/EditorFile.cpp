@@ -55,7 +55,7 @@ void Editor::perform(FileAction action, const std::string& path) {
     switch (action) {
         case FileAction::New:
             scene.clear();
-            transformHistory.clear();
+            editHistory.reset(scene);
             scenePath.clear();
             userSettings.lastScene.clear();  // the default scene at the next start
             savedText = scene.contentText();
@@ -77,7 +77,7 @@ void Editor::perform(FileAction action, const std::string& path) {
 bool Editor::openSceneFile(const std::string& path) {
     try {
         std::vector<std::string> warnings = scene.load(path);
-        transformHistory.clear();  // (its entities are another scene's)
+        editHistory.reset(scene);  // (its changes were another scene's)
         scenePath = path;
         userSettings.addRecentScene(path);
         userSettings.lastScene = path;
@@ -300,10 +300,11 @@ void Editor::play() {
         return;
     }
     hasUnsavedChanges();  // the mark as it is now: kept while playing
+    finishGizmoDrag();
+    editHistory.commit(scene);  // an edit not committed yet is undoable after Stop (the history stays: nothing is
+                                // undone while playing, and Stop puts the scene back)
     playSnapshot = scene.text();
     playing = true;
-    finishGizmoDrag();
-    transformHistory.clear();  // (undoing an edit from before Play would change the scene Stop puts back)
     log(LogLevel::Info, "Playing: what changes now is undone by Stop");
 }
 
@@ -322,6 +323,6 @@ void Editor::stop() {
     }
     playSnapshot.clear();
     finishGizmoDrag();
-    transformHistory.clear();  // (edits made while playing are gone)
+    editHistory.sync(scene);  // (the scene is back as it was at Play, the last commit)
     hasUnsavedChanges();
 }

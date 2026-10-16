@@ -159,16 +159,17 @@ void Editor::buildMenuBar() {
         if (ImGui::MenuItem("Frame the selection", "F", false, scene.find(selected) != nullptr)) {
             frameSelection();
         }
-        if (ImGui::MenuItem("Undo transform", "Ctrl+Z", false, transformHistory.canUndo())) {
-            undoTransform();
+        if (ImGui::MenuItem("Undo", "Ctrl+Z", false, editHistory.canUndo() && !playing)) {
+            undoEdit();
         }
-        if (ImGui::MenuItem("Redo transform", "Ctrl+Y", false, transformHistory.canRedo())) {
-            redoTransform();
+        if (ImGui::MenuItem("Redo", "Ctrl+Y", false, editHistory.canRedo() && !playing)) {
+            redoEdit();
         }
         ImGui::Separator();
         ImGui::TextDisabled("Click the image to select; again to select its parent.");
         ImGui::TextDisabled("Hold Ctrl while dragging a handle to snap. Ctrl+D duplicates, Esc deselects,");
-        ImGui::TextDisabled("Delete deletes. Hold the right mouse button to fly (W/A/S/D, Space, Shift).");
+        ImGui::TextDisabled("Delete deletes (mouse over the image). Undo covers every change to the scene.");
+        ImGui::TextDisabled("Hold the right mouse button to fly (W/A/S/D, Space, Shift).");
         ImGui::EndMenu();
     }
     const char* toolNames[] = {"Select", "Move", "Rotate", "Scale"};

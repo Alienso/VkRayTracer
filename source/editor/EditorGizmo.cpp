@@ -3,7 +3,7 @@
 // and scale by dragging, and the keys that go with them (the same as Unity's and Unreal's):
 //   Q no handles, W move, E rotate, R scale, X world / local axes (scale is always along its own), hold Ctrl while
 //   dragging to snap (0.25 units, 15 degrees, 0.1 of the scale), F frame the selection, Ctrl+D duplicate, Esc select
-//   nothing, Delete delete (over the image or in the Outliner), Ctrl+Z / Ctrl+Y undo / redo a transform change.
+//   nothing, Delete delete (over the image or in the Outliner), Ctrl+Z / Ctrl+Y undo / redo (any change, EditHistory).
 // The keys are off while typing, while flying (right mouse button: W/A/S/D move the camera then) and while playing
 // (the game's).
 //
@@ -76,12 +76,10 @@ void Editor::buildGizmo() {
             t.scale = glm::max(scale, glm::vec3(1e-4f));  // (not to 0: the entity couldn't be scaled back by hand)
         }
     }
-    // A drag is one change for undo: from where it started to where it ends
-    if (ImGuizmo::IsUsing() && !gizmoDragging) {
+    // A drag is one change for undo: committed when it ends
+    if (ImGuizmo::IsUsing()) {
         gizmoDragging = true;
-        gizmoDragEntity = selected;
-        gizmoDragBefore = before;
-    } else if (!ImGuizmo::IsUsing()) {
+    } else {
         finishGizmoDrag();
     }
 }
@@ -91,9 +89,7 @@ void Editor::finishGizmoDrag() {
         return;
     }
     gizmoDragging = false;
-    if (const Entity* entity = scene.find(gizmoDragEntity)) {
-        transformHistory.record(gizmoDragEntity, gizmoDragBefore, entity->local);
-    }
+    commitEdit();
 }
 
 // The camera moves back along its view until the selection fills about the middle of the image
@@ -129,18 +125,18 @@ void Editor::frameSelection() {
 
 void Editor::handleEditorKeys() {
     ImGuiIO& io = ImGui::GetIO();
+    deleteKeyUsed = false;
     if (io.WantTextInput || ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
         return;
     }
-    // Undo and redo work while playing too (the history starts empty at Play: only what was changed since)
+    if (playing) {
+        return;  // the letters are the game's (and nothing is undone while playing: Stop puts the scene back)
+    }
     if (ImGui::IsKeyPressed(ImGuiKey_Z, false) && io.KeyCtrl && !io.KeyShift) {
-        undoTransform();
+        undoEdit();
     } else if ((ImGui::IsKeyPressed(ImGuiKey_Y, false) && io.KeyCtrl) ||
                (ImGui::IsKeyPressed(ImGuiKey_Z, false) && io.KeyCtrl && io.KeyShift)) {
-        redoTransform();
-    }
-    if (playing) {
-        return;  // the letters are the game's
+        redoEdit();
     }
     if (!io.KeyCtrl && !io.KeyAlt) {
         if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
@@ -161,28 +157,35 @@ void Editor::handleEditorKeys() {
     }
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false) && scene.find(selected) != nullptr) {
         selected = scene.duplicate(selected);
+        commitEdit();
     }
-    // Delete over the image (no panel has the keyboard); in the Outliner it is the tree's (buildEntityTree)
-    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) &&
-        scene.find(selected) != nullptr) {
+    // Delete with the mouse over the image (not over a panel); in the Outliner it is the tree's (buildEntityTree)
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && !io.WantCaptureMouse && scene.find(selected) != nullptr) {
+        deleteKeyUsed = true;  // (not the Outliner's too, this frame)
         EntityId parent = scene.find(selected)->parent;
         scene.remove(selected);
         selected = parent;
+        commitEdit();
     }
 }
 
-void Editor::undoTransform() {
-    finishGizmoDrag();
-    EntityId changed = 0;
-    if (transformHistory.undo(scene, changed)) {
-        selected = changed;
+void Editor::commitEdit() {
+    if (!playing) {
+        editHistory.commit(scene);
     }
 }
 
-void Editor::redoTransform() {
+// (The selection stays when its entity is still there: ids are kept by undo; one an undo removed is deselected)
+void Editor::undoEdit() {
     finishGizmoDrag();
-    EntityId changed = 0;
-    if (transformHistory.redo(scene, changed)) {
-        selected = changed;
+    if (!playing && editHistory.undo(scene) && scene.find(selected) == nullptr) {
+        selected = 0;
+    }
+}
+
+void Editor::redoEdit() {
+    finishGizmoDrag();
+    if (!playing && editHistory.redo(scene) && scene.find(selected) == nullptr) {
+        selected = 0;
     }
 }

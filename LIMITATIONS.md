@@ -844,11 +844,16 @@ the display pass with it, the helmet selected). A selection covering the whole i
 alpha-tested plants) traces the whole image once more per frame: not measured.
 - Fix if it shows: trace it at a lower resolution, or only when the camera or the selection changed.
 
-### Undo covers transforms only
-Ctrl+Z / Ctrl+Y undo and redo moves, turns and scales (handles, the Details panel's fields, Reset transform).
-Adding, deleting (Delete has no undo), duplicating, re-parenting, materials, components and settings aren't
-undone. The history is cleared when another scene opens and at Play and Stop.
-- Fix: a general undo, e.g. scene snapshots (Scene::text, as Play keeps) per change, cheap enough for small scenes.
+### Undo keeps whole scene texts, and restores the whole scene
+Each change is the scene's text before and after it (editor/EditHistory.h; a few KB, at most 100 changes or 64 MB).
+Undoing loads the text before it back, like opening the scene: the render list and the TLAS are rebuilt once and
+the image starts accumulating again; models still loaded aren't reloaded (one that was unloaded since loads again
+in the background). The camera stays where it is; the program's settings (render mode, samples per pixel, ...)
+aren't part of it. A change counts when an edit ends (a widget let go, a handle drag ended, a key): a model
+arriving from the background between two edits goes into the next change (undoing that shows it as loading
+again, briefly). The history is cleared when another scene opens; nothing is undone while playing.
+- Writing the text walks every part of every model (hidden parts are saved by index): a few ms per edit in Jungle
+  Ruins (not measured on its own).
 
 ### Handles under a scaled, turned parent
 A handle works in the world and the result is turned back into the entity's own transform. Under a parent that is
