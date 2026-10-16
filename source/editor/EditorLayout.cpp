@@ -211,6 +211,9 @@ void Editor::buildOverlay() {
                         cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Ui],
                         cpuTimes.ms[CpuFrameTimes::Render], cpuTimes.ms[CpuFrameTimes::Wait]);
         }
+        if (playing && !gameStatus.empty()) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "%s", gameStatus.c_str());
+        }
         if (stats.accumulating) {
             ImGui::Text("%u frames accumulated", stats.accumulatedFrames);
         }

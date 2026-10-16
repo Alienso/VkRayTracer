@@ -58,7 +58,7 @@ add_library(vulkanDemoCore STATIC
         include/cgltf/cgltf.h)
 target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
 
-# The game (GAME_PLAN.md): uses the scene, never the renderer, the editor or the window; it links only the core
+# The game (README: Game logic): uses the scene, never the renderer, the editor or the window; it links only the core
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
         source/game/GameProperties.h source/game/StepInterpolation.cpp source/game/StepInterpolation.h
@@ -108,9 +108,11 @@ add_executable(tests
         tests/TestHelpers.h tests/RangeAllocatorTests.cpp tests/DeferredDeletionTests.cpp tests/AssetStoreTests.cpp
         tests/SceneTreeTests.cpp tests/RenderListTests.cpp tests/SceneFileTests.cpp tests/RenderSettingsFileTests.cpp
         tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp tests/GameComponentTests.cpp
-        tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp)
+        tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
+        tests/GameInteractionTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
+target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes
 target_link_libraries(tests vulkanDemoGame vulkanDemoCore -static-libgcc -static-libstdc++)
 enable_testing()
 add_test(NAME unit COMMAND tests)

@@ -1,0 +1,19 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 9,
+  "portalPairsMade": 0,
+  "camera": {"position":[0.0,1.8,5.0],"yaw":0.0,"pitch":-5.0,"fov":60.0},
+  "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
+  "entities": [
+    {"id":1,"name":"Floor","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Floor"}},
+    {"id":2,"name":"Helmet","parent":0,"position":[0.0,0.3,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"file":"DamagedHelmet.glb"},"game":[{"type":"spin","properties":{"speed":20}}]},
+    {"id":3,"name":"Camera path (around the helmet)","parent":0,"position":[0.0,1.8,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"cameraPath","properties":{"speed":1.5,"loop":true,"lookAt":8}}]},
+    {"id":4,"name":"Point 1","parent":3,"position":[0.0,0.0,5.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":5,"name":"Point 2","parent":3,"position":[5.0,0.5,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":6,"name":"Point 3","parent":3,"position":[0.0,1.5,-5.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":7,"name":"Point 4","parent":3,"position":[-5.0,0.5,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":8,"name":"Look at the helmet's middle","parent":2,"position":[0.0,1.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]}
+  ],
+  "models": []
+}

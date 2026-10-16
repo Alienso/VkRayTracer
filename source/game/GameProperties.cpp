@@ -72,6 +72,18 @@ glm::vec3 GameProperties::vec3(const char* key, const glm::vec3& fallback) {
     return {(*value)[0].get<float>(), (*value)[1].get<float>(), (*value)[2].get<float>()};
 }
 
+uint64_t GameProperties::entity(const char* key) {
+    const nlohmann::json* value = find(key);
+    if (value == nullptr) {
+        return 0;
+    }
+    if (!value->is_number_unsigned() || value->get<uint64_t>() == 0) {
+        warn(std::string("\"") + key + "\" isn't an entity's id (the Details panel shows it)");
+        return 0;
+    }
+    return value->get<uint64_t>();
+}
+
 void GameProperties::finish() {
     for (const auto& [key, value] : json.items()) {
         if (!asked.count(key)) {

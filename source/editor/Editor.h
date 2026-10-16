@@ -45,6 +45,8 @@ public:
     [[nodiscard]] bool isPlaying() const { return playing; }
     // View > "Blend game steps": things the game moves are shown between its steps (StepInterpolation)
     [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
+    // What the game says over the image while playing ("Pickups: 2 / 5"; "": nothing)
+    void setGameStatus(const std::string& text) { gameStatus = text; }
     // A warning for the Log panel (from outside the editor: reading the user settings)
     void warn(const std::string& text) { log(LogLevel::Warning, text); }
     void info(const std::string& text) { log(LogLevel::Info, text); }
@@ -110,6 +112,7 @@ private:
     bool askSaveAs = false;     // open the Save As question this frame
     bool playing = false;
     bool blendSteps = true;
+    std::string gameStatus;
     std::string playSnapshot;   // Scene::text at Play
     std::string saveError;      // why the last save failed (also in the log), shown in the save questions
     // New / Open / Exit wait for the unsaved-changes question

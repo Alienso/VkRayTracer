@@ -175,6 +175,7 @@ void Application::updateGame(float deltaTime, const InputState& input) {
     } else if (!playing && game.running()) {
         game.stop();  // (the editor put the scene back)
         interpolation.clear();
+        editor.setGameStatus("");
     }
     if (!game.running()) {
         return;
@@ -188,6 +189,7 @@ void Application::updateGame(float deltaTime, const InputState& input) {
         game.update(step);
     });
     interpolation.blend(scene, steps, static_cast<float>(gameLoop.owed() / GameLoop::stepSeconds));
+    editor.setGameStatus(game.status());
 }
 
 void Application::mainLoop() {
@@ -225,13 +227,13 @@ void Application::mainLoop() {
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
         ImGuiIO& io = ImGui::GetIO();
         InputState input = readInput(!io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        glm::vec3 cameraFrom = scene.camera().position;  // (the game may move it too: through portals as well)
         Clock::time_point gameStart = Clock::now();
         updateGame(deltaTime, input);
         Clock::time_point gameEnd = Clock::now();
-        glm::vec3 cameraFrom = scene.camera().position;
         if (bench) {
             bench->beforeRender(scene, renderer, assets);  // the camera is the bench's
-        } else {
+        } else if (!game.controlsCamera()) {
             cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
         }
         scene.moveCameraThroughPortals(cameraFrom);

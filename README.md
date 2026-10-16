@@ -90,7 +90,7 @@ it there (it stays where it is).
 
 Scenes are saved as JSON files (one line per entity, so changes show in a diff) in the `scenes` folder next to
 the program: the entities, the camera, the sun and sky, and edits to the models' materials and lights (only what
-differs from the model file). `scenes/` in the project has Sponza, Bistro at night and Jungle Ruins; CMake copies
+differs from the model file). `scenes/` in the project has Sponza, Bistro at night, Jungle Ruins and two game scenes (below); CMake copies
 them next to the program, but never over a scene already there. The JSON reader is nlohmann/json (include/nlohmann,
 MIT license).
 
@@ -106,6 +106,30 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
 - `tools/sponza`: Intel's Sponza 2022, with textures converted to compressed DDS.
 - `tools/bistro`: Amazon Lumberyard Bistro (exterior and interior) from FBX.
 - `tools/jungle`: Intel's Jungle Ruins from USD, with the plants thinned out around the camera.
+
+## Game logic
+
+A small game layer sits beside the engine (`source/game/`, its own library linking only the Vulkan-free core): the
+scene, the renderer and the editor don't know about it, and it uses the scene the way the editor does. It isn't a
+general engine: one game, in C++, whose behaviours are listed in `source/game/Game.h`.
+
+- **Game components**: an entity can have a list of them, each a `type` and its `properties` as free-form JSON
+  (Details panel: "+ Game", or the Outliner's right-click menu). The scene stores and saves them without reading
+  the properties; the game reads them when Play starts. A typo or a wrong kind of value is a warning in the Log,
+  and the default is used. Other entities are named by their id (shown next to the name in the Details panel).
+- **Play / Stop** (F5, or the menu bar): Play keeps the scene, Stop puts it back as it was, so what changes while
+  playing (by the game or by hand) is undone. While playing, New, Open and Save are off. `--play` plays as soon as
+  the scene is open.
+- **Fixed steps**: the game advances 60 times a second whatever the frame rate (`source/game/GameLoop.h`), so it
+  behaves the same on any machine. What moves is shown blended between the steps, so it moves smoothly at any
+  frame rate (View > "Blend game steps" to compare).
+- **Behaviours**: `spin` and `bob` (turning, floating), `door` (E near it opens and closes it), `pickup` (taken by
+  coming near, counted over the image), `trigger` (a box that shows or hides another entity while the camera is
+  inside), `spawner` (copies of an entity that come and go), `cameraPath` (the game flies the camera along the
+  entity's children). The camera stands in for the player.
+- `scenes/game_demo.json` has each of them except the camera path (walk up to the door and press E, collect the
+  coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera path around
+  the helmet. What it can't do yet: LIMITATIONS.md, "Game".
 
 ## Requirements
 
@@ -137,10 +161,11 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
      messages from inside DLSS (`nv.ngx.dlssd`) each time it starts are NVIDIA's, not ours.
    - `--resources <dir>`: read models/ and environments/ from another folder
    - `--shader-dir <dir>`: read the compiled shaders (.spv) from another folder (it keeps its own pipeline cache)
+   - `--play`: start playing the game once the scene is open (see Game logic)
    - `--bench <file.json>` (and `--bench-out <dir>`): run a bench and exit, see below
 
 Controls: right mouse button to look around, W/A/S/D to move, Space/Shift up and down, Ctrl to move faster, F11
-for fullscreen, F1 to hide the UI, Ctrl+S to save the scene.
+for fullscreen, F1 to hide the UI, Ctrl+S to save the scene, F5 to play / stop, E to open a door while playing.
 
 ## Benches
 

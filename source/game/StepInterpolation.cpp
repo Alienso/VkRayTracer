@@ -2,11 +2,26 @@
 // Blending the game's steps for showing. See StepInterpolation.h.
 //
 
+#include <cmath>
 #include <unordered_map>
 #include "game/StepInterpolation.h"
 
 static bool same(const Transform& a, const Transform& b) {
     return a.position == b.position && a.rotation == b.rotation && a.scale == b.scale;
+}
+
+static bool same(const Camera& a, const Camera& b) {
+    return a.position == b.position && a.yaw == b.yaw && a.pitch == b.pitch && a.fov == b.fov;
+}
+
+static Camera mix(const Camera& a, const Camera& b, float t) {
+    Camera result = b;
+    result.position = glm::mix(a.position, b.position, t);
+    float turn = std::fmod(b.yaw - a.yaw + 540.0f, 360.0f) - 180.0f;  // the shorter way round
+    result.yaw = a.yaw + turn * t;
+    result.pitch = glm::mix(a.pitch, b.pitch, t);
+    result.fov = glm::mix(a.fov, b.fov, t);
+    return result;
 }
 
 static Transform mix(const Transform& a, const Transform& b, float t) {
@@ -21,9 +36,18 @@ void StepInterpolation::clear() {
     before.clear();
     moving.clear();
     snapped.clear();
+    cameraMoving = false;
+    cameraSnapped = false;
 }
 
 void StepInterpolation::restore(Scene& scene) {
+    if (cameraMoving) {
+        if (same(scene.camera(), cameraShown)) {
+            scene.camera() = cameraCurrent;
+        } else {
+            cameraMoving = false;  // moved by something else (a portal, the editor): kept
+        }
+    }
     for (size_t i = 0; i < moving.size();) {
         Entity* entity = scene.find(moving[i].id);
         if (entity != nullptr && same(entity->local, moving[i].shown)) {
@@ -39,6 +63,7 @@ void StepInterpolation::beforeStep(const Scene& scene) {
     if (!enabled) {
         return;
     }
+    cameraBefore = scene.camera();
     const std::vector<Entity>& entities = scene.entities();
     before.resize(entities.size());
     for (size_t i = 0; i < entities.size(); i++) {
@@ -50,6 +75,8 @@ void StepInterpolation::blend(Scene& scene, int stepsRun, float alpha) {
     if (!enabled) {
         moving.clear();
         snapped.clear();
+        cameraMoving = false;
+        cameraSnapped = false;
         return;
     }
     if (stepsRun > 0) {
@@ -80,8 +107,16 @@ void StepInterpolation::blend(Scene& scene, int stepsRun, float alpha) {
             }
         }
         snapped.clear();
+        cameraMoving = !same(cameraBefore, scene.camera()) && !cameraSnapped;
+        cameraPrevious = cameraBefore;
+        cameraCurrent = scene.camera();
+        cameraSnapped = false;
     }
     alpha = glm::clamp(alpha, 0.0f, 1.0f);
+    if (cameraMoving) {
+        cameraShown = mix(cameraPrevious, cameraCurrent, alpha);
+        scene.camera() = cameraShown;
+    }
     for (Moving& m : moving) {
         if (Entity* entity = scene.find(m.id)) {
             m.shown = mix(m.previous, m.current, alpha);

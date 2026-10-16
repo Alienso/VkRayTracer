@@ -224,6 +224,12 @@ void Editor::buildEntityUi(EntityId id) {
     if (ImGui::InputText("Name", name, sizeof(name))) {
         entity.name = name;
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("id %llu", static_cast<unsigned long long>(id));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Game components name other entities by this (\"target\": %llu).",
+                          static_cast<unsigned long long>(id));
+    }
     ImGui::Checkbox("Visible", &entity.visible);
     if (const Entity* parent = scene.find(entity.parent)) {
         ImGui::SameLine();
@@ -656,7 +662,7 @@ void Editor::addGameComponent(EntityId id) {
 }
 
 // The entity's game components: a type and properties (JSON) each, in their order. The editor doesn't know the
-// types: the game reads them when Play starts (GAME_PLAN.md). Properties are applied while they are valid JSON.
+// types: the game reads them when Play starts (game/Game.h). Properties are applied while they are valid JSON.
 void Editor::buildGameUi(EntityId id) {
     std::vector<GameComponent> components = *scene.game(id);
     bool fresh = gameEditEntity != id || gameEdits.size() != components.size();

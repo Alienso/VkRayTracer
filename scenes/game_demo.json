@@ -1,0 +1,26 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 16,
+  "portalPairsMade": 0,
+  "camera": {"position":[0.0,1.6,7.0],"yaw":0.0,"pitch":-5.0,"fov":60.0},
+  "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
+  "entities": [
+    {"id":1,"name":"Floor","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Floor"}},
+    {"id":2,"name":"Helmet (pickup)","parent":0,"position":[0.0,0.6,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.35],"model":{"file":"DamagedHelmet.glb"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":60}},{"type":"bob","properties":{"height":0.15,"period":2.5}}]},
+    {"id":3,"name":"Coin left","parent":0,"position":[-3.0,0.5,-1.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":4,"name":"Coin right","parent":0,"position":[3.0,0.5,-1.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":5,"name":"Coin behind the door","parent":0,"position":[0.0,0.5,-10.5],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5,"remove":true}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":6,"name":"Wall","parent":0,"position":[0.0,0.0,-7.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":7,"name":"Wall left","parent":6,"position":[-3.5,1.25,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[5.0,2.5,0.2],"uniformScale":false,"model":{"builtIn":"Cube"}},
+    {"id":8,"name":"Wall right","parent":6,"position":[3.0,1.25,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[5.0,2.5,0.2],"uniformScale":false,"model":{"builtIn":"Cube"}},
+    {"id":9,"name":"Door (E to open)","parent":6,"position":[-1.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"door","properties":{"openAngle":100,"seconds":0.8,"radius":2.5}}]},
+    {"id":10,"name":"Door panel","parent":9,"position":[0.75,1.1,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.5,2.2,0.1],"uniformScale":false,"model":{"builtIn":"Cube"}},
+    {"id":11,"name":"Lamp zone (trigger)","parent":0,"position":[0.0,1.5,-10.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[6.0,3.0,5.0],"uniformScale":false,"game":[{"type":"trigger","properties":{"target":12}}]},
+    {"id":12,"name":"Lamp (shown in the zone)","parent":0,"position":[0.0,2.6,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.5,0.5,0.5],"visible":false,"model":{"builtIn":"Light orb"}},
+    {"id":13,"name":"Crate (spawned)","parent":0,"position":[0.0,-10.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.4,0.4,0.4],"visible":false,"model":{"builtIn":"Cube"},"game":[{"type":"spin","properties":{"speed":120,"axis":[1,1,0]}},{"type":"bob","properties":{"height":0.3,"period":1.5}}]},
+    {"id":14,"name":"Spawner","parent":0,"position":[4.5,1.5,-3.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"spawner","properties":{"target":13,"interval":1,"lifetime":4,"max":4}}]},
+    {"id":15,"name":"Spawner 2","parent":0,"position":[-4.5,1.5,-3.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"spawner","properties":{"target":13,"interval":1.5,"lifetime":3,"max":2}}]}
+  ],
+  "models": []
+}

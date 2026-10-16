@@ -772,3 +772,55 @@ executable is linked statically and doesn't care.
 
 ### No precompiled header
 Measured: 0.6-0.7 s saved per file (15-20%: most of the time is optimizing, not parsing). Not worth it yet.
+
+## Game
+
+### The camera is the player: no body, no collision
+Distances (door, pickup) and the trigger boxes use the camera's position; the camera flies through walls, doors and
+the floor. There is no CPU-side collision or ray query against the scene (the BVH is on the GPU).
+- Fix: a player entity with a simple shape (a capsule) and collision against boxes the scene marks, or a coarse
+  CPU copy of the static geometry; picking (clicking an object) the same, or a GPU pick read back a frame late.
+- Where: source/game/Game.cpp (`player`).
+
+### Entity ids in properties aren't remapped
+`"target": 12` names entity 12. Duplicating a door, trigger or spawner copies the id as it is, so the copy still
+points at the original's target; nothing warns. Removing the target leaves the id dangling (a warning at Play).
+- Fix: `Scene::duplicate` rewriting ids that point inside the copied subtree needs to know which properties are
+  ids: either the game tells the editor (a list of id properties per type) or ids get a marked form
+  (`{"entity": 12}`).
+- Where: Scene::duplicate (source/scene/Scene.cpp), GameProperties::entity.
+
+### Behaviours that move the same thing fight
+Each behaviour writes what it moves every step: `spin` and `door` on one entity both set the rotation, and the later
+one in Game::update's order wins (spin, bob, door, pickup, trigger, spawner, camera path). A trigger and a pickup on
+the same target both set its visibility. Nothing warns.
+- Fix: put one of them on a child entity (spin the child, swing the parent), or a warning at Play for known pairs.
+
+### Edits made while playing are lost
+Stop puts back the scene as it was at Play: moving, adding or editing things by hand while playing is undone too
+(as in Unity). Save is off while playing, so the played state can't be saved by mistake.
+- Also: Stop logs a missing model's "failed to load" again (putting the scene back asks for it again).
+
+### What is shown runs up to a step behind
+Moving things are shown blended between the last two steps (StepInterpolation): up to 16.7 ms behind the game. And
+a moving entity changes the TLAS every frame instead of 60 times a second: above 60 fps that is more refits (cheap
+in small scenes; Jungle Ruins runs well below 60 fps, where every frame has a step anyway). Not measured on its own.
+View > "Blend game steps" turns it off.
+
+### A camera path ignores portals
+A camera path sets the camera's position from its points every step, so a portal the path crosses moves the camera
+for a frame and the next step puts it back. Paths are in world positions taken at Play (points moved while playing
+don't change the path).
+
+### Keys reach the game along with the editor's
+While playing, the game sees every key the editor isn't typing into, the editor's own shortcuts too (F1, F5, F11).
+Only E is used by a behaviour. Benches never play.
+
+### Free-form properties: no help in the editor
+The Details panel edits a component's properties as JSON text; it doesn't know the types or their properties
+(Game.h lists them). Mistakes show as warnings in the Log at Play.
+- Fix: the game hands the editor its types and their fields (data only), for a type dropdown and proper widgets.
+
+### An older build drops game components
+The scene file's version stayed 1 (`"game"` is a new optional field): a build from before game components opens a
+newer scene without complaint, and saving it there drops them.
