@@ -1,5 +1,5 @@
 //
-// Showing the game's steps between them (game/StepInterpolation.h, GAME_PLAN.md 2b): smooth at frame rates that
+// Showing the game's steps between them (game/StepInterpolation.h): smooth at frame rates that
 // aren't the step rate, never seen by the game, jumps shown at once, other changes left alone.
 //
 

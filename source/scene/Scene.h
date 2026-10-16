@@ -83,7 +83,7 @@ struct ModelComponent {
     std::string missingEntry;
 };
 
-// The game's data on an entity (GAME_PLAN.md): the scene stores, copies and saves it, the game gives it meaning when
+// The game's data on an entity (game/Game.h): the scene stores, copies and saves it, the game gives it meaning when
 // Play starts. An entity has a list of them, in the order the editor shows them.
 struct GameComponent {
     std::string type;        // what the game makes of it ("spin", "door", ...; "": nothing yet)
@@ -121,7 +121,7 @@ public:
     // later (update), with their hidden parts and edits; what goes wrong then comes as messages.
     std::vector<std::string> load(const std::string& path);
     // The same with the file's text (name: for the errors). With text(), the scene as its file would have it, camera
-    // included: Play keeps it and Stop loads it back (GAME_PLAN.md).
+    // included: Play keeps it and Stop loads it back (Editor::play / stop).
     std::vector<std::string> loadText(const std::string& text, const std::string& name);
     [[nodiscard]] std::string text() const;
     // The scene as its file would have it, without the camera (moving around isn't a change to save): when this

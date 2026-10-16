@@ -1,5 +1,5 @@
 //
-// The keyboard and mouse as the game sees them (GAME_PLAN.md): filled by the program from the window each frame
+// The keyboard and mouse as the game sees them (game/Game.h): filled by the program from the window each frame
 // (Application.cpp), so the game includes no GLFW. Key numbers are GLFW's (Key:: names the ones in use).
 //
 

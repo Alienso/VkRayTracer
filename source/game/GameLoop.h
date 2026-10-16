@@ -1,5 +1,5 @@
 //
-// The game's clock (GAME_PLAN.md): the game advances in fixed steps of exactly 1/60 s, however long the frames are,
+// The game's clock (game/Game.h): the game advances in fixed steps of exactly 1/60 s, however long the frames are,
 // so the same input gives the same state on any machine and tests are exact. Each frame's time goes into an
 // accumulator, and as many whole steps run as it holds; at most maxStepsPerFrame, so a long frame (a model loading,
 // a breakpoint) doesn't owe ever more steps: the time beyond that is dropped (the game runs slower than real time).

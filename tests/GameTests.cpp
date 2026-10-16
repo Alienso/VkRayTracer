@@ -1,5 +1,5 @@
 //
-// The game (game/, GAME_PLAN.md phase 2): the fixed-step clock and its input, the behaviours spin and bob, and the
+// The game (game/): the fixed-step clock and its input, the behaviours spin and bob, and the
 // warnings for components it can't use.
 //
 

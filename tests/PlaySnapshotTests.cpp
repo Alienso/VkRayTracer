@@ -1,5 +1,5 @@
 //
-// Play / Stop's snapshot (Scene::text / loadText, GAME_PLAN.md phase 1): what Play keeps, Stop puts back, whatever
+// Play / Stop's snapshot (Scene::text / loadText, Editor::play / stop): what Play keeps, Stop puts back, whatever
 // changed in between; the program's settings are left alone.
 //
 

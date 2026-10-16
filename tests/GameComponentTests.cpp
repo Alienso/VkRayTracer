@@ -1,5 +1,5 @@
 //
-// Game components (Scene.h, GAME_PLAN.md): the scene keeps them with their entities, copies and removes them, and
+// Game components (Scene.h, game/Game.h): the scene keeps them with their entities, copies and removes them, and
 // saves them as they are; what it can't read is a warning, not a refused file.
 //
 
