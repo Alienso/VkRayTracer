@@ -55,6 +55,8 @@ public:
     [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
     // What the game says over the image while playing ("Pickups: 2 / 5"; "": nothing)
     void setGameStatus(const std::string& text) { gameStatus = text; }
+    // The game's behaviour types (Game::types), for the game components' Type menu
+    void setGameTypes(std::vector<GameComponentType> types) { gameTypes = std::move(types); }
     // A warning for the Log panel (from outside the editor: reading the user settings)
     void warn(const std::string& text) { log(LogLevel::Warning, text); }
     void info(const std::string& text) { log(LogLevel::Info, text); }
@@ -124,6 +126,7 @@ private:
     };
     EntityId gameEditEntity = 0;
     std::vector<GameEdit> gameEdits;
+    std::vector<GameComponentType> gameTypes;
     // Scene files (EditorFile.cpp)
     static constexpr const char* scenesDirectory = "scenes";  // next to the executable (CMakeLists.txt copies scenes/)
     std::string scenePath;   // the open scene's file; empty: not saved yet

@@ -111,10 +111,12 @@ Larger scenes are prepared with the scripts in `tools/` (run through Blender's P
 
 A small game layer sits beside the engine (`source/game/`, its own library linking only the Vulkan-free core): the
 scene, the renderer and the editor don't know about it, and it uses the scene the way the editor does. It isn't a
-general engine: one game, in C++, whose behaviours are listed in `source/game/Game.h`.
+general engine: one game, in C++, with one file per behaviour in `source/game/behaviours/` (how a type is made:
+`source/game/Behaviour.h`).
 
 - **Game components**: an entity can have a list of them, each a `type` and its `properties` as free-form JSON
-  (Details panel: "+ Game", or the Outliner's right-click menu). The scene stores and saves them without reading
+  (Details panel: "+ Game", or the Outliner's right-click menu; the Type menu fills in the type's defaults and shows
+  what it does). The scene stores and saves them without reading
   the properties; the game reads them when Play starts. A typo or a wrong kind of value is a warning in the Log,
   and the default is used. Other entities are named by their id (shown next to the name in the Details panel).
 - **Play / Stop** (F5, or the menu bar): Play keeps the scene, Stop puts it back as it was, so what changes while

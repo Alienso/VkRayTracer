@@ -74,10 +74,10 @@ glm::vec3 GameProperties::vec3(const char* key, const glm::vec3& fallback) {
 
 uint64_t GameProperties::entity(const char* key) {
     const nlohmann::json* value = find(key);
-    if (value == nullptr) {
+    if (value == nullptr || (value->is_number_unsigned() && value->get<uint64_t>() == 0)) {
         return 0;
     }
-    if (!value->is_number_unsigned() || value->get<uint64_t>() == 0) {
+    if (!value->is_number_unsigned()) {
         warn(std::string("\"") + key + "\" isn't an entity's id (the Details panel shows it)");
         return 0;
     }

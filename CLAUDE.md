@@ -16,7 +16,8 @@ fix one.
 - `source/scene`, `source/assets`: Scene, SceneFile (JSON), AssetStore, model loading. These go into
   `vulkanDemoCore` (no Vulkan).
 - `source/game`: `vulkanDemoGame` (Game, GameLoop, StepInterpolation). Links only vulkanDemoCore and runs at a
-  fixed 60 Hz step. New behaviours go in Game.cpp (listed at the top of Game.h).
+  fixed 60 Hz step. New behaviours: one file in `source/game/behaviours/` (see Behaviour.h), listed in
+  Behaviours.cpp.
 - `source/renderer`: Renderer, Frame, passes (Display, Selection, ...). `shaders/raytrace/*.glsl` are included
   by `raytrace.comp`.
 - `source/editor`: ImGui editor, ImGuizmo gizmo, EditHistory (undo as whole-scene text snapshots).

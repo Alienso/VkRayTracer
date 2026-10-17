@@ -21,10 +21,13 @@ public:
     float number(const char* key, float fallback);
     bool flag(const char* key, bool fallback);
     glm::vec3 vec3(const char* key, const glm::vec3& fallback);
-    // An entity's id (Scene's EntityId), 0 when not given; a value that isn't an id is a warning (and 0)
+    // An entity's id (Scene's EntityId), 0 when not given (or given as 0: a type's defaults); a value that isn't an
+    // id is a warning (and 0)
     uint64_t entity(const char* key);
     // Warns about the keys none of the above asked for
     void finish();
+    // The keys the reads above asked for
+    [[nodiscard]] const std::set<std::string>& askedKeys() const { return asked; }
 
     void warn(const std::string& text) { warnings.push_back(where + ": " + text); }
 

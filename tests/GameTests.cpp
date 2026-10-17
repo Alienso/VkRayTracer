@@ -1,13 +1,16 @@
 //
-// The game (game/): the fixed-step clock and its input, the behaviours spin and bob, and the
-// warnings for components it can't use.
+// The game (game/): the fixed-step clock and its input, the behaviours spin and bob, the warnings for components it
+// can't use, and the types' defaults.
 //
 
 #include <catch_amalgamated.hpp>
+#include <set>
 #include <glm/gtc/constants.hpp>
 #include "TestHelpers.h"
+#include "game/Behaviours.h"
 #include "game/Game.h"
 #include "game/GameLoop.h"
+#include "game/GameProperties.h"
 #include "scene/Scene.h"
 
 namespace {  // (each test file has its own TestScene)
@@ -240,4 +243,37 @@ TEST_CASE("Game: stop drops the behaviours; Play again reads the scene anew", "[
     t.scene.setGame(id, {{"spin", ""}, {"bob", ""}});
     t.play();
     CHECK(t.game.behaviours() == 2);
+}
+
+TEST_CASE("Game: each type's defaults are the properties it reads, and read without warnings", "[Game]") {
+    TestScene t;
+    EntityId id = t.scene.addEmpty("A", 0);
+    t.scene.addEmpty("Point 1", id);  // (a camera path's)
+    t.scene.addEmpty("Point 2", id);
+    std::vector<std::unique_ptr<BehaviourListBase>> lists = makeBehaviourLists();
+    std::vector<GameComponentType> types = Game::types();
+    REQUIRE(types.size() == lists.size());
+    std::set<std::string> names;
+    for (size_t i = 0; i < lists.size(); i++) {
+        BehaviourListBase& list = *lists[i];
+        INFO(list.type());
+        CHECK(types[i].type == list.type());
+        CHECK_FALSE(types[i].help.empty());
+        CHECK(names.insert(list.type()).second);
+        nlohmann::json defaults = nlohmann::json::parse(list.defaults());
+        REQUIRE(defaults.is_object());
+        std::set<std::string> keys;
+        for (const auto& [key, value] : defaults.items()) {
+            keys.insert(key);
+        }
+        std::vector<std::string> warnings;
+        GameProperties properties(list.defaults(), list.type(), warnings);
+        GameWorld world;
+        list.read(ReadContext{t.scene, *t.scene.find(id), false, 0.0, world}, properties);
+        properties.finish();
+        CHECK(properties.askedKeys() == keys);
+        for (const std::string& warning : warnings) {  // only an id it needs (0 in the defaults: not given)
+            CHECK(warning.find("needs \"") != std::string::npos);
+        }
+    }
 }

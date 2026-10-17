@@ -61,6 +61,10 @@ target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PRO
 # The game (README: Game logic): uses the scene, never the renderer, the editor or the window; it links only the core
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
+        source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h
+        source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Door.cpp
+        source/game/behaviours/Pickup.cpp source/game/behaviours/Trigger.cpp source/game/behaviours/Spawner.cpp
+        source/game/behaviours/CameraPath.cpp
         source/game/GameProperties.h source/game/StepInterpolation.cpp source/game/StepInterpolation.h
         source/core/Input.h)
 target_link_libraries(vulkanDemoGame vulkanDemoCore)

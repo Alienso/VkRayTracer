@@ -44,6 +44,7 @@ int Application::run() {
     // The UI: ImGui's context and its input from the window are the program's; the renderer adds the Vulkan side
     ImGui::CreateContext();
     editor.initUi();
+    editor.setGameTypes(Game::types());
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);  // true: install input callbacks, chaining the window's own
     renderer.init(window.handle(), renderList);
     if (bench) {

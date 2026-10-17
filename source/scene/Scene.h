@@ -94,6 +94,13 @@ struct GameComponent {
     }
 };
 
+// A type the game knows (Game::types), for the editor: the scene and the editor don't depend on the game
+struct GameComponentType {
+    std::string type;
+    std::string help;      // what it does and what its properties mean
+    std::string defaults;  // its properties with their defaults, a JSON object as text
+};
+
 // What happened while models and maps loaded (Scene::takeMessages): for the editor's log
 struct SceneMessage {
     enum class Level { Info, Warning, Error } level;

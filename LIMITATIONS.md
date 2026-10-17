@@ -780,7 +780,7 @@ Distances (door, pickup) and the trigger boxes use the camera's position; the ca
 the floor. There is no CPU-side collision or ray query against the scene (the BVH is on the GPU).
 - Fix: a player entity with a simple shape (a capsule) and collision against boxes the scene marks, or a coarse
   CPU copy of the static geometry; picking (clicking an object) the same, or a GPU pick read back a frame late.
-- Where: source/game/Game.cpp (`player`).
+- Where: `GameWorld::player` (source/game/Behaviour.h), set in Game::update.
 
 ### Entity ids in properties aren't remapped
 `"target": 12` names entity 12. Duplicating a door, trigger or spawner copies the id as it is, so the copy still
@@ -792,7 +792,7 @@ points at the original's target; nothing warns. Removing the target leaves the i
 
 ### Behaviours that move the same thing fight
 Each behaviour writes what it moves every step: `spin` and `door` on one entity both set the rotation, and the later
-one in Game::update's order wins (spin, bob, door, pickup, trigger, spawner, camera path). A trigger and a pickup on
+one in the update order wins (spin, bob, door, pickup, trigger, spawner, camera path: game/Behaviours.cpp). A trigger and a pickup on
 the same target both set its visibility. Nothing warns.
 - Fix: put one of them on a child entity (spin the child, swing the parent), or a warning at Play for known pairs.
 
@@ -816,10 +816,18 @@ don't change the path).
 While playing, the game sees every key the editor isn't typing into, the editor's own shortcuts too (F1, F5, F11).
 Only E is used by a behaviour. Benches never play.
 
-### Free-form properties: no help in the editor
-The Details panel edits a component's properties as JSON text; it doesn't know the types or their properties
-(Game.h lists them). Mistakes show as warnings in the Log at Play.
-- Fix: the game hands the editor its types and their fields (data only), for a type dropdown and proper widgets.
+### Properties are edited as JSON text
+The Details panel's Type menu lists the game's types (Game::types: name, help, default properties) and fills in a
+new component's defaults, but the properties stay a JSON text field. Mistakes show as warnings in the Log at Play.
+- Fix: the types' fields with their kinds (number, flag, vector, entity id) instead of a defaults text, for proper
+  widgets (and an entity picker for ids).
+
+### Behaviours look entities up every step
+Each behaviour finds its entity by id (a hash lookup) every step, and world positions walk up the parents. 10,000
+behaviours (entities two groups deep) take ~0.7 ms per step in Release, ~4% of a core at 60 steps a second; 1,000
+take ~0.07 ms.
+- Fix when it matters: the world transforms worked out once per step for all entities (as the render list does),
+  and behaviours holding entity indices, refreshed when entities are added or removed.
 
 ### An older build drops game components
 The scene file's version stayed 1 (`"game"` is a new optional field): a build from before game components opens a

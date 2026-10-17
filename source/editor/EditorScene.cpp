@@ -611,7 +611,7 @@ void Editor::buildPunctualLightUi(SceneModel& model) {
 }
 
 
-// ImGui text fields for a std::string (the buffer grows as text is typed)
+// An ImGui text field for a std::string (the buffer grows as text is typed)
 static int resizeString(ImGuiInputTextCallbackData* data) {
     if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
         auto* text = static_cast<std::string*>(data->UserData);
@@ -619,11 +619,6 @@ static int resizeString(ImGuiInputTextCallbackData* data) {
         data->Buf = text->data();
     }
     return 0;
-}
-
-static bool inputText(const char* label, std::string& text) {
-    return ImGui::InputText(label, text.data(), text.capacity() + 1, ImGuiInputTextFlags_CallbackResize, resizeString,
-                            &text);
 }
 
 static bool inputTextMultiline(const char* label, std::string& text, const ImVec2& size) {
@@ -670,8 +665,10 @@ void Editor::addGameComponent(EntityId id) {
     scene.setGame(id, std::move(components));
 }
 
-// The entity's game components: a type and properties (JSON) each, in their order. The editor doesn't know the
-// types: the game reads them when Play starts (game/Game.h). Properties are applied while they are valid JSON.
+// The entity's game components: a type and properties (JSON) each, in their order. The types come from the game
+// (setGameTypes), which reads the components when Play starts (game/Game.h). Choosing a type fills in its default
+// properties while the old ones are none or the old type's defaults. Properties are applied while they are valid
+// JSON.
 void Editor::buildGameUi(EntityId id) {
     std::vector<GameComponent> components = *scene.game(id);
     bool fresh = gameEditEntity != id || gameEdits.size() != components.size();
@@ -696,7 +693,40 @@ void Editor::buildGameUi(EntityId id) {
         ImGui::PushID(static_cast<int>(i));
         if (ImGui::TreeNodeEx("component", ImGuiTreeNodeFlags_DefaultOpen, "%s",
                               component.type.empty() ? "(no type)" : component.type.c_str())) {
-            changed |= inputText("Type", component.type);
+            auto typeNamed = [&](const std::string& name) -> const GameComponentType* {
+                auto it = std::find_if(gameTypes.begin(), gameTypes.end(),
+                                       [&](const GameComponentType& type) { return type.type == name; });
+                return it == gameTypes.end() ? nullptr : &*it;
+            };
+            const GameComponentType* known = typeNamed(component.type);
+            if (ImGui::BeginCombo("Type", component.type.empty() ? "(choose one)" : component.type.c_str())) {
+                for (const GameComponentType& type : gameTypes) {
+                    if (ImGui::Selectable(type.type.c_str(), type.type == component.type) &&
+                        type.type != component.type) {
+                        std::string oldDefaults;
+                        if (known != nullptr) {
+                            compactProperties(known->defaults, oldDefaults);
+                        }
+                        if (component.properties.empty() ||
+                            component.properties == oldDefaults) {
+                            compactProperties(type.defaults, component.properties);  // (the field follows)
+                        }
+                        component.type = type.type;
+                        changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", type.help.c_str());
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (known != nullptr && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", known->help.c_str());
+            }
+            if (known == nullptr && !component.type.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "The game has no type \"%s\"",
+                                   component.type.c_str());
+            }
             int lines = static_cast<int>(std::count(edit.properties.begin(), edit.properties.end(), '\n')) + 2;
             float height = static_cast<float>(std::clamp(lines, 3, 16)) * ImGui::GetTextLineHeight() +
                            ImGui::GetStyle().FramePadding.y * 2.0f;
