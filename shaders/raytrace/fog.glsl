@@ -270,7 +270,7 @@ bool nextFogSurface(vec3 origin, vec3 direction, float tMin, float tMax, uint ma
     rayQueryInitializeEXT(rayQuery, tlas, gl_RayFlagsNoneEXT, mask, origin, tMin, direction, tMax);
     while (rayQueryProceedEXT(rayQuery)) {
         // (fog volumes are all "not opaque": for the shadow rays)
-        if (notPassed(rayQuery, passed)) {
+        if (notPassed(rayQuery, passed) && !cutAway(rayQuery)) {
             rayQueryConfirmIntersectionEXT(rayQuery);
         }
     }

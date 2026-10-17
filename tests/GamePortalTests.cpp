@@ -143,3 +143,16 @@ TEST_CASE("Portals: the player walking through comes out of the other end, its v
     CHECK(t.scene.camera().position.z > z + 1.5f);  // walking on, away from B
     CHECK(t.scene.camera().position.x == Catch::Approx(10.0f).margin(1e-3));
 }
+
+TEST_CASE("Portals: a solid collider carried through isn't stopped by what is between the two ends", "[Game][Portals]") {
+    TestScene t;
+    t.portalPair({0.0f, 1.0f, -5.0f}, none, {10.0f, 1.0f, 0.0f}, none);  // both facing +Z
+    t.entityWith("Wall between", {{"collider", R"({"size": [0.2, 4, 20]})"}}, {5.0f, 1.0f, -2.5f});
+    EntityId box = t.entityWith("Box", {{"collider", R"({"size": [0.4, 0.4, 0.4], "solid": true})"},
+                                        {"slide", R"({"axis": [0, 0, -1], "distance": 4, "period": 8})"}},
+                                {0.0f, 1.0f, -3.0f});
+    t.play();
+    t.run(150);  // at A (z = -5) after 2 s: through it, out of B
+    CHECK(t.world(box).x == Catch::Approx(10.0f).margin(1e-3));
+    CHECK(t.world(box).z > 0.0f);
+}

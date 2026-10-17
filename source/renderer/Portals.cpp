@@ -1,6 +1,7 @@
 //
 // Portals: the render list's portal ends -> the shader's portal list (binding 31). The shader does the rest (see
-// "Portals" in shaders/raytrace/portals.glsl).
+// "Portals" in shaders/raytrace/portals.glsl). And the clip regions of objects part way through them (binding 34,
+// see "Portal pieces" in shaders/raytrace/tracing.glsl).
 //
 
 #include <cstring>
@@ -10,10 +11,12 @@
 
 void GpuScene::createPortalBuffer() {
     createStreamedBuffer(portalBuffer, 16 * sizeof(GpuPortal));  // never empty: descriptors can't point at nothing
+    createStreamedBuffer(clipRegionBuffer, 16 * sizeof(GpuClipRegion));
 }
 
 void GpuScene::destroyPortalBuffer() {
     destroyStreamedBuffer(portalBuffer);
+    destroyStreamedBuffer(clipRegionBuffer);
 }
 
 // This frame's portal ends in world space, each with the way to its partner. Cheap, so every frame; uploaded only on
@@ -40,4 +43,24 @@ void GpuScene::buildPortalList() {
 void GpuScene::recordPortalUpload(VkCommandBuffer commandBuffer) {
     recordStreamedUpload(commandBuffer, portalBuffer, uploadedPortals.data(), sizeof(GpuPortal) * uploadedPortals.size());
     portalsUploadPending = false;
+}
+
+void GpuScene::buildClipRegionList() {
+    frameClipRegions.clear();
+    for (const ClipRegion& region : renderList->clipRegions) {
+        GpuClipRegion gpu{};
+        gpu.cutCount = region.cutCount;
+        for (uint32_t i = 0; i < region.cutCount; i++) {
+            const portals::PortalCut& cut = region.cuts[i];
+            gpu.cuts[i] = {glm::mat4x3(cut.worldToEnd), cut.halfSize, cut.ellipse ? 1u : 0u, cut.keepNear ? 1u : 0u,
+                           cut.side};
+        }
+        frameClipRegions.push_back(gpu);
+    }
+}
+
+void GpuScene::recordClipRegionUpload(VkCommandBuffer commandBuffer) {
+    recordStreamedUpload(commandBuffer, clipRegionBuffer, uploadedClipRegions.data(),
+                         sizeof(GpuClipRegion) * uploadedClipRegions.size());
+    clipRegionsUploadPending = false;
 }

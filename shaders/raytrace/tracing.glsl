@@ -158,6 +158,36 @@ bool candidateIsSolid(uint meshIndex, int primitive, vec2 bary, inout uint seed,
     return opacity >= 1.0 || (opacity > 0.0 && randomFloat(seed) < opacity);
 }
 
+// Portal pieces (portals/PortalPieces.h): an object part way through a portal is cut at the opening, and its part
+// beyond is shown at the other end by a ghost instance, cut to that end's side. A cut instance is "not opaque" (its
+// candidate hits come to the shader) and holds 1 + its clip region as its TLAS instance's shader binding table
+// offset (no ray tracing pipeline reads it); 0: whole. A candidate on a part it doesn't keep is passed, like a hole
+// of a cut-out (the same test as portals::pieceKeeps).
+bool cutAway(rayQueryEXT rayQuery) {
+    uint region = FEATURE_PORTALS ? rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(rayQuery, false)
+                                  : 0u;
+    if (region == 0u) {
+        return false;
+    }
+    region -= 1u;
+    vec3 p = rayQueryGetWorldRayOriginEXT(rayQuery)
+             + rayQueryGetWorldRayDirectionEXT(rayQuery) * rayQueryGetIntersectionTEXT(rayQuery, false);
+    uint cuts = clipRegions[region].cutCount;
+    for (uint i = 0; i < cuts; i++) {
+        vec3 q = clipRegions[region].cuts[i].worldToEnd * vec4(p, 1.0);
+        if (clipRegions[region].cuts[i].side * q.z < -1e-5) {
+            if (clipRegions[region].cuts[i].keepNear != 0u) {
+                return true;  // behind the end it came out of
+            }
+            vec2 r = q.xy / clipRegions[region].cuts[i].halfSize;
+            if (clipRegions[region].cuts[i].ellipse != 0u ? dot(r, r) <= 1.0 : max(abs(r.x), abs(r.y)) <= 1.0) {
+                return true;  // gone into an opening
+            }
+        }
+    }
+    return false;
+}
+
 // The traversal loop. Hits on opaque instances are accepted by the hardware on its own. Instances a ray can pass
 // through (cut-outs, glass, fog) are flagged "not opaque" in the TLAS (see updateScene): for those, the traversal stops
 // at every hit as a "candidate" and the shader decides whether it counts (unless PATH_RAY_FLAGS makes the ray treat
@@ -177,7 +207,7 @@ void traverse(rayQueryEXT rayQuery, inout uint seed, bool invisibleCounts, uvec4
     while (rayQueryProceedEXT(rayQuery)) {
         if (PATH_RAY_FLAGS == gl_RayFlagsNoneEXT &&
             rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
-            (FOG == 0 || notPassed(rayQuery, passed)) &&
+            (FOG == 0 || notPassed(rayQuery, passed)) && !cutAway(rayQuery) &&
             candidateIsSolid(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
                              rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
                              rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed, invisibleCounts)) {

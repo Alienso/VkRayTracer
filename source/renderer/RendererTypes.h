@@ -402,6 +402,23 @@ struct GpuPortal {
 };
 static_assert(sizeof(GpuPortal) == 96, "GpuPortal must match Portal in shaders/raytrace/portals.glsl");
 
+// Must match ClipCut and ClipRegion in shaders/raytrace/bindings.glsl (scalar layout). What an instance cut by portal
+// openings keeps (RenderList::clipRegions, portals::pieceKeeps); its TLAS instance's shader binding table offset is
+// 1 + its region (unused otherwise: no ray tracing pipeline), 0 for the rest.
+struct GpuClipCut {
+    glm::mat4x3 worldToEnd;  // world -> the end's space: the opening's plane at z = 0
+    glm::vec2 halfSize;
+    uint32_t ellipse;        // 1: an ellipse, 0: a rectangle
+    uint32_t keepNear;       // 1: an exit (only side * z >= 0 kept), 0: an entrance (side * z < 0 in the tube removed)
+    float side;
+};
+static_assert(sizeof(GpuClipCut) == 68, "GpuClipCut must match ClipCut in shaders/raytrace/bindings.glsl");
+struct GpuClipRegion {
+    uint32_t cutCount;
+    GpuClipCut cuts[4];
+};
+static_assert(sizeof(GpuClipRegion) == 276, "GpuClipRegion must match ClipRegion in shaders/raytrace/bindings.glsl");
+
 // A device-local buffer the CPU refills from time to time. The CPU writes what changed into the current frame's part
 // of the upload ring (Renderer::uploadRings), then the GPU copies it over.
 struct StreamedBuffer {

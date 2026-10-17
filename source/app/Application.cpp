@@ -171,6 +171,13 @@ void Application::updateSelection() {
     if (!bench && editor.showsUi() && !renderer.capturePending() && scene.find(selected) != nullptr) {
         ranges = renderList.instanceRanges([&](uint64_t id) { return scene.isUnder(id, selected); });
         boxes = scene.selectionBoxes(selected);
+        // Its pieces at other portal ends (their model's box placed there)
+        for (const auto& [id, transform] : renderList.ghostsOf([&](uint64_t id) { return scene.isUnder(id, selected); })) {
+            glm::vec3 min, max;
+            if (scene.modelBox(id, min, max)) {
+                boxes.push_back({transform * scene.worldTransform(id), min, max});
+            }
+        }
     }
     renderer.setSelection(std::move(ranges), std::move(boxes));
 

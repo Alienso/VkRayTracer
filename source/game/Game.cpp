@@ -103,6 +103,7 @@ void Game::update(const GameStep& step) {
     for (const std::unique_ptr<BehaviourListBase>& list : lists) {
         list->update(step, world);
     }
+    world.jumped.clear();
     if (portals) {
         carryThroughPortals(step, before);
     }
@@ -129,19 +130,14 @@ void Game::carryThroughPortals(const GameStep& step, const std::unordered_map<En
         bool moved = now != was->second;
         if (moved && !parentMoved && id != world.playerEntity && scene.portal(id) == nullptr) {
             if (std::optional<glm::mat4> crossing = scene.portalCrossing(was->second, now)) {
-                // Its world transform taken through: local = parent^-1 * crossing * parent * local (rigid)
-                Entity& carried = *scene.find(id);
-                glm::mat4 parent = carried.parent != 0 ? scene.worldTransform(carried.parent) : glm::mat4(1.0f);
-                glm::mat4 change = glm::inverse(parent) * *crossing * parent;
-                glm::mat3 turn(glm::normalize(glm::vec3(change[0])), glm::normalize(glm::vec3(change[1])),
-                               glm::normalize(glm::vec3(change[2])));
-                Transform oldLocal = carried.local;
-                carried.local.position = glm::vec3(change * glm::vec4(carried.local.position, 1.0f));
-                carried.local.rotation = glm::normalize(glm::quat_cast(turn) * carried.local.rotation);
-                EntityMove move{id, oldLocal, carried.local, *crossing};
+                // Its world transform taken through (rigid)
+                Transform oldLocal = entity->local;
+                moveInWorld(scene, id, *crossing);
+                EntityMove move{id, oldLocal, entity->local, *crossing};
                 for (const std::unique_ptr<BehaviourListBase>& list : lists) {
                     list->moved(move, world);
                 }
+                world.jumped.push_back(id);
                 step.snap(id);  // (a jump, not blended)
                 return;  // what is under it came along
             }
@@ -210,6 +206,7 @@ std::vector<std::string> Game::resume(const Scene& scene) {
             for (const std::unique_ptr<BehaviourListBase>& list : lists) {
                 list->moved(move, world);
             }
+            world.jumped.push_back(entity.id);
         }
     }
     pausedEntities.clear();

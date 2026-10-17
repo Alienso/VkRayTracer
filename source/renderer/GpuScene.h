@@ -149,6 +149,11 @@ public:
     std::vector<GpuPortal> uploadedPortals;
     StreamedBuffer portalBuffer;
     bool portalsUploadPending = false;
+    // Clip regions of instances cut by portal openings (Portals.cpp): as the portals
+    std::vector<GpuClipRegion> frameClipRegions;
+    std::vector<GpuClipRegion> uploadedClipRegions;
+    StreamedBuffer clipRegionBuffer;
+    bool clipRegionsUploadPending = false;
 
     // Environment (Environment.cpp): the HDR map, and the table the shader picks sky directions from
     uint64_t uploadedEnvironmentId = 0;  // EnvironmentMap::id of what environmentTexture holds (0: none yet)
@@ -218,6 +223,8 @@ public:
     void destroyPortalBuffer();
     void buildPortalList();
     void recordPortalUpload(VkCommandBuffer commandBuffer);
+    void buildClipRegionList();
+    void recordClipRegionUpload(VkCommandBuffer commandBuffer);
 
     // Environment.cpp
     void createEnvironment();

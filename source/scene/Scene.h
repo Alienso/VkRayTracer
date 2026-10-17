@@ -316,11 +316,24 @@ private:
         glm::mat4 world;
     };
     // The render list's instances and motions made from scratch / only the moved entities' ranges rewritten (false
-    // when the layout turned out different: then nothing useful was done)
+    // when the layout turned out different: then nothing useful was done). clips: per model, its instances' clip
+    // (RenderInstance::clip)
     void remakeInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                         std::vector<std::pair<uint32_t, glm::mat4>>& rims) const;
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, const std::vector<uint32_t>& clips) const;
     bool updateInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                         std::vector<std::pair<uint32_t, glm::mat4>>& rims) const;
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, const std::vector<uint32_t>& clips) const;
+    // A visible model entity going into portal openings: its pieces (portals/PortalPieces.h; models[model])
+    struct ModelPieces {
+        size_t model;
+        std::vector<portals::PortalPiece> pieces;
+    };
+    static constexpr int maxGhosts = 64;  // ghost pieces per frame, all entities together
+    [[nodiscard]] std::vector<ModelPieces> findPortalPieces(const std::vector<PlacedModel>& models,
+                                                            const std::vector<PlacedPair>& pairs) const;
+    // The ghosts at the list's end, made anew (with their clip regions): what changed of them goes into the list's
+    // remade or changed instances, and its motions
+    void placeGhosts(RenderList& list, const std::vector<PlacedModel>& models,
+                     const std::vector<ModelPieces>& pieces) const;
     // An entity's parts in world space (entity * fit * part), the hidden ones left out, in order
     template <typename Visit>
     void forEachVisiblePart(const PlacedModel& model, Visit&& visit) const;

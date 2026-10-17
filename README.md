@@ -50,6 +50,10 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
   either can be moved, or attached to something that moves.
 - The camera can fly through: it comes out of the other end, seeing what it saw through the opening, with no seam
   (also in the DLSS modes: the motion vectors follow it through).
+- Objects part way through are in both places: the part that went in shows at the other end (a ghost of the model,
+  cut to that side), the rest stays, cut at the opening (`source/portals/PortalPieces.h`, shared with collision
+  later). Through several pairs, or between ends facing each other, an object shows once per crossing, up to "Max
+  portal crossings". Clicking either part selects the object; both are outlined.
 - Optional rims.
 
 ### Noise reduction and real-time modes
@@ -130,11 +134,12 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
 - **Fixed steps**: the game advances 60 times a second whatever the frame rate (`source/game/GameLoop.h`), so it
   behaves the same on any machine. What moves is shown blended between the steps, so it moves smoothly at any
   frame rate (View > "Blend game steps" to compare).
-- **Behaviours**: `spin` and `bob` (turning, floating), `door` (E near it opens and closes it), `pickup` (taken by
+- **Behaviours**: `spin`, `bob` and `slide` (turning, floating, moving out and back along an axis), `door` (E near it opens and closes it), `pickup` (taken by
   coming near, counted over the image), `trigger` (a box that shows or hides another entity while the camera is
   inside), `spawner` (copies of an entity that come and go), `cameraPath` (the game flies the camera along the
   entity's children), `collider` (a solid box: around the entity's model, or of a given size; it moves with the
-  entity and isn't solid while hidden) and `player` (the camera as a body: W/A/S/D walk, Shift runs, Space jumps,
+  entity and isn't solid while hidden; `"solid": true` also stops it at other colliders when the game moves it,
+  pushing the player but not squeezing it) and `player` (the camera as a body: W/A/S/D walk, Shift runs, Space jumps,
   the mouse turns the view; it is stopped by colliders, slides along walls, walks up low steps and gentle slopes,
   and falls under gravity). Without a player the camera flies (game-style) and stands in for the player.
 - Physics (`source/physics/`, its own library: only glm) sits behind an interface (`physics/PhysicsWorld.h`): our
@@ -144,7 +149,8 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
 - `scenes/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
   collect the coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera
   path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
-  the door, a moving lift, and a portal pair that leads behind the wall. What it can't do yet: LIMITATIONS.md,
+  the door, a moving lift, a solid box that slides into the wall (and pushes you), and a portal pair that leads
+  behind the wall. What it can't do yet: LIMITATIONS.md,
   "Game".
 - **Portals while playing**: anything the game moves through a portal's opening (the player, a bobbing thing, a
   spawned copy, with what is under it) comes out of the other end and carries on there; the player's view and

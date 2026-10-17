@@ -7,7 +7,7 @@
 // Distances (doors, pickups, triggers) are to the camera's position: the player's eyes when there is a player, a
 // body walking among colliders (physics/PhysicsWorld.h, owned here); else the fly camera.
 //
-// Behaviours: spin, bob, door, pickup, trigger, spawner, collider, player, cameraPath, one file each in game/behaviours/ (what each
+// Behaviours: spin, bob, slide, door, pickup, trigger, spawner, collider, player, cameraPath, one file each in game/behaviours/ (what each
 // does and reads: its help and defaults there; how a type is made: game/Behaviour.h). Several on one entity work
 // together when they move different things (spin turns, bob moves); two that turn it (spin and door) fight: the later
 // one in the update order (game/Behaviours.cpp) wins. The same type twice on one entity is a warning (only the first

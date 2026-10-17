@@ -214,6 +214,7 @@ bool intersectTowardsLight(vec3 origin, vec3 direction, inout uint seed, out Int
     while (rayQueryProceedEXT(rayQuery)) {
         if (SHADOW_RAY_FLAGS == gl_RayFlagsNoneEXT &&
             rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+            !cutAway(rayQuery) &&
             blocksLight(rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false),
                         rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false),
                         rayQueryGetIntersectionBarycentricsEXT(rayQuery, false), seed)) {

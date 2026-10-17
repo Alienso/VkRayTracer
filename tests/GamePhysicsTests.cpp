@@ -5,6 +5,8 @@
 //
 
 #include <catch_amalgamated.hpp>
+#include <algorithm>
+#include <cmath>
 #include "TestHelpers.h"
 #include "game/Colliders.h"
 #include "game/Game.h"
@@ -292,4 +294,114 @@ TEST_CASE("Colliders: the boxes the editor outlines are the ones the game makes"
     REQUIRE(one.size() == 1);
     CHECK(one[0].max == glm::vec3(0.5f));  // no model: a unit cube
     CHECK(colliderBoxes(t.scene, sized).size() == 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Solid colliders and slide
+
+namespace {
+
+float turnedDegrees(const glm::quat& rotation) {
+    return glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(rotation.w))));
+}
+
+}  // namespace
+
+TEST_CASE("Slide: out along its axis and back, from where it was at Play", "[Game][Player]") {
+    TestScene t;
+    EntityId box = t.entityWith("Box", {{"slide", R"({"axis": [0, 0, 2], "distance": 3, "period": 4})"}},
+                                {1.0f, 0.0f, 0.0f});
+    t.scene.find(box)->local.rotation = glm::angleAxis(glm::radians(90.0f), glm::vec3(0, 1, 0));  // +Z turned to +X
+    CHECK(t.play().empty());
+    t.run(60);  // a quarter period: half way out
+    CHECK(t.scene.find(box)->local.position.x == Catch::Approx(1.0f + 1.5f).margin(1e-4));
+    t.run(60);  // all the way out
+    CHECK(t.scene.find(box)->local.position.x == Catch::Approx(1.0f + 3.0f).margin(1e-4));
+    t.pause();
+    t.scene.find(box)->local.position.z = 5.0f;  // moved by hand while paused: it slides from there
+    t.resume();
+    t.run(120);  // back in
+    glm::vec3 position = t.scene.find(box)->local.position;
+    CHECK(position.x == Catch::Approx(1.0f).margin(1e-4));
+    CHECK(position.z == Catch::Approx(5.0f).margin(1e-4));
+}
+
+TEST_CASE("Colliders: a solid box slid into a wall stops at it and goes on once free; not solid, it goes through",
+          "[Game][Player]") {
+    for (bool solid : {true, false}) {
+        TestScene t;
+        t.entityWith("Wall", {{"collider", R"({"size": [0.2, 2, 4]})"}}, {3.0f, 1.0f, 0.0f});  // its face at 2.9
+        EntityId box = t.entityWith(
+            "Box", {{"collider", std::string(R"({"size": [1, 1, 1], "solid": )") + (solid ? "true}" : "false}")},
+                    {"slide", R"({"axis": [1, 0, 0], "distance": 4, "period": 4})"}},
+            {0.0f, 1.0f, 0.0f});
+        CHECK(t.play().empty());
+        t.run(120);  // half a period: it would be 4 out
+        float x = t.scene.find(box)->local.position.x;
+        if (solid) {
+            CHECK(x == Catch::Approx(2.4f).margin(0.01));  // held against the wall
+        } else {
+            CHECK(x == Catch::Approx(4.0f).margin(1e-4));
+        }
+        t.run(119);  // nearly back
+        CHECK(t.scene.find(box)->local.position.x < 0.01f);
+    }
+}
+
+TEST_CASE("Colliders: a solid panel turned by its parent stops at a crate", "[Game][Player]") {
+    TestScene t;
+    EntityId arm = t.entityWith("Arm", {{"spin", R"({"speed": 90})"}}, {0.0f, 1.0f, 0.0f});  // +X turns to -Z
+    t.entityWith("Panel", {{"collider", R"({"size": [1.5, 1, 0.1], "solid": true})"}}, {0.75f, 0.0f, 0.0f}, arm);
+    t.entityWith("Crate", {{"collider", R"({"size": [0.6, 0.6, 0.6]})"}}, {1.0f, 1.0f, -1.0f});
+    CHECK(t.play().empty());
+    t.run(60);  // it would be 90 degrees round
+    float held = turnedDegrees(t.scene.find(arm)->local.rotation);
+    CHECK(held > 10.0f);
+    CHECK(held < 80.0f);
+    t.run(30);
+    CHECK(turnedDegrees(t.scene.find(arm)->local.rotation) == Catch::Approx(held).margin(0.5));
+}
+
+TEST_CASE("Colliders: solid colliders under one moved entity stop together", "[Game][Player]") {
+    TestScene t;
+    t.entityWith("Ceiling", {{"collider", R"({"size": [4, 0.2, 4]})"}}, {0.0f, 1.6f, 0.0f});  // its bottom at 1.5
+    EntityId platform = t.entityWith("Platform", {{"collider", R"({"size": [2, 0.2, 2], "solid": true})"},
+                                                  {"bob", R"({"height": 1, "period": 4})"}},
+                                     {0.0f, 0.0f, 0.0f});
+    EntityId crate = t.entityWith("Crate", {{"collider", R"({"size": [0.6, 0.6, 0.6], "solid": true})"}},
+                                  {0.0f, 0.4f, 0.0f}, platform);  // on it, its top at 0.7
+    CHECK(t.play().empty());
+    t.run(60);  // the bob would be 1 up: the crate's top at 1.7
+    CHECK(t.scene.find(platform)->local.position.y == Catch::Approx(0.8f).margin(0.01));
+    CHECK(worldPosition(t.scene, crate).y == Catch::Approx(1.2f).margin(0.01));
+}
+
+TEST_CASE("Colliders: a solid mover pushes the player, and is blocked when the player is squeezed against a wall",
+          "[Game][Player]") {
+    TestScene t;
+    t.floor();
+    t.entityWith("Wall", {{"collider", R"({"size": [1, 2, 2]})"}}, {-1.5f, 1.0f, 0.0f});  // its face at x = -1
+    EntityId box = t.entityWith("Box", {{"collider", R"({"size": [1, 1, 1], "solid": true})"},
+                                        {"slide", R"({"axis": [-1, 0, 0], "distance": 3, "period": 8})"}},
+                                {2.0f, 0.5f, 0.0f});
+    t.player({0.0f, 0.0f, 0.0f});
+    CHECK(t.play().empty());
+    t.run(240);  // half a period: the box would be at x = -1
+    CHECK(t.scene.find(box)->local.position.x == Catch::Approx(-1.0f + 0.6f + 0.5f).margin(0.03));
+    CHECK(t.eyes().x == Catch::Approx(-1.0f + 0.3f).margin(0.03));  // pushed to the wall
+}
+
+TEST_CASE("Colliders: a solid collider moved through a wall by hand while paused stays there", "[Game][Player]") {
+    TestScene t;
+    t.entityWith("Wall", {{"collider", R"({"size": [0.2, 2, 4]})"}}, {3.0f, 1.0f, 0.0f});
+    EntityId box = t.entityWith("Box", {{"collider", R"({"size": [1, 1, 1], "solid": true})"},
+                                        {"slide", R"({"axis": [1, 0, 0], "distance": 1, "period": 4})"}},
+                                {0.0f, 1.0f, 0.0f});
+    CHECK(t.play().empty());
+    t.run(30);
+    t.pause();
+    t.scene.find(box)->local.position.x = 5.0f;  // past the wall: put there, not moved there
+    t.resume();
+    t.run(30);
+    CHECK(t.scene.find(box)->local.position.x > 5.0f);
 }

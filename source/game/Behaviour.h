@@ -11,6 +11,8 @@
 //                                               nothing (warned about through the properties)
 //   void update(const GameStep&, GameWorld&)    each step
 // and optionally:
+//   static void updateAll(std::vector<T>&, const GameStep&, GameWorld&)   each step instead of update, for types
+//                                               whose behaviours depend on each other (colliders moved in groups)
 //   void moved(const EntityMove&, GameWorld&)   something other than its behaviours moved its entity (the editor
 //                                               while paused, a portal it went through): places kept from Play
 //                                               follow it
@@ -78,6 +80,10 @@ struct GameWorld {
     bool mouseLook = false;      // the player turns the view with the mouse (the program captures it)
     physics::PhysicsWorld* physics = nullptr;  // the colliders and the player's body (Game's)
     EntityId playerEntity = 0;   // goes through portals on its own (its eyes, with the camera), not by Game's pass
+    // Entities moved by something other than the behaviours since the last step (a portal, the editor while paused):
+    // solid colliders under them are put there, not moved there (which their way could block). Cleared after the
+    // step's behaviours.
+    std::vector<EntityId> jumped;
     std::vector<EntityId> removals;
     std::vector<SpawnRequest> spawns;
 };
@@ -123,6 +129,18 @@ inline glm::vec3 worldPosition(const Scene& scene, EntityId id) {
     return glm::vec3(scene.worldTransform(id)[3]);
 }
 
+// Moves the entity by a rigid change of its world transform (new world = change * world): its local transform worked
+// out under its parent (local = parent^-1 * change * parent * local)
+inline void moveInWorld(Scene& scene, EntityId id, const glm::mat4& change) {
+    Entity& entity = *scene.find(id);
+    glm::mat4 parent = entity.parent != 0 ? scene.worldTransform(entity.parent) : glm::mat4(1.0f);
+    glm::mat4 local = glm::inverse(parent) * change * parent;
+    glm::mat3 turn(glm::normalize(glm::vec3(local[0])), glm::normalize(glm::vec3(local[1])),
+                   glm::normalize(glm::vec3(local[2])));
+    entity.local.position = glm::vec3(local * glm::vec4(entity.local.position, 1.0f));
+    entity.local.rotation = glm::normalize(glm::quat_cast(turn) * entity.local.rotation);
+}
+
 class BehaviourListBase {
 public:
     virtual ~BehaviourListBase() = default;
@@ -139,7 +157,12 @@ public:
     virtual void clear() = 0;
 };
 
-// Whether a type has the optional moved / removed
+// Whether a type has the optional updateAll / moved / removed
+template <typename T, typename = void> struct HasUpdateAll : std::false_type {};
+template <typename T>
+struct HasUpdateAll<T, std::void_t<decltype(T::updateAll(std::declval<std::vector<T>&>(),
+                                                         std::declval<const GameStep&>(),
+                                                         std::declval<GameWorld&>()))>> : std::true_type {};
 template <typename T, typename = void> struct HasMoved : std::false_type {};
 template <typename T>
 struct HasMoved<T, std::void_t<decltype(std::declval<T&>().moved(std::declval<const EntityMove&>(),
@@ -162,8 +185,12 @@ public:
         }
     }
     void update(const GameStep& step, GameWorld& world) override {
-        for (T& behaviour : items) {
-            behaviour.update(step, world);
+        if constexpr (HasUpdateAll<T>::value) {
+            T::updateAll(items, step, world);
+        } else {
+            for (T& behaviour : items) {
+                behaviour.update(step, world);
+            }
         }
     }
     void removeGone(const Scene& scene, GameWorld& world) override {

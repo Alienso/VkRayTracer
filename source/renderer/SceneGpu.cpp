@@ -76,14 +76,16 @@ VkAccelerationStructureInstanceKHR GpuScene::makeTlasInstance(const RenderInstan
     // alone: 0x02 even fog, 0x04 varying, 0x08 solid glass (see "Fog" and "Glass volumes" there). The rest: 0x01.
     bool glassVolume = material.transmission > 0.0f && material.solid;
     instance.mask = fogVaries(material) ? 0x04 : material.fogDensity > 0.0f ? 0x02 : glassVolume ? 0x08 : 0x01;
-    instance.instanceShaderBindingTableRecordOffset = 0;
+    // (No ray tracing pipeline reads it: it holds 1 + the instance's clip region, see "Portal pieces" in tracing.glsl)
+    instance.instanceShaderBindingTableRecordOffset = renderInstance.clip;
     instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     // Materials a ray can pass through (needsHitTest) are "not opaque": rays ask the shader whether a hit on
     // them counts (except in the basic shader without fog, whose rays treat everything as opaque). Everything
     // else stays on the fast path where the hardware decides alone. Switching a material's alpha mode in the UI
-    // changes the flags, which rebuilds the TLAS.
-    instance.flags |= needsHitTest(material) ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
-                                             : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    // changes the flags, which rebuilds the TLAS. Instances cut by portal openings too: the shader tells their
+    // parts apart.
+    instance.flags |= needsHitTest(material) || renderInstance.clip != 0 ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+                                                                         : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
     instance.accelerationStructureReference = gpuAssets.blases[renderInstance.mesh].address;
     return instance;
 }
@@ -147,6 +149,9 @@ void GpuScene::recordUploads(VkCommandBuffer commandBuffer) {
     }
     if (portalsUploadPending) {
         recordPortalUpload(commandBuffer);
+    }
+    if (clipRegionsUploadPending) {
+        recordClipRegionUpload(commandBuffer);
     }
 }
 
@@ -225,6 +230,29 @@ void GpuScene::updateScene() {
             allInstancesChanged();
         }
     } else {
+        // Ghosts (portal pieces) came, went or are cut otherwise; entities went into or out of an opening: those
+        // instances made anew (the list's end may have grown or shrunk), and the TLAS built anew
+        size_t count = renderList->instances.size();
+        if (count != frameInstances.size() || !renderList->remadeInstances().empty()) {
+            frameInstances.resize(count);
+            frameGpuInstances.resize(count);
+            for (const InstanceRange& range : renderList->remadeInstances()) {
+                if (range.count == 0) {
+                    continue;
+                }
+                for (uint32_t i = range.first; i < range.first + range.count; i++) {
+                    const RenderInstance& renderInstance = renderList->instances[i];
+                    frameInstances[i] = makeTlasInstance(renderInstance);
+                    frameGpuInstances[i] = {glm::mat4x3(renderInstance.world), renderInstance.mesh,
+                                            renderInstance.motion};
+                }
+                tlasInstancePending.add(range);
+                instanceDataPending.add(range);
+            }
+            tlasDirty = true;
+            tlasRebuildNeeded = true;
+            tlasTidyOnly = false;
+        }
         // A material can change which rays may pass through an instance (the flags) and which group it is in (the
         // mask). Only when one did is the TLAS rebuilt.
         if (gpuAssets.materialsDirty) {
@@ -322,10 +350,34 @@ void GpuScene::updateScene() {
         }
     }
 
+    // 5c: the clip regions of instances cut by portal openings, the same way
+    buildClipRegionList();
+    if (frameClipRegions.size() != uploadedClipRegions.size() ||
+        std::memcmp(frameClipRegions.data(), uploadedClipRegions.data(),
+                    frameClipRegions.size() * sizeof(GpuClipRegion)) != 0) {
+        uploadedClipRegions = frameClipRegions;
+        clipRegionsUploadPending = true;
+        changes.resetAccumulation = true;
+        changes.clearCache = true;
+        VkDeviceSize size = sizeof(GpuClipRegion) * uploadedClipRegions.size();
+        if (size > clipRegionBuffer.capacity) {
+            waitIdle();  // the buffer is replaced, no frame may use it
+            ensureStreamedCapacity(clipRegionBuffer, size);
+            changes.descriptors = true;
+        }
+    }
+
     // 6: glowing triangles moved, appeared, or a material's emission changed -> new light list. Also when light
     // picking changes: the tree is built only for picking with it.
     bool lightsChanged = instancesRemade || gpuAssets.materialsDirty;
-    if (lightsChanged || emissiveMoved || settings.lightPicking != lightListPicking) {
+    bool ghostsResized = !lightsChanged && instanceFirstLight.size() != renderList->instances.size();
+    if (ghostsResized) {
+        // The ghosts at the list's end came or went: they aren't lights (LIMITATIONS.md), only the instances' table
+        // follows them (none at their end)
+        instanceFirstLight.resize(renderList->instances.size(), -1);
+        instanceLightsUploadPending = true;
+    }
+    if (lightsChanged || emissiveMoved || ghostsResized || settings.lightPicking != lightListPicking) {
         buildLightList(lightsChanged);  // uploaded in this frame's command buffer
         VkDeviceSize trianglesSize = sizeof(EmissiveTriangle) * emissiveTriangles.size();
         VkDeviceSize offsetsSize = sizeof(int32_t) * instanceFirstLight.size();

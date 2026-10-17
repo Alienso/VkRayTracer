@@ -9,6 +9,11 @@
 // entities added, removed, re-parented, shown or hidden, parts shown or hidden, a model loaded or unloaded.
 // Punctual lights and portals are few and remade every frame.
 //
+// Objects part way through a portal (portals/PortalPieces.h): an instance can be cut (clip: a region of
+// clipRegions, which keeps only its part on this side of the openings), and its pieces at the other ends are ghost
+// instances after the portal rims, made every frame (few). A ghost appearing or going changes only the list's end:
+// remadeInstances() names it, the revision stays.
+//
 
 #ifndef VULKANDEMO_RENDERLIST_H
 #define VULKANDEMO_RENDERLIST_H
@@ -22,12 +27,20 @@
 #include "assets/ModelLoader.h"
 #include "scene/Portal.h"
 #include "scene/SceneEnvironment.h"
+#include "portals/PortalPieces.h"
 
 // One mesh placed in the world: a visible part of a visible object
 struct RenderInstance {
     uint32_t mesh;       // index into AssetStore::meshes()
     uint32_t motion;     // index into RenderList::motions (the object's)
     glm::mat4 world;     // entity (world) * fit * part
+    uint32_t clip = 0;   // 0: whole; else 1 + its region in RenderList::clipRegions (cut by portal openings)
+};
+
+// What a cut instance keeps (a portal piece's cuts, portals::pieceKeeps): the rest of it isn't there
+struct ClipRegion {
+    uint32_t cutCount = 0;
+    portals::PortalCut cuts[portals::PortalPiece::maxCuts];
 };
 
 // A punctual light of a visible object, in world space but still in the file's units (the renderer converts it)
@@ -71,6 +84,7 @@ public:
     std::vector<glm::mat4> motions;
     std::vector<RenderLight> lights;
     std::vector<RenderPortal> portals;
+    std::vector<ClipRegion> clipRegions;  // made every frame
     Camera camera;                 // copied every frame
     // Where the camera went through portals since the last build: takes points from where it was to where it is now
     // (identity when it didn't). The same view continues, so last frame's image is still this one's history.
@@ -84,14 +98,22 @@ public:
     [[nodiscard]] uint64_t build() const { return builds; }
     // The instances whose matrices this build rewrote (same meshes, same order), when the revision stayed the same
     [[nodiscard]] const std::vector<InstanceRange>& changedInstances() const { return changed; }
+    // The instances this build made anew (other meshes, or cut otherwise: the ghosts, entities going into or out of
+    // an opening), when the revision stayed the same. The list may have grown or shrunk at its end (the ghosts).
+    [[nodiscard]] const std::vector<InstanceRange>& remadeInstances() const { return remade; }
     // Some motion changed in this build (or the revision went up)
     [[nodiscard]] bool motionsChanged() const { return motionChanged; }
 
-    // The model entity whose parts instance i is (0: none, e.g. a portal rim's bar)
+    // The model entity whose parts instance i is (0: none, e.g. a portal rim's bar); a ghost's is its entity's
     [[nodiscard]] uint64_t entityOfInstance(uint32_t instance) const {
         for (const BuiltEntity& entity : builtEntities) {
             if (instance >= entity.range.first && instance - entity.range.first < entity.range.count) {
                 return entity.id;
+            }
+        }
+        for (const BuiltGhost& ghost : builtGhosts) {
+            if (instance >= ghost.range.first && instance - ghost.range.first < ghost.range.count) {
+                return ghost.id;
             }
         }
         return 0;
@@ -110,7 +132,25 @@ public:
                 ranges.push_back(entity.range);
             }
         }
+        for (const BuiltGhost& ghost : builtGhosts) {  // (their ghosts too)
+            if (ghost.range.count > 0 && selected(ghost.id)) {
+                ranges.push_back(ghost.range);
+            }
+        }
         return ranges;
+    }
+
+    // The ghosts of the entities for which selected(id) is true: (entity, the piece's transform) for each (the
+    // selection's outline shows them too)
+    template <typename Selected>
+    [[nodiscard]] std::vector<std::pair<uint64_t, glm::mat4>> ghostsOf(Selected&& selected) const {
+        std::vector<std::pair<uint64_t, glm::mat4>> ghosts;
+        for (const BuiltGhost& ghost : builtGhosts) {
+            if (selected(ghost.id)) {
+                ghosts.emplace_back(ghost.id, ghost.transform);
+            }
+        }
+        return ghosts;
     }
 
 private:
@@ -118,6 +158,7 @@ private:
     uint64_t revision = 0;
     uint64_t builds = 0;
     std::vector<InstanceRange> changed;
+    std::vector<InstanceRange> remade;
     bool motionChanged = false;
 
     // What the instances were made from: per model entity in tree order, its range of the instances and its motion.
@@ -131,6 +172,7 @@ private:
         glm::mat4 world;  // the entity's world transform
         InstanceRange range;  // its visible parts (none when hidden)
         uint32_t motion;      // its entry in motions (when visible)
+        uint32_t clip = 0;    // its instances' (RenderInstance::clip)
     };
     std::vector<BuiltEntity> builtEntities;
     uint64_t builtLayout = 0;  // Scene's layout revision and the AssetStore's revision the list was made with
@@ -138,6 +180,17 @@ private:
     // The portal rims' bars (mesh, world matrix), after the entities' instances from firstRim on
     std::vector<std::pair<uint32_t, glm::mat4>> builtRims;
     uint32_t firstRim = 0;
+    // The ghosts (an entity's piece through portals), after the rims, each with a motion after the others' from
+    // firstGhostMotion on. world: the piece's transform * the entity's world transform, for next frame's motion.
+    struct BuiltGhost {
+        uint64_t id;     // its entity
+        uint32_t piece;  // which of the entity's pieces (1: its first ghost)
+        glm::mat4 transform;  // the piece's (portals::PortalPiece::transform)
+        glm::mat4 world;
+        InstanceRange range;
+    };
+    std::vector<BuiltGhost> builtGhosts;
+    uint32_t firstGhostMotion = 0;
 };
 
 #endif //VULKANDEMO_RENDERLIST_H

@@ -257,6 +257,20 @@ layout(binding = 12, scalar) readonly buffer Instances { InstanceData instances[
 // Per object: takes a point on it from this frame's world position to last frame's (object motion); identity for
 // objects that didn't move
 layout(binding = 33, scalar) readonly buffer Motions { mat4 motions[]; };
+// Objects part way through portals (see "Portal pieces" in tracing.glsl): what a cut instance keeps. Must match
+// GpuClipCut and GpuClipRegion in RendererTypes.h.
+struct ClipCut {
+    mat4x3 worldToEnd;  // world -> the end's space: the opening's plane at z = 0
+    vec2 halfSize;
+    uint ellipse;       // 1: an ellipse, 0: a rectangle
+    uint keepNear;      // 1: an exit (only side * z >= 0 kept), 0: an entrance (side * z < 0 in the tube removed)
+    float side;
+};
+struct ClipRegion {
+    uint cutCount;
+    ClipCut cuts[4];
+};
+layout(binding = 34, scalar) readonly buffer ClipRegions { ClipRegion clipRegions[]; };
 
 // The inverse of an instance's matrix, without the translation (what normals and directions need). Worked out here
 // rather than stored: 36 bytes less per instance (millions in big scenes).

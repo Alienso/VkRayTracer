@@ -40,6 +40,7 @@ static void requireSameAsRemade(Scene& scene, const RenderList& list) {
     for (size_t i = 0; i < list.instances.size(); i++) {
         REQUIRE(list.instances[i].mesh == fresh.instances[i].mesh);
         REQUIRE(nearlyEqual(list.instances[i].world, fresh.instances[i].world, 1e-5f));
+        REQUIRE(list.instances[i].clip == fresh.instances[i].clip);
     }
 }
 
@@ -170,6 +171,139 @@ TEST_CASE("RenderList: a portal pair gives two portal ends and rim bars after th
     t.scene.buildRenderList(t.list);
     CHECK(t.list.portals.empty());
     CHECK(t.list.instances.size() == floorParts);
+}
+
+namespace {
+
+// A pair whose ends face +Z, A at (0, 1, 0) and B at (5, 1, -2), 1 wide and 2 high; and a cube 0.6 across
+struct HalfThrough : TestScene {
+    EntityId cubeId;
+    glm::mat4 endA, endB;
+    HalfThrough() {
+        EntityId pair = scene.addPortalPair();
+        scene.find(pair)->local = Transform();
+        EntityId a = scene.find(pair)->children[0];
+        EntityId b = scene.find(pair)->children[1];
+        scene.find(a)->local = Transform();
+        scene.find(a)->local.position = {0, 1, 0};
+        scene.find(b)->local = Transform();
+        scene.find(b)->local.position = {5, 1, -2};
+        endA = scene.worldTransform(a);
+        endB = scene.worldTransform(b);
+        cubeId = scene.addObject(cube, false);
+        glm::vec3 min, max;
+        REQUIRE(scene.modelBox(cubeId, min, max));
+        scene.find(cubeId)->local.scale = glm::vec3(0.6f / (max.x - min.x));
+        place({0, 1, 3});  // away from the opening
+    }
+    void place(const glm::vec3& position) { scene.find(cubeId)->local.position = position; }
+    // The cube's (real) instances: its entity's range
+    InstanceRange cubeRange() {
+        std::vector<InstanceRange> ranges = list.instanceRanges([&](uint64_t id) { return id == cubeId; });
+        REQUIRE(!ranges.empty());
+        return ranges[0];
+    }
+};
+
+}  // namespace
+
+TEST_CASE("RenderList: a cube half through a portal is cut there, its ghost at the other end after the rims",
+          "[RenderList][Portals]") {
+    HalfThrough t;
+    t.place({0, 1, 0.1f});  // 0.2 of it behind A
+    t.scene.buildRenderList(t.list);
+    size_t parts = t.visibleParts(t.cubeId);
+    REQUIRE(t.list.clipRegions.size() == 2);  // the real one's, the ghost's
+    InstanceRange real = t.cubeRange();
+    CHECK(real.count == parts);
+    CHECK(t.list.instances[real.first].clip == 1);
+    CHECK(t.list.clipRegions[0].cutCount == 1);
+    CHECK_FALSE(t.list.clipRegions[0].cuts[0].keepNear);
+    // The ghost: the list's last instances, placed through the pair, cut to B's front
+    size_t first = t.list.instances.size() - parts;
+    for (size_t i = 0; i < parts; i++) {
+        const RenderInstance& ghost = t.list.instances[first + i];
+        CHECK(ghost.clip == 2);
+        CHECK(ghost.mesh == t.list.instances[real.first + i].mesh);
+        CHECK(nearlyEqual(ghost.world, portalToPartner(t.endA, t.endB) * t.list.instances[real.first + i].world,
+                          1e-5f));
+        CHECK(ghost.motion != t.list.instances[real.first + i].motion);  // a motion of its own
+    }
+    CHECK(t.list.clipRegions[1].cuts[0].keepNear);
+    // It is the cube's: picked, and outlined with it
+    CHECK(t.list.entityOfInstance(static_cast<uint32_t>(first)) == t.cubeId);
+    std::vector<InstanceRange> ranges = t.list.instanceRanges([&](uint64_t id) { return id == t.cubeId; });
+    REQUIRE(ranges.size() == 2);
+    CHECK(ranges[1].first == first);
+    std::vector<std::pair<uint64_t, glm::mat4>> ghosts = t.list.ghostsOf([&](uint64_t id) { return id == t.cubeId; });
+    REQUIRE(ghosts.size() == 1);
+    CHECK(nearlyEqual(ghosts[0].second, portalToPartner(t.endA, t.endB), 1e-5f));
+}
+
+TEST_CASE("RenderList: a ghost coming, moving and going changes only the list's end, not the revision",
+          "[RenderList][Portals]") {
+    HalfThrough t;
+    t.scene.checkUpdates = true;
+    t.scene.buildRenderList(t.list);
+    size_t whole = t.list.instances.size();
+    uint64_t revision = t.list.instanceRevision();
+    size_t parts = t.visibleParts(t.cubeId);
+    CHECK(t.list.clipRegions.empty());
+
+    t.place({0, 1, 0.1f});  // into A
+    t.scene.buildRenderList(t.list);
+    CHECK(t.list.instanceRevision() == revision);
+    CHECK(t.list.instances.size() == whole + parts);
+    REQUIRE(t.list.remadeInstances().size() == 2);  // the cube (cut now), the ghosts
+    CHECK(t.list.remadeInstances()[0].first == t.cubeRange().first);
+    CHECK(t.list.remadeInstances()[1].first == whole);
+    CHECK(t.list.remadeInstances()[1].count == parts);
+    CHECK(t.list.motionsChanged());
+    requireSameAsRemade(t.scene, t.list);
+
+    t.place({0, 1, 0.05f});  // further in: the same pieces, moved
+    t.scene.buildRenderList(t.list);
+    CHECK(t.list.instanceRevision() == revision);
+    CHECK(t.list.remadeInstances().empty());
+    bool tailMoved = false;
+    for (const InstanceRange& range : t.list.changedInstances()) {
+        tailMoved = tailMoved || (range.first == whole && range.count == parts);
+    }
+    CHECK(tailMoved);
+    CHECK(t.list.motions.back() != glm::mat4(1.0f));  // the ghost's motion: it moved too
+    requireSameAsRemade(t.scene, t.list);
+
+    t.scene.buildRenderList(t.list);  // still: nothing to do
+    CHECK(t.list.remadeInstances().empty());
+    CHECK(t.list.changedInstances().empty());
+
+    t.place({0, 1, 3});  // out again
+    t.scene.buildRenderList(t.list);
+    CHECK(t.list.instanceRevision() == revision);
+    CHECK(t.list.instances.size() == whole);  // (the end only shrank)
+    REQUIRE(t.list.remadeInstances().size() == 1);
+    CHECK(t.list.remadeInstances()[0].first == t.cubeRange().first);
+    CHECK(t.list.clipRegions.empty());
+    CHECK(t.list.instances[t.cubeRange().first].clip == 0);
+    CHECK(t.scene.updateCheckFailures() == 0);
+    requireSameAsRemade(t.scene, t.list);
+}
+
+TEST_CASE("RenderList: a room around a portal isn't cut, nor a cube half in the wall beside it", "[RenderList][Portals]") {
+    HalfThrough t;
+    EntityId room = t.scene.addObject(cornellBox, false);
+    t.scene.find(room)->local.position = {0, 0, 0};  // the opening inside it
+    glm::vec3 min, max;
+    REQUIRE(t.scene.modelBox(room, min, max));
+    INFO("room " << min.x << " " << min.y << " " << min.z << " .. " << max.x << " " << max.y << " " << max.z);
+    REQUIRE(glm::all(glm::lessThanEqual(min, glm::vec3(-0.5f, 0.0f, -0.5f))));
+    REQUIRE(glm::all(glm::greaterThanEqual(max, glm::vec3(0.5f, 2.0f, 0.5f))));
+    t.place({0.6f, 1, 0.1f});                       // half across A's side edge
+    t.scene.buildRenderList(t.list);
+    CHECK(t.list.clipRegions.empty());
+    for (const RenderInstance& instance : t.list.instances) {
+        CHECK(instance.clip == 0);
+    }
 }
 
 TEST_CASE("RenderList: punctual lights of visible models, with the object's scale", "[RenderList]") {

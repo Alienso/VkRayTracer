@@ -644,6 +644,24 @@ still), but the normal guide is the surface's real one, not turned like the view
 moving behind one gives wrong motion vectors there.
 - Where: `storeSurfaceGuides`.
 
+### Objects half through a portal: what is drawn
+A model going into an opening is cut there and shown again at the other end (Scene::findPortalPieces, ghosts at the
+render list's end, the cut in the shader: "Portal pieces" in tracing.glsl).
+- Only when where it crosses the opening's plane lies all within the opening: a model crossing it partly beside the
+  opening (half in the wall around it, or a room the portal is in) isn't cut, as before.
+- Ghosts don't light anything: a glowing model's part at the other end isn't in the light list (its emission shows
+  where seen), nor are its punctual lights moved there.
+- The model's box decides which openings it goes into: a model whose box crosses an opening but whose triangles
+  don't still gets an (invisible) cut and ghost.
+- At most 64 ghosts in a frame (all models together) and 4 cuts per piece; past them, pieces are left out.
+- Cost: cut instances are "not opaque" (the hardware hands their hits to the shader), so an object in a busy opening
+  costs: portal_rooms with a 0.3 m cube half through the lamp window traces in 7.05 ms, 6.6 ms with two whole cubes
+  in the same places (RTX 3070, 1600x900). Scenes with nothing cut: within noise (Sponza 6.28 -> 6.34 ms), captures
+  byte-identical.
+- The statistics' triangle count leaves ghosts out; a ghost appearing or going rebuilds the TLAS (not updated).
+- A new ghost has no motion of its own (DLSS sees it appear). A click is read back a frame or two later: if the
+  ghosts changed meanwhile, a click on one can select another ghost's entity, or nothing.
+
 ### The camera comes out upright
 The camera has no roll, so going through a pair whose ends lean differently (one in a wall, the other in the floor)
 turns the view upright at once as it comes out, instead of continuing it. Only the camera's own movement takes it
@@ -777,11 +795,28 @@ Measured: 0.6-0.7 s saved per file (15-20%: most of the time is optimizing, not 
 
 ### Collision: boxes only, and only the player
 The player (a capsule) collides with boxes the scene marks (`collider`), not with the models' own triangles: a
-Sponza wall without a collider is walked through. Colliders don't collide with each other, nothing is pushed or
-falls (no rigid bodies), and a lift or platform doesn't carry the player along sideways (it only lifts it).
+Sponza wall without a collider is walked through. Only solid colliders (`"solid": true`) stop at other colliders;
+nothing is pushed or falls (no rigid bodies), and a lift or platform doesn't carry the player along sideways (it
+only lifts it).
 - Fix: collision against the models' triangles (PHYSICS_PLAN.md, option B: a mesh shape behind the same
   PhysicsWorld interface, built from Mesh::vertices / indices, which stay on the CPU); rigid bodies with a library
   (Jolt) behind it.
+
+### What blocked moves don't do
+A solid collider's move (PhysicsWorld::moveBodies) stops where it would go into another collider, then slides the
+straight part of what is left along it (twice at most).
+- A turn only stops: a door swinging into a crate stops at it instead of turning while it slides off.
+- Behaviours aren't told: a held door keeps opening by its own count and catches up when freed; a bob or slide goes
+  on with its time. They could read "blocked" from GameWorld.
+- Groups move rigidly: the colliders under the topmost entity that moved go as one; a child's own move in the same
+  step isn't tested (its body is put where it ends up).
+- What a solid collider is already in when it moves (it was placed so, or a non-solid one went into it) doesn't
+  block it, so they can part; a non-solid collider goes through anything, solid ones too.
+- The player blocks a move only when it is squeezed (a trial push can't free it); it is never carried sideways.
+- A door made solid in a wall needs its panel's collider a little narrower than the gap: a panel that touches the
+  wall at the hinge swings into it and is blocked at once.
+- Where: SimplePhysicsWorld::moveBodies (source/physics/SimplePhysics.cpp), Collider::updateAll
+  (game/behaviours/Collider.cpp).
 
 ### Distances are from the eyes
 Doors, pickups and triggers measure from the camera's position: with a player that is its eyes, 1.65 m up, so a
@@ -810,7 +845,8 @@ points at the original's target; nothing warns. Removing the target leaves the i
 
 ### Behaviours that move the same thing fight
 Each behaviour writes what it moves every step: `spin` and `door` on one entity both set the rotation, and the later
-one in the update order wins (spin, bob, door, pickup, trigger, spawner, camera path: game/Behaviours.cpp). A trigger and a pickup on
+one in the update order wins (spin, bob, slide, door, pickup, trigger, spawner, camera path:
+game/Behaviours.cpp). A trigger and a pickup on
 the same target both set its visibility. Nothing warns.
 - Fix: put one of them on a child entity (spin the child, swing the parent), or a warning at Play for known pairs.
 
@@ -841,7 +877,8 @@ model whose origin is outside the opening (a door hinge) never does. Something m
 opening (a bob through a flat portal facing the same way at both ends) goes through each time it crosses.
 - Colliders don't know about openings: a wall with a portal in it must be built from boxes around the opening, or
   it stops the player before it gets there; and the player's body (not its eyes) colliding with what is beside the
-  far end before it went through isn't checked.
+  far end before it went through isn't checked. A solid collider is stopped by what is in front of the opening's
+  plane at its own end only, and what goes through is put at the other end without testing it there.
 - Only in scenes with portals: each step then works out every entity's world position twice (a few microseconds per
   hundred entities).
 

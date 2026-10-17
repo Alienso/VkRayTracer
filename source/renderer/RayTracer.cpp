@@ -131,8 +131,8 @@ void RayTracer::createRayTracingDescriptors() {
     // 21: environment map, 22: environment sampling distribution, 23: punctual lights, 24: light tree,
     // 25: primary hits, 26: ReSTIR reservoirs, 27: ReSTIR surfaces, 28: first bounces traced by the ReSTIR pass,
     // 29: ReSTIR GI reservoirs, 30: blue noise, 31: portals, 32: 3D textures (the fog's, Volumes.cpp),
-    // 33: per-object motion
-    std::vector<VkDescriptorSetLayoutBinding> bindings(34);
+    // 33: per-object motion, 34: clip regions (objects part way through portals)
+    std::vector<VkDescriptorSetLayoutBinding> bindings(35);
     bindings[0] = {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -165,6 +165,7 @@ void RayTracer::createRayTracingDescriptors() {
     bindings[31] = {31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[32] = {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GpuScene::maxVolumeTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     bindings[33] = {33, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[34] = {34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 
     // The texture array is "partially bound": only the first gpuAssets.textures.size() entries are filled in.
     // That's allowed as long as the shader never reads the empty ones.
@@ -189,7 +190,7 @@ void RayTracer::createRayTracingDescriptors() {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, maxTextures + 1 + GpuScene::maxVolumeTextures}
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -265,7 +266,8 @@ void RayTracer::updateRayTracingDescriptorSet() {
     }
 
     VkDescriptorBufferInfo motionInfo{scene.motionData.buffer, 0, VK_WHOLE_SIZE};
-    std::vector<VkWriteDescriptorSet> writes(34);
+    VkDescriptorBufferInfo clipRegionInfo{scene.clipRegionBuffer.buffer, 0, VK_WHOLE_SIZE};
+    std::vector<VkWriteDescriptorSet> writes(35);
     for (uint32_t i = 0; i < writes.size(); i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = rtDescriptorSet;
@@ -334,6 +336,8 @@ void RayTracer::updateRayTracingDescriptorSet() {
     writes[32].pImageInfo = volumeInfos.data();
     writes[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[33].pBufferInfo = &motionInfo;
+    writes[34].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[34].pBufferInfo = &clipRegionInfo;
     if (textureInfos.empty()) {
         writes.erase(writes.begin() + 7);  // nothing to write yet; a write with 0 descriptors isn't allowed
     }

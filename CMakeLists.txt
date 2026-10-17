@@ -57,6 +57,12 @@ add_library(vulkanDemoCore STATIC
         source/core/RangeAllocator.h source/core/DeferredDeletion.h
         include/cgltf/cgltf.h)
 target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
+target_link_libraries(vulkanDemoCore vulkanDemoPortals)
+
+# Portal pieces (PORTAL_PHYSICS_PLAN.md): objects half through portals, for drawing and collision, and what going
+# through an end does. Only glm
+add_library(vulkanDemoPortals STATIC
+        source/portals/PortalPieces.cpp source/portals/PortalPieces.h source/portals/PortalTransform.h)
 
 # Physics (PHYSICS_PLAN.md): colliders and the player's capsule behind an interface (physics/PhysicsWorld.h). Knows
 # nothing of the scene, the assets or the game: only glm
@@ -69,7 +75,8 @@ add_library(vulkanDemoPhysics STATIC
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
         source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h source/game/Colliders.h
-        source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Door.cpp
+        source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Slide.cpp
+        source/game/behaviours/Door.cpp
         source/game/behaviours/Pickup.cpp source/game/behaviours/Trigger.cpp source/game/behaviours/Spawner.cpp
         source/game/behaviours/CameraPath.cpp source/game/behaviours/Collider.cpp source/game/behaviours/Player.cpp
         source/game/GameProperties.h source/game/StepInterpolation.cpp source/game/StepInterpolation.h
@@ -126,11 +133,11 @@ add_executable(tests
         tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
         tests/GameInteractionTests.cpp tests/SelectionTests.cpp
         tests/EditHistoryTests.cpp tests/PhysicsTests.cpp tests/GamePauseTests.cpp
-        tests/GamePhysicsTests.cpp tests/GamePortalTests.cpp)
+        tests/GamePhysicsTests.cpp tests/GamePortalTests.cpp tests/PortalPiecesTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes
-target_link_libraries(tests vulkanDemoGame vulkanDemoPhysics vulkanDemoCore -static-libgcc -static-libstdc++)
+target_link_libraries(tests vulkanDemoGame vulkanDemoPhysics vulkanDemoCore vulkanDemoPortals -static-libgcc -static-libstdc++)
 enable_testing()
 add_test(NAME unit COMMAND tests)
 

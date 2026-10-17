@@ -3,8 +3,8 @@
 // implementation can be swapped (our own SimplePhysics now; mesh collision or a library later) without touching the
 // game. It knows nothing of the scene: the game hands it shapes and transforms and reads back where the character went.
 //
-// Colliders are static or moved by hand each step (kinematic): nothing here moves them, and they don't collide with
-// each other. The character is a capsule standing on its feet: moveCharacter walks it, with gravity, sliding along
+// Colliders are static or moved by hand each step (kinematic): nothing here moves them on its own. Placed with
+// setTransform they go anywhere (through other colliders); moved with moveBodies they stop at other colliders. The character is a capsule standing on its feet: moveCharacter walks it, with gravity, sliding along
 // what it hits and stepping onto low ledges.
 //
 
@@ -12,6 +12,7 @@
 #define VULKANDEMO_PHYSICSWORLD_H
 
 #include <memory>
+#include <vector>
 #include "physics/PhysicsTypes.h"
 
 namespace physics {
@@ -21,6 +22,12 @@ struct CharacterSettings {
     float maxSlopeDegrees = 45.0f;   // steeper surfaces are walls
     float stepHeight = 0.3f;         // ledges up to this high are stepped onto (and down from, walking)
     float airAcceleration = 10.0f;   // m/s^2 towards the wanted velocity while in the air (on the ground: at once)
+};
+
+// Where a group of bodies moved with moveBodies got to
+struct GroupMove {
+    Transform reached;     // the group's transform where it stopped (the target when nothing blocked it)
+    bool blocked = false;
 };
 
 struct CharacterState {
@@ -40,6 +47,12 @@ public:
     virtual void setEnabled(BodyId body, bool enabled) = 0;  // a disabled body is passed through
     virtual void remove(BodyId body) = 0;
     [[nodiscard]] virtual size_t bodyCount() const = 0;
+    // Moves the bodies together as one rigid thing whose transform goes from `from` (where they are now) to `to`
+    // (positions in a line, the turn the short way), as far as it can go without overlapping other enabled bodies or
+    // squeezing a character (pushing one is fine: its next move pushes it out; it is squeezed when that push can't
+    // free it). Blocked, the straight part of what is left slides along what stopped it (twice at most); a turn only
+    // stops. What overlaps them where they start doesn't block them, so things already in each other can part.
+    virtual GroupMove moveBodies(const std::vector<BodyId>& group, const Transform& from, const Transform& to) = 0;
 
     // The character
     virtual CharacterId addCharacter(const CharacterSettings& settings, const glm::vec3& feet) = 0;

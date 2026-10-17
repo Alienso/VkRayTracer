@@ -1,6 +1,6 @@
 //
-// Physics (physics/): the capsule against box test, and the character walking, falling, sliding and stepping among
-// boxes. No scene: the library knows none.
+// Physics (physics/): the capsule against box and box against box tests, moves that can be blocked, and the
+// character walking, falling, sliding and stepping among boxes. No scene: the library knows none.
 //
 
 #include <catch_amalgamated.hpp>
@@ -9,6 +9,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include "physics/Collision.h"
 #include "physics/PhysicsWorld.h"
+#include "physics/SimplePhysics.h"
 
 using namespace physics;
 
@@ -93,6 +94,150 @@ TEST_CASE("Collision: a capsule deep in a box goes out the nearest face", "[Phys
     REQUIRE(contact);
     CHECK(contact->normal.y == Catch::Approx(1.0f));
     CHECK(contact->depth == Catch::Approx(1.0f - 0.5f + 0.3f).margin(1e-4));  // its lowest point past the top
+}
+
+// ---------------------------------------------------------------------------------------------
+// Box against box
+
+TEST_CASE("Collision: two boxes face to face touch over the faces' overlap", "[Physics]") {
+    std::vector<glm::vec3> points;
+    std::optional<Contact> contact = boxBoxContact(at({1.8f, 0, 0}), glm::vec3(1.0f), at({0, 0, 0}), glm::vec3(1.0f),
+                                                   &points);
+    REQUIRE(contact);
+    CHECK(contact->normal.x == Catch::Approx(1.0f));
+    CHECK(contact->depth == Catch::Approx(0.2f).margin(1e-5));
+    CHECK(points.size() == 4);  // the face's corners
+    for (const glm::vec3& point : points) {
+        CHECK(point.x == Catch::Approx(1.0f));  // on the second box's face
+    }
+    // The other way round: pushed the other way
+    std::optional<Contact> back = boxBoxContact(at({0, 0, 0}), glm::vec3(1.0f), at({1.8f, 0, 0}), glm::vec3(1.0f));
+    REQUIRE(back);
+    CHECK(back->normal.x == Catch::Approx(-1.0f));
+    CHECK(back->depth == Catch::Approx(0.2f).margin(1e-5));
+    // Apart
+    CHECK_FALSE(boxBoxContact(at({2.1f, 0, 0}), glm::vec3(1.0f), at({0, 0, 0}), glm::vec3(1.0f)));
+}
+
+TEST_CASE("Collision: two crossed edges touch at one point", "[Physics]") {
+    // A turned so an edge along Z points down, B so an edge along X points up: the edges cross
+    float r2 = std::sqrt(2.0f);
+    glm::quat aTurn = turned(45.0f, {0, 0, 1});
+    glm::quat bTurn = turned(45.0f, {1, 0, 0});
+    std::vector<glm::vec3> points;
+    std::optional<Contact> contact = boxBoxContact(at({0, 2.0f * r2 - 0.1f, 0}, aTurn), glm::vec3(1.0f),
+                                                   at({0, 0, 0}, bTurn), glm::vec3(1.0f), &points);
+    REQUIRE(contact);
+    CHECK(contact->normal.y == Catch::Approx(1.0f).margin(1e-4));
+    CHECK(contact->depth == Catch::Approx(0.1f).margin(1e-4));
+    REQUIRE(points.size() == 1);
+    CHECK(glm::length(contact->point - glm::vec3(0, r2, 0)) < 1e-3f);  // B's top edge, under A's
+    CHECK_FALSE(boxBoxContact(at({0, 2.0f * r2 + 0.05f, 0}, aTurn), glm::vec3(1.0f), at({0, 0, 0}, bTurn),
+                              glm::vec3(1.0f)));
+}
+
+TEST_CASE("Collision: a box's corner into a face touches at the corner", "[Physics]") {
+    // B turned so a corner points straight up, A flat on it
+    glm::vec3 corner = glm::normalize(glm::vec3(1.0f));
+    glm::quat cornerUp = glm::angleAxis(std::acos(corner.y), glm::normalize(glm::cross(corner, glm::vec3(0, 1, 0))));
+    float r3 = std::sqrt(3.0f);
+    std::vector<glm::vec3> points;
+    std::optional<Contact> contact = boxBoxContact(at({0.2f, r3 + 1.0f - 0.05f, 0.1f}), glm::vec3(1.0f),
+                                                   at({0, 0, 0}, cornerUp), glm::vec3(1.0f), &points);
+    REQUIRE(contact);
+    CHECK(contact->normal.y == Catch::Approx(1.0f).margin(1e-4));
+    CHECK(contact->depth == Catch::Approx(0.05f).margin(1e-4));
+    REQUIRE(points.size() == 1);
+    CHECK(glm::length(contact->point - glm::vec3(0, r3, 0)) < 1e-3f);
+}
+
+TEST_CASE("Collision: a turned box against a box: its edge is what reaches", "[Physics]") {
+    glm::quat turn = turned(45.0f, {0, 1, 0});
+    float r2 = std::sqrt(2.0f);
+    std::optional<Contact> contact = boxBoxContact(at({1.0f + r2 - 0.1f, 0, 0}, turn), glm::vec3(1.0f),
+                                                   at({0, 0, 0}), glm::vec3(1.0f));
+    REQUIRE(contact);
+    CHECK(contact->normal.x == Catch::Approx(1.0f).margin(1e-4));
+    CHECK(contact->depth == Catch::Approx(0.1f).margin(1e-4));
+    CHECK(contact->point.x == Catch::Approx(1.0f).margin(1e-4));
+    CHECK_FALSE(boxBoxContact(at({1.0f + r2 + 0.05f, 0, 0}, turn), glm::vec3(1.0f), at({0, 0, 0}), glm::vec3(1.0f)));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Moves that can be blocked
+
+TEST_CASE("Physics: a box moved into a wall stops at it; moved at an angle, it slides along it", "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(0.5f, 2.0f, 2.0f)}, at({3.0f, 0, 0}));  // its face at x = 2.5
+    BodyId box = world->addBox({glm::vec3(0.5f)}, at({0, 0, 0}));
+    GroupMove straight = world->moveBodies({box}, at({0, 0, 0}), at({5.0f, 0, 0}));
+    CHECK(straight.blocked);
+    CHECK(straight.reached.position.x == Catch::Approx(2.0f).margin(5e-3));
+    CHECK(straight.reached.position.x <= 2.0f + SimplePhysicsWorld::contactSkin);
+    // From there, at an angle: it keeps the part along the wall
+    GroupMove slid = world->moveBodies({box}, straight.reached, at({5.0f, 0, 1.0f}));
+    CHECK(slid.blocked);
+    CHECK(slid.reached.position.x == Catch::Approx(2.0f).margin(5e-3));
+    CHECK(slid.reached.position.z == Catch::Approx(1.0f).margin(1e-3));
+    // Free: all the way
+    GroupMove back = world->moveBodies({box}, slid.reached, at({-3.0f, 0, 0}));
+    CHECK_FALSE(back.blocked);
+    CHECK(back.reached.position == glm::vec3(-3.0f, 0, 0));
+}
+
+TEST_CASE("Physics: a fast box doesn't pass through a thin wall", "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(0.05f, 2.0f, 2.0f)}, at({3.0f, 0, 0}));
+    BodyId box = world->addBox({glm::vec3(0.2f)}, at({0, 0, 0}));
+    GroupMove move = world->moveBodies({box}, at({0, 0, 0}), at({10.0f, 0, 0}));  // past it in one move
+    CHECK(move.blocked);
+    CHECK(move.reached.position.x == Catch::Approx(2.75f).margin(5e-3));
+}
+
+TEST_CASE("Physics: a turning door stops at a crate", "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    // The hinge at the origin, the panel along +X; turned 90 degrees about Y it would end along -Z
+    BodyId panel = world->addBox({glm::vec3(0.75f, 1.0f, 0.05f)}, at({0.75f, 0, 0}));
+    BoxShape crate{glm::vec3(0.3f)};
+    Transform crateAt = at({1.0f, 0, -1.0f});
+    world->addBox(crate, crateAt);
+    GroupMove move = world->moveBodies({panel}, at({0, 0, 0}), at({0, 0, 0}, turned(90.0f, {0, 1, 0})));
+    CHECK(move.blocked);
+    CHECK(move.reached.position == glm::vec3(0.0f));  // (a turn isn't slid)
+    float degrees = glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(move.reached.rotation.w))));
+    CHECK(degrees > 10.0f);
+    CHECK(degrees < 80.0f);
+    Transform panelAt{move.reached.rotation * glm::vec3(0.75f, 0, 0), move.reached.rotation};
+    std::optional<Contact> contact = boxBoxContact(panelAt, glm::vec3(0.75f, 1.0f, 0.05f), crateAt, crate.halfExtents);
+    CHECK((!contact || contact->depth <= 2e-3f));  // stopped at it, not in it
+}
+
+TEST_CASE("Physics: a group (a platform and the box on it) stops together; the platform alone is stopped by the box",
+          "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(3.0f, 0.1f, 3.0f)}, at({0, 2.1f, 0}));  // a ceiling at y = 2
+    BodyId platform = world->addBox({glm::vec3(1.0f, 0.1f, 1.0f)}, at({0, 0, 0}));
+    BodyId box = world->addBox({glm::vec3(0.3f)}, at({0, 0.4f, 0}));  // resting on it, its top at 0.7
+    GroupMove alone = world->moveBodies({platform}, at({0, 0, 0}), at({0, 3.0f, 0}));
+    CHECK(alone.blocked);
+    CHECK(alone.reached.position.y < 0.01f);  // the box on it is in the way
+    GroupMove together = world->moveBodies({platform, box}, alone.reached, at({0, 3.0f, 0}));
+    CHECK(together.blocked);
+    CHECK(together.reached.position.y == Catch::Approx(1.3f).margin(5e-3));  // the box's top at the ceiling
+}
+
+TEST_CASE("Physics: a moved box pushes the character; squeezed against a wall, the box is blocked", "[Physics]") {
+    TestWorld t;
+    t.run(10);
+    BodyId box = t.world->addBox({glm::vec3(0.5f)}, at({2.0f, 0.5f, 0}));
+    GroupMove push = t.world->moveBodies({box}, at({2.0f, 0.5f, 0}), at({0.6f, 0.5f, 0}));  // its face at 0.1
+    CHECK_FALSE(push.blocked);
+    CharacterState state = t.run(1);
+    CHECK(state.feet.x == Catch::Approx(0.1f - 0.3f).margin(2e-3));
+    t.world->addBox({glm::vec3(0.5f, 1.0f, 1.0f)}, at({-1.5f, 1.0f, 0}));  // a wall, its face at x = -1
+    GroupMove squeeze = t.world->moveBodies({box}, push.reached, at({-0.5f, 0.5f, 0}));
+    CHECK(squeeze.blocked);
+    CHECK(squeeze.reached.position.x == Catch::Approx(-1.0f + 0.6f + 0.5f).margin(0.02));  // room for the capsule
 }
 
 // ---------------------------------------------------------------------------------------------

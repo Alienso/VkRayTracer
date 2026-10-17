@@ -601,7 +601,8 @@ static glm::mat4 motionFrom(const glm::mat4* last, const glm::mat4& world) {
 }
 
 void Scene::remakeInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                            std::vector<std::pair<uint32_t, glm::mat4>>& rims) const {
+                            std::vector<std::pair<uint32_t, glm::mat4>>& rims,
+                            const std::vector<uint32_t>& clips) const {
     // Last frame's entities, found by id (entities come and go; a new one has no motion). A child that moves with its
     // parent has its own world transform here, so it gets its motion too.
     std::unordered_map<EntityId, glm::mat4> previous;
@@ -613,16 +614,17 @@ void Scene::remakeInstances(RenderList& list, const std::vector<PlacedModel>& mo
     list.builtEntities.clear();
     list.revision++;
     list.motionChanged = true;
-    for (const PlacedModel& placed : models) {
+    for (size_t i = 0; i < models.size(); i++) {
+        const PlacedModel& placed = models[i];
         RenderList::BuiltEntity built{placed.id, placed.component->model, placed.visible,
                                       placed.component->originalSize, placed.world,
-                                      {static_cast<uint32_t>(list.instances.size()), 0}, 0};
+                                      {static_cast<uint32_t>(list.instances.size()), 0}, 0, clips[i]};
         if (placed.visible) {
             auto last = previous.find(placed.id);
             built.motion = static_cast<uint32_t>(list.motions.size());
             list.motions.push_back(motionFrom(last != previous.end() ? &last->second : nullptr, placed.world));
             forEachVisiblePart(placed, [&](uint32_t mesh, const glm::mat4& world) {
-                list.instances.push_back({mesh, built.motion, world});
+                list.instances.push_back({mesh, built.motion, world, clips[i]});
             });
             built.range.count = static_cast<uint32_t>(list.instances.size()) - built.range.first;
         }
@@ -638,12 +640,14 @@ void Scene::remakeInstances(RenderList& list, const std::vector<PlacedModel>& mo
         }
     }
     list.builtRims = std::move(rims);
+    list.firstGhostMotion = static_cast<uint32_t>(list.motions.size());
     list.builtLayout = layoutRevision;
     list.builtAssets = assets.revision();
 }
 
 bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                            std::vector<std::pair<uint32_t, glm::mat4>>& rims) const {
+                            std::vector<std::pair<uint32_t, glm::mat4>>& rims,
+                            const std::vector<uint32_t>& clips) const {
     if (layoutRevision != list.builtLayout || assets.revision() != list.builtAssets ||
         models.size() != list.builtEntities.size() || rims.size() != list.builtRims.size()) {
         return false;
@@ -687,7 +691,16 @@ bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& mo
                     list.changed.push_back(built.range);
                 }
             }
+            if (clips[i] != built.clip) {  // going into an opening, or out: cut otherwise
+                for (uint32_t k = built.range.first; k < built.range.first + built.range.count; k++) {
+                    list.instances[k].clip = clips[i];
+                }
+                if (built.range.count > 0) {
+                    list.remade.push_back(built.range);
+                }
+            }
         }
+        built.clip = clips[i];
     }
     // (Only now: a remake instead would still need last frame's)
     for (size_t i = 0; i < models.size(); i++) {
@@ -702,6 +715,109 @@ bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& mo
         list.builtRims = std::move(rims);
     }
     return true;
+}
+
+std::vector<Scene::ModelPieces> Scene::findPortalPieces(const std::vector<PlacedModel>& models,
+                                                        const std::vector<PlacedPair>& pairs) const {
+    std::vector<ModelPieces> found;
+    if (pairs.empty()) {
+        return found;
+    }
+    std::vector<portals::PortalOpening> openings;
+    for (const PlacedPair& pair : pairs) {
+        portals::addPortalPair(openings, pair.ends[0], pair.ends[1], pair.portal->size * 0.5f,
+                               pair.portal->shape == PortalShape::Ellipse);
+    }
+    int depth = std::max(1, settings.maxPortalCrossings);
+    int ghosts = 0;
+    for (size_t i = 0; i < models.size() && ghosts < maxGhosts; i++) {
+        const PlacedModel& placed = models[i];
+        glm::vec3 min, max;
+        if (!placed.visible || !modelBox(placed.id, min, max)) {
+            continue;
+        }
+        // Its model's box placed in the world (its scale in the half sizes)
+        portals::OrientedBox box;
+        box.center = glm::vec3(placed.world * glm::vec4((min + max) * 0.5f, 1.0f));
+        for (int axis = 0; axis < 3; axis++) {
+            glm::vec3 column(placed.world[axis]);
+            float length = glm::length(column);
+            box.axes[axis] = length > 0.0f ? column / length : glm::vec3(0.0f);
+            box.half[axis] = (max[axis] - min[axis]) * 0.5f * length;
+        }
+        // (Only near an opening: within their bounding spheres)
+        bool near = false;
+        for (size_t o = 0; o < openings.size() && !near; o++) {
+            near = glm::distance(box.center, glm::vec3(openings[o].end[3])) <=
+                   glm::length(box.half) + glm::length(openings[o].halfSize);
+        }
+        if (!near) {
+            continue;
+        }
+        std::vector<portals::PortalPiece> pieces;
+        portals::portalPieces(box, glm::vec3(placed.world[3]), openings, depth, maxGhosts - ghosts + 1, pieces);
+        if (pieces.size() > 1 || pieces[0].cutCount > 0) {
+            ghosts += static_cast<int>(pieces.size()) - 1;
+            found.push_back({i, std::move(pieces)});
+        }
+    }
+    return found;
+}
+
+void Scene::placeGhosts(RenderList& list, const std::vector<PlacedModel>& models,
+                        const std::vector<ModelPieces>& pieces) const {
+    uint32_t first = list.firstRim + static_cast<uint32_t>(list.builtRims.size());
+    std::vector<RenderInstance> instancesBefore(list.instances.begin() + first, list.instances.end());
+    std::vector<glm::mat4> motionsBefore(list.motions.begin() + list.firstGhostMotion, list.motions.end());
+    std::vector<RenderList::BuiltGhost> ghostsBefore = std::move(list.builtGhosts);
+    list.builtGhosts.clear();
+    list.instances.resize(first);
+    list.motions.resize(list.firstGhostMotion);
+    for (const ModelPieces& entry : pieces) {
+        const PlacedModel& placed = models[entry.model];
+        for (uint32_t k = 1; k < entry.pieces.size(); k++) {
+            const portals::PortalPiece& piece = entry.pieces[k];
+            RenderList::BuiltGhost ghost{placed.id, k, piece.transform, piece.transform * placed.world,
+                                         {static_cast<uint32_t>(list.instances.size()), 0}};
+            // Its motion from its last frame's place (the same entity's same piece); a new one has none
+            auto last = std::find_if(ghostsBefore.begin(), ghostsBefore.end(), [&](const RenderList::BuiltGhost& g) {
+                return g.id == placed.id && g.piece == k;
+            });
+            uint32_t motion = static_cast<uint32_t>(list.motions.size());
+            list.motions.push_back(motionFrom(last != ghostsBefore.end() ? &last->world : nullptr, ghost.world));
+            ClipRegion region;
+            region.cutCount = static_cast<uint32_t>(piece.cutCount);
+            std::copy(piece.cuts, piece.cuts + piece.cutCount, region.cuts);
+            list.clipRegions.push_back(region);
+            uint32_t clip = static_cast<uint32_t>(list.clipRegions.size());
+            forEachVisiblePart(placed, [&](uint32_t mesh, const glm::mat4& world) {
+                list.instances.push_back({mesh, motion, piece.transform * world, clip});
+            });
+            ghost.range.count = static_cast<uint32_t>(list.instances.size()) - ghost.range.first;
+            list.builtGhosts.push_back(ghost);
+        }
+    }
+    // What changed at the end: only the matrices (the same ghosts, cut the same way), or the ghosts
+    uint32_t count = static_cast<uint32_t>(list.instances.size()) - first;
+    bool same = count == instancesBefore.size();
+    bool moved = false;
+    for (uint32_t i = 0; i < count && same; i++) {
+        const RenderInstance& now = list.instances[first + i];
+        const RenderInstance& was = instancesBefore[i];
+        same = now.mesh == was.mesh && now.motion == was.motion && now.clip == was.clip;
+        moved = moved || now.world != was.world;
+    }
+    if (!same) {
+        if (count > 0) {  // (none left: the list's end only shrank)
+            list.remade.push_back({first, count});
+        }
+    } else if (moved) {
+        list.changed.push_back({first, count});
+    }
+    if (!std::equal(list.motions.begin() + list.firstGhostMotion, list.motions.end(), motionsBefore.begin(),
+                    motionsBefore.end())) {
+        list.motionChanged = true;
+    }
 }
 
 std::vector<Scene::PlacedPair> Scene::placePairs(const std::vector<Placed>& placed) const {
@@ -812,6 +928,20 @@ void Scene::buildRenderList(RenderList& list) {
     }
     std::vector<PlacedPair> pairs = placePairs(placed);
     std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims(pairs);
+    // Model entities going into portal openings: their instances cut, their ghosts at the list's end (placeGhosts)
+    std::vector<ModelPieces> pieces = findPortalPieces(models, pairs);
+    std::vector<uint32_t> clips(models.size(), 0);
+    list.clipRegions.clear();
+    for (const ModelPieces& entry : pieces) {
+        const portals::PortalPiece& real = entry.pieces[0];
+        if (real.cutCount > 0) {
+            ClipRegion region;
+            region.cutCount = static_cast<uint32_t>(real.cutCount);
+            std::copy(real.cuts, real.cuts + real.cutCount, region.cuts);
+            list.clipRegions.push_back(region);
+            clips[entry.model] = static_cast<uint32_t>(list.clipRegions.size());
+        }
+    }
     list.camera = sceneCamera;
     list.cameraTeleport = cameraTeleport;
     cameraTeleport = glm::mat4(1.0f);
@@ -820,25 +950,37 @@ void Scene::buildRenderList(RenderList& list) {
     // The instances: only the moved entities' ranges, unless the layout changed
     list.builds++;
     list.changed.clear();
+    list.remade.clear();
     list.motionChanged = false;
     std::vector<RenderList::BuiltEntity> before;
+    std::vector<RenderList::BuiltGhost> ghostsBefore;
+    std::vector<ClipRegion> regionsBefore;
     std::vector<std::pair<uint32_t, glm::mat4>> rimsBefore;
     if (checkUpdates) {
         before = list.builtEntities;
+        ghostsBefore = list.builtGhosts;
+        regionsBefore = list.clipRegions;
         rimsBefore = rims;
     }
-    if (!updateInstances(list, models, rims)) {
+    bool updated = updateInstances(list, models, rims, clips);
+    if (!updated) {
         list.changed.clear();
-        remakeInstances(list, models, rims);
-    } else if (checkUpdates) {
+        list.remade.clear();
+        remakeInstances(list, models, rims, clips);
+    }
+    placeGhosts(list, models, pieces);
+    if (updated && checkUpdates) {
         RenderList scratch;
         scratch.builtEntities = std::move(before);
-        remakeInstances(scratch, models, rimsBefore);
+        scratch.builtGhosts = std::move(ghostsBefore);
+        scratch.clipRegions = std::move(regionsBefore);
+        remakeInstances(scratch, models, rimsBefore, clips);
+        placeGhosts(scratch, models, pieces);
         size_t wrong = 0;
         for (size_t i = 0; i < list.instances.size() && i < scratch.instances.size(); i++) {
             const RenderInstance& x = list.instances[i];
             const RenderInstance& y = scratch.instances[i];
-            wrong += x.mesh != y.mesh || x.motion != y.motion || x.world != y.world ? 1 : 0;
+            wrong += x.mesh != y.mesh || x.motion != y.motion || x.world != y.world || x.clip != y.clip ? 1 : 0;
         }
         if (wrong > 0 || list.instances.size() != scratch.instances.size() || list.motions != scratch.motions) {
             checkFailures++;

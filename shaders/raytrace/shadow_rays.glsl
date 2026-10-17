@@ -49,7 +49,8 @@ vec3 shadowTransmittance(vec3 origin, vec3 direction, float maxDistance, int thr
         uvec2 crossed = OUTSIDE;  // varying fog volumes whose surfaces it crosses
         while (rayQueryProceedEXT(rayQuery)) {
             if (SHADOW_RAY_FLAGS != gl_RayFlagsNoneEXT ||
-                rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+                rayQueryGetIntersectionTypeEXT(rayQuery, false) != gl_RayQueryCandidateIntersectionTriangleEXT ||
+                cutAway(rayQuery)) {
                 continue;
             }
             // Only what the next test needs is read at each step (the UVs first, the triangle's shape only for glass and
