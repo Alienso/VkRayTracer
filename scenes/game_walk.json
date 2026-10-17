@@ -1,8 +1,8 @@
 {
   "format": "vulkanDemo scene",
   "version": 1,
-  "nextEntityId": 22,
-  "portalPairsMade": 0,
+  "nextEntityId": 25,
+  "portalPairsMade": 1,
   "camera": {"position":[0.0,1.65,8.0],"yaw":0.0,"pitch":0.0,"fov":70.0},
   "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
   "entities": [
@@ -26,7 +26,10 @@
     {"id":18,"name":"Coin behind the door","parent":0,"position":[0.0,0.5,-9.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5,"remove":true}},{"type":"spin","properties":{"speed":180}}]},
     {"id":19,"name":"Lift (stand on it)","parent":0,"position":[7.0,0.4,-8.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.2,2.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}},{"type":"bob","properties":{"height":1.0,"period":5}}]},
     {"id":20,"name":"High shelf","parent":0,"position":[7.0,2.4,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.2,2.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
-    {"id":21,"name":"Coin on the shelf","parent":0,"position":[7.0,3.0,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]}
+    {"id":21,"name":"Coin on the shelf","parent":0,"position":[7.0,3.0,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":22,"name":"Portal (walk in: out behind the wall)","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":23,"name":"End A","parent":22,"position":[-6.0,1.1,5.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"portal":{"other":24,"endA":true,"shape":"rectangle","size":[1.2,2.2],"rim":true,"rimWidth":0.06,"rimDepth":0.04}},
+    {"id":24,"name":"End B","parent":22,"position":[5.0,1.1,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"portal":{"other":23,"endA":false,"shape":"rectangle","size":[1.2,2.2],"rim":true,"rimWidth":0.06,"rimDepth":0.04}}
   ],
   "models": []
 }

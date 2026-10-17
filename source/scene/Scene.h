@@ -24,6 +24,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -215,6 +216,14 @@ public:
     // at the camera's position, so it is on one side or the other, never half in. Its roll is lost (the camera
     // has none): a pair whose ends lean differently turns the view upright as it comes out.
     void moveCameraThroughPortals(const glm::vec3& from);
+    // Whether the line from `from` to `to` goes through an enabled portal's opening (also more than once): the
+    // transform that takes the near side to where it comes out (rigid; the camera's crossings, composed). The game
+    // carries entities through with it.
+    [[nodiscard]] std::optional<glm::mat4> portalCrossing(const glm::vec3& from, const glm::vec3& to) const;
+    [[nodiscard]] bool hasPortals() const { return !portalTable.empty(); }
+    // The camera was moved through a portal by someone else (the game's player): the renderer's history follows it
+    // (RenderList::cameraTeleport), as for moveCameraThroughPortals
+    void teleportCamera(const glm::mat4& crossing) { cameraTeleport = crossing * cameraTeleport; }
 
     SceneEnvironment& environment() { return sceneEnvironment; }
     [[nodiscard]] const SceneEnvironment& environment() const { return sceneEnvironment; }
@@ -290,6 +299,12 @@ private:
     };
     // The enabled pairs (both ends visible), in the order of their A ends
     [[nodiscard]] std::vector<PlacedPair> placePairs(const std::vector<Placed>& placed) const;
+    // The line from `from` to `to` through the pairs' openings: crossed(toPartner) for each opening it goes through,
+    // in order (at most 8, as the shader's default "Max portal crossings"); the rest of the line continues from the
+    // partner end
+    template <typename Crossed>
+    void crossPortals(const std::vector<PlacedPair>& pairs, const glm::vec3& from, const glm::vec3& to,
+                      Crossed&& crossed) const;
     // The bars of the pairs' rims: (mesh, world matrix) for each
     [[nodiscard]] std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims(
             const std::vector<PlacedPair>& pairs) const;

@@ -28,6 +28,7 @@ struct Player {
     float eyeHeight, speed, runSpeed, jumpSpeed, gravity, respawnBelow, sensitivity;
     glm::vec3 start;  // the feet at Play
     float yaw, pitch; // the view, degrees (as Camera's)
+    glm::vec3 lastEyes = glm::vec3(0.0f);  // the last step's: the line to this step's goes through portals or not
 
     static std::optional<Player> read(const ReadContext& context, GameProperties& properties) {
         float radius = std::max(properties.number("radius", 0.3f), 0.01f);
@@ -56,8 +57,10 @@ struct Player {
             return std::nullopt;
         }
         player.body = context.world.physics->addCharacter(settings, player.start);
+        player.lastEyes = player.start + glm::vec3(0.0f, player.eyeHeight, 0.0f);
         context.world.controlsCamera = true;
         context.world.mouseLook = true;
+        context.world.playerEntity = context.entity.id;
         return player;
     }
 
@@ -92,12 +95,34 @@ struct Player {
             state.feet = start;
             step.snap(entity);
             step.snapCamera();
+        } else if (std::optional<glm::mat4> crossing =
+                           scene.portalCrossing(lastEyes, state.feet + glm::vec3(0.0f, eyeHeight, 0.0f))) {
+            // Its eyes went through a portal: the body, its speed and the view come out of the other end (the roll
+            // is lost, as the camera's)
+            glm::mat3 turn(*crossing);
+            state.feet = glm::vec3(*crossing * glm::vec4(state.feet, 1.0f));
+            state.velocity = turn * state.velocity;
+            world.physics->teleport(body, state.feet, state.velocity);
+            glm::vec3 look = glm::normalize(turn * forwardOf(yaw, pitch));
+            pitch = glm::clamp(glm::degrees(std::asin(glm::clamp(look.y, -1.0f, 1.0f))), -89.0f, 89.0f);
+            yaw = glm::degrees(std::atan2(look.x, -look.z));
+            scene.teleportCamera(*crossing);  // (the renderer's history follows)
+            step.snap(entity);
+            step.snapCamera();
         }
         Camera& camera = scene.camera();
         camera.position = state.feet + glm::vec3(0.0f, eyeHeight, 0.0f);
+        lastEyes = camera.position;
         camera.yaw = yaw;
         camera.pitch = pitch;
         follow(scene, state.feet);
+    }
+
+    // The direction of a view (as Camera::forward)
+    static glm::vec3 forwardOf(float yawDegrees, float pitchDegrees) {
+        float y = glm::radians(yawDegrees);
+        float p = glm::radians(pitchDegrees);
+        return {std::cos(p) * std::sin(y), std::sin(p), -std::cos(p) * std::cos(y)};
     }
 
     // The entity at the feet, turned to the view (a model under it shows the player)
@@ -117,10 +142,11 @@ struct Player {
     }
 
     // Put somewhere else by hand while paused: the body goes there (still; the respawn point stays)
-    void moved(const EntityMove& move, GameWorld& world) const {
+    void moved(const EntityMove& move, GameWorld& world) {
         if (world.physics != nullptr) {
-            glm::vec3 feet = world.physics->character(body).feet;
-            world.physics->teleport(body, glm::vec3(move.worldChange * glm::vec4(feet, 1.0f)), glm::vec3(0.0f));
+            glm::vec3 feet = glm::vec3(move.worldChange * glm::vec4(world.physics->character(body).feet, 1.0f));
+            world.physics->teleport(body, feet, glm::vec3(0.0f));
+            lastEyes = feet + glm::vec3(0.0f, eyeHeight, 0.0f);  // (not a walk through a portal)
         }
     }
 
@@ -130,6 +156,7 @@ struct Player {
         }
         world.controlsCamera = false;
         world.mouseLook = false;
+        world.playerEntity = 0;
     }
 };
 

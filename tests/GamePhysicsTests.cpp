@@ -6,6 +6,7 @@
 
 #include <catch_amalgamated.hpp>
 #include "TestHelpers.h"
+#include "game/Colliders.h"
 #include "game/Game.h"
 #include "game/GameLoop.h"
 #include "game/StepInterpolation.h"
@@ -273,4 +274,22 @@ TEST_CASE("Player: only one thing drives the camera; the mouse is captured unles
     TestScene u;
     CHECK(u.play().empty());
     CHECK(u.game.capturesMouse());  // nothing drives it: the game-style fly camera
+}
+
+TEST_CASE("Colliders: the boxes the editor outlines are the ones the game makes", "[Game][Player]") {
+    TestScene t;
+    EntityId sized = t.entityWith("Sized", {{"collider", R"({"size": [2, 1, 4], "offset": [0, 0.5, 0]})"}},
+                                  {3.0f, 0.0f, 0.0f});
+    EntityId hidden = t.entityWith("Hidden", {{"collider", ""}}, {-3.0f, 0.0f, 0.0f});
+    t.scene.find(hidden)->visible = false;
+    t.entityWith("Not a collider", {{"spin", ""}}, {0.0f, 0.0f, 0.0f});
+    std::vector<WorldBox> all = colliderBoxes(t.scene, 0);
+    REQUIRE(all.size() == 1);  // (hidden ones aren't solid: not outlined with the rest)
+    CHECK(all[0].min == glm::vec3(-1.0f, 0.0f, -2.0f));
+    CHECK(all[0].max == glm::vec3(1.0f, 1.0f, 2.0f));
+    CHECK(glm::vec3(all[0].transform[3]) == glm::vec3(3.0f, 0.0f, 0.0f));
+    std::vector<WorldBox> one = colliderBoxes(t.scene, hidden);  // the selection's: also when hidden
+    REQUIRE(one.size() == 1);
+    CHECK(one[0].max == glm::vec3(0.5f));  // no model: a unit cube
+    CHECK(colliderBoxes(t.scene, sized).size() == 1);
 }

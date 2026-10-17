@@ -789,6 +789,12 @@ pickup on the floor needs a radius over 1.65 (the scenes use 1.5 with coins 0.5 
 instead (PhysicsWorld::overlapsCapsule).
 - Where: `GameWorld::player` (source/game/Behaviour.h), set in Game::update.
 
+### Collider outlines are drawn over everything
+The green collider boxes (the selection's, or all with View > "Collider outlines") are lines drawn over the image,
+not traced: a box behind a wall still shows, and nothing marks which edges are hidden. They show while the game
+doesn't run (paused too), from the components' properties, not the game's bodies.
+- Where: Editor::drawColliderBoxes (source/editor/EditorGizmo.cpp), colliderBoxes (game/Colliders.h).
+
 ### The player is lifted onto a step in one step
 Stepping up a ledge (up to stepHeight) moves the body up at once; the camera is blended between the steps but still
 rises by the whole step within 1/60 s. Games often smooth the camera's height over a few frames.
@@ -823,9 +829,21 @@ in small scenes; Jungle Ruins runs well below 60 fps, where every frame has a st
 View > "Blend game steps" turns it off.
 
 ### A camera path ignores portals
-A camera path sets the camera's position from its points every step, so a portal the path crosses moves the camera
-for a frame and the next step puts it back. Paths are in world positions taken at Play (points moved while playing
-don't change the path).
+A camera path sets the camera's position from its points every step; while the game drives the camera the camera
+isn't taken through portals by the program (the player goes through on its own), so a path through an opening just
+passes the plane. Paths are in world positions taken at Play (points moved while playing don't change the path).
+
+### What portals carry, and what they don't
+While playing, an entity the game moved in a step whose origin's path went through an opening comes out of the
+other end (Game::carryThroughPortals): the topmost one that moved (what is under it comes along), never a portal
+end itself. It is tested at its origin only: a big object goes through all at once when its center does, and a
+model whose origin is outside the opening (a door hinge) never does. Something moving back and forth across an
+opening (a bob through a flat portal facing the same way at both ends) goes through each time it crosses.
+- Colliders don't know about openings: a wall with a portal in it must be built from boxes around the opening, or
+  it stops the player before it gets there; and the player's body (not its eyes) colliding with what is beside the
+  far end before it went through isn't checked.
+- Only in scenes with portals: each step then works out every entity's world position twice (a few microseconds per
+  hundred entities).
 
 ### F-keys reach the game along with the editor's
 While the game runs the editor's shortcuts are off, but F1, F5, F6, F11 and Esc still work, and the game sees them

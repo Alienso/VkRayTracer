@@ -6,6 +6,47 @@
 #include <cmath>
 #include <memory>
 #include "game/Behaviour.h"
+#include "game/Colliders.h"
+
+void colliderBox(const Scene& scene, EntityId entity, GameProperties& properties, glm::vec3& center,
+                 glm::vec3& halfSize) {
+    glm::vec3 size = properties.vec3("size", glm::vec3(0.0f));
+    glm::vec3 offset = properties.vec3("offset", glm::vec3(0.0f));
+    center = offset;
+    halfSize = glm::abs(size) * 0.5f;
+    if (size == glm::vec3(0.0f)) {
+        glm::vec3 min, max;
+        if (scene.modelBox(entity, min, max)) {
+            center = (min + max) * 0.5f;
+            halfSize = (max - min) * 0.5f;
+        } else {
+            center = glm::vec3(0.0f);
+            halfSize = glm::vec3(0.5f);
+        }
+    }
+}
+
+std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only) {
+    std::vector<WorldBox> boxes;
+    for (const Entity& entity : scene.entities()) {
+        const std::vector<GameComponent>* components = scene.game(entity.id);
+        if (components == nullptr || (only != 0 && entity.id != only) ||
+            (only == 0 && !scene.visibleInWorld(entity.id))) {
+            continue;
+        }
+        for (const GameComponent& component : *components) {
+            if (component.type == "collider") {
+                std::vector<std::string> ignored;  // (said at Play)
+                GameProperties properties(component.properties, "", ignored);
+                glm::vec3 center, halfSize;
+                colliderBox(scene, entity.id, properties, center, halfSize);
+                boxes.push_back({scene.worldTransform(entity.id), center - halfSize, center + halfSize});
+                break;  // (the same type twice: only the first is used)
+            }
+        }
+    }
+    return boxes;
+}
 
 namespace {
 
@@ -64,19 +105,8 @@ struct Collider {
     }
 
     static std::optional<Collider> read(const ReadContext& context, GameProperties& properties) {
-        glm::vec3 size = properties.vec3("size", glm::vec3(0.0f));
-        glm::vec3 offset = properties.vec3("offset", glm::vec3(0.0f));
-        Collider collider{context.entity.id, offset, glm::abs(size) * 0.5f};
-        if (size == glm::vec3(0.0f)) {
-            glm::vec3 min, max;
-            if (context.scene.modelBox(context.entity.id, min, max)) {
-                collider.center = (min + max) * 0.5f;
-                collider.halfSize = (max - min) * 0.5f;
-            } else {
-                collider.center = glm::vec3(0.0f);
-                collider.halfSize = glm::vec3(0.5f);
-            }
-        }
+        Collider collider{context.entity.id};
+        colliderBox(context.scene, context.entity.id, properties, collider.center, collider.halfSize);
         if (context.world.physics != nullptr) {
             collider.enabled = context.scene.visibleInWorld(context.entity.id);
             collider.place(context.scene, *context.world.physics);

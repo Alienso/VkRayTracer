@@ -48,6 +48,9 @@ void Editor::build() {
     if (!gameRunning()) {
         handleImageClicks();
     }
+    if (wantsColliderBoxes()) {
+        drawColliderBoxes();
+    }
     handleEditorKeys();
     // Keys that work wherever the mouse is (but not while typing into a field)
     if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F1, false)) {

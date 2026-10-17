@@ -139,11 +139,16 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   and falls under gravity). Without a player the camera flies (game-style) and stands in for the player.
 - Physics (`source/physics/`, its own library: only glm) sits behind an interface (`physics/PhysicsWorld.h`): our
   own SimplePhysics (turned boxes, a capsule character) now, collision with the models' own triangles or a library
-  later, without changing the game.
+  later, without changing the game. The selected entity's collider box is outlined in green over the image (View >
+  "Collider outlines": all of them), so a size can be checked by eye.
 - `scenes/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
   collect the coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera
   path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
-  the door, a moving lift. What it can't do yet: LIMITATIONS.md, "Game".
+  the door, a moving lift, and a portal pair that leads behind the wall. What it can't do yet: LIMITATIONS.md,
+  "Game".
+- **Portals while playing**: anything the game moves through a portal's opening (the player, a bobbing thing, a
+  spawned copy, with what is under it) comes out of the other end and carries on there; the player's view and
+  speed are turned with it.
 
 ## Requirements
 

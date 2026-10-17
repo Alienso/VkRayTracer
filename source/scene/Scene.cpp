@@ -744,12 +744,11 @@ static bool crossesOpening(const glm::mat4& end, const PortalComponent& portal, 
     return portal.shape == PortalShape::Ellipse ? glm::dot(p, p) <= 1.0f : std::max(std::abs(p.x), std::abs(p.y)) <= 1.0f;
 }
 
-void Scene::moveCameraThroughPortals(const glm::vec3& from) {
-    if (portalTable.empty() || from == sceneCamera.position) {
-        return;
-    }
-    std::vector<PlacedPair> pairs = placePairs(placeAll());
+template <typename Crossed>
+void Scene::crossPortals(const std::vector<PlacedPair>& pairs, const glm::vec3& from, const glm::vec3& to,
+                         Crossed&& crossed) const {
     glm::vec3 a = from;
+    glm::vec3 b = to;
     int cameOutOf = -1;  // the end it just came out of (2 * pair + end): the line starts on its plane
     // As many times as the shader lets a ray through by default ("Max portal crossings"): a step that long is rare
     for (int crossing = 0; crossing < 8; crossing++) {
@@ -758,8 +757,7 @@ void Scene::moveCameraThroughPortals(const glm::vec3& from) {
         for (size_t i = 0; i < pairs.size() * 2; i++) {
             float along;
             if (static_cast<int>(i) != cameOutOf &&
-                crossesOpening(pairs[i / 2].ends[i % 2], *pairs[i / 2].portal, a, sceneCamera.position, along) &&
-                along < nearestAlong) {
+                crossesOpening(pairs[i / 2].ends[i % 2], *pairs[i / 2].portal, a, b, along) && along < nearestAlong) {
                 nearest = static_cast<int>(i);
                 nearestAlong = along;
             }
@@ -769,15 +767,36 @@ void Scene::moveCameraThroughPortals(const glm::vec3& from) {
         }
         const PlacedPair& pair = pairs[nearest / 2];
         glm::mat4 toPartner = portalToPartner(pair.ends[nearest % 2], pair.ends[1 - nearest % 2]);
-        glm::vec3 crossedAt = a + (sceneCamera.position - a) * nearestAlong;
+        glm::vec3 crossedAt = a + (b - a) * nearestAlong;
         a = glm::vec3(toPartner * glm::vec4(crossedAt, 1.0f));
+        b = glm::vec3(toPartner * glm::vec4(b, 1.0f));
+        crossed(toPartner);
+        cameOutOf = nearest ^ 1;
+    }
+}
+
+void Scene::moveCameraThroughPortals(const glm::vec3& from) {
+    if (portalTable.empty() || from == sceneCamera.position) {
+        return;
+    }
+    crossPortals(placePairs(placeAll()), from, sceneCamera.position, [&](const glm::mat4& toPartner) {
         sceneCamera.position = glm::vec3(toPartner * glm::vec4(sceneCamera.position, 1.0f));
         glm::vec3 forward = glm::normalize(glm::mat3(toPartner) * sceneCamera.forward());
         sceneCamera.pitch = glm::clamp(glm::degrees(std::asin(glm::clamp(forward.y, -1.0f, 1.0f))), -89.0f, 89.0f);
         sceneCamera.yaw = glm::degrees(std::atan2(forward.x, -forward.z));
         cameraTeleport = toPartner * cameraTeleport;
-        cameOutOf = nearest ^ 1;
+    });
+}
+
+std::optional<glm::mat4> Scene::portalCrossing(const glm::vec3& from, const glm::vec3& to) const {
+    if (portalTable.empty() || from == to) {
+        return std::nullopt;
     }
+    std::optional<glm::mat4> total;
+    crossPortals(placePairs(placeAll()), from, to, [&](const glm::mat4& toPartner) {
+        total = toPartner * total.value_or(glm::mat4(1.0f));
+    });
+    return total;
 }
 
 void Scene::buildRenderList(RenderList& list) {

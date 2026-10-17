@@ -68,7 +68,7 @@ add_library(vulkanDemoPhysics STATIC
 # (and the physics)
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
-        source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h
+        source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h source/game/Colliders.h
         source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Door.cpp
         source/game/behaviours/Pickup.cpp source/game/behaviours/Trigger.cpp source/game/behaviours/Spawner.cpp
         source/game/behaviours/CameraPath.cpp source/game/behaviours/Collider.cpp source/game/behaviours/Player.cpp
@@ -126,7 +126,7 @@ add_executable(tests
         tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
         tests/GameInteractionTests.cpp tests/SelectionTests.cpp
         tests/EditHistoryTests.cpp tests/PhysicsTests.cpp tests/GamePauseTests.cpp
-        tests/GamePhysicsTests.cpp)
+        tests/GamePhysicsTests.cpp tests/GamePortalTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes

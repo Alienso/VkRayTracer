@@ -11,8 +11,9 @@
 //                                               nothing (warned about through the properties)
 //   void update(const GameStep&, GameWorld&)    each step
 // and optionally:
-//   void moved(const EntityMove&, GameWorld&)   something other than the game moved its entity (the editor while
-//                                               paused; later a portal): places kept from Play follow it
+//   void moved(const EntityMove&, GameWorld&)   something other than its behaviours moved its entity (the editor
+//                                               while paused, a portal it went through): places kept from Play
+//                                               follow it
 //   void removed(GameWorld&)                    it is dropped (its entity removed, or its components changed while
 //                                               paused): what it holds outside its list goes too
 // BehaviourList<T> keeps one type's behaviours in a list and does the rest (Stop, removed entities, counting); the
@@ -76,6 +77,7 @@ struct GameWorld {
     bool controlsCamera = false; // a camera path or the player drives the camera
     bool mouseLook = false;      // the player turns the view with the mouse (the program captures it)
     physics::PhysicsWorld* physics = nullptr;  // the colliders and the player's body (Game's)
+    EntityId playerEntity = 0;   // goes through portals on its own (its eyes, with the camera), not by Game's pass
     std::vector<EntityId> removals;
     std::vector<SpawnRequest> spawns;
 };

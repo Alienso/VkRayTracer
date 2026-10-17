@@ -3,6 +3,7 @@
 //
 
 #include <algorithm>
+#include <functional>
 #include <set>
 #include "game/Behaviours.h"
 #include "game/Game.h"
@@ -92,8 +93,18 @@ void Game::update(const GameStep& step) {
     }
     time = step.time;
     world.player = step.scene.camera().position;
+    std::unordered_map<EntityId, glm::vec3> before;  // (only in scenes with portals)
+    bool portals = step.scene.hasPortals();
+    if (portals) {
+        for (const Entity& entity : step.scene.entities()) {
+            before[entity.id] = worldPosition(step.scene, entity.id);
+        }
+    }
     for (const std::unique_ptr<BehaviourListBase>& list : lists) {
         list->update(step, world);
+    }
+    if (portals) {
+        carryThroughPortals(step, before);
     }
     applyQueue(step);
     if (snapCameraNext) {
@@ -101,6 +112,48 @@ void Game::update(const GameStep& step) {
             step.snapCamera();  // (not blended from where the editor's camera was)
         }
         snapCameraNext = false;
+    }
+}
+
+void Game::carryThroughPortals(const GameStep& step, const std::unordered_map<EntityId, glm::vec3>& before) {
+    Scene& scene = step.scene;
+    // Parents first: one carried through takes what is under it along; under one that moved, only that one is tested
+    std::function<void(EntityId, bool)> visit = [&](EntityId id, bool parentMoved) {
+        const Entity* entity = scene.find(id);
+        auto was = before.find(id);
+        if (entity == nullptr || was == before.end()) {
+            return;  // (made in this step: tested from the next)
+        }
+        glm::mat4 placed = scene.worldTransform(id);
+        glm::vec3 now(placed[3]);
+        bool moved = now != was->second;
+        if (moved && !parentMoved && id != world.playerEntity && scene.portal(id) == nullptr) {
+            if (std::optional<glm::mat4> crossing = scene.portalCrossing(was->second, now)) {
+                // Its world transform taken through: local = parent^-1 * crossing * parent * local (rigid)
+                Entity& carried = *scene.find(id);
+                glm::mat4 parent = carried.parent != 0 ? scene.worldTransform(carried.parent) : glm::mat4(1.0f);
+                glm::mat4 change = glm::inverse(parent) * *crossing * parent;
+                glm::mat3 turn(glm::normalize(glm::vec3(change[0])), glm::normalize(glm::vec3(change[1])),
+                               glm::normalize(glm::vec3(change[2])));
+                Transform oldLocal = carried.local;
+                carried.local.position = glm::vec3(change * glm::vec4(carried.local.position, 1.0f));
+                carried.local.rotation = glm::normalize(glm::quat_cast(turn) * carried.local.rotation);
+                EntityMove move{id, oldLocal, carried.local, *crossing};
+                for (const std::unique_ptr<BehaviourListBase>& list : lists) {
+                    list->moved(move, world);
+                }
+                step.snap(id);  // (a jump, not blended)
+                return;  // what is under it came along
+            }
+        }
+        std::vector<EntityId> children = entity->children;
+        for (EntityId child : children) {
+            visit(child, parentMoved || moved);
+        }
+    };
+    std::vector<EntityId> roots = scene.roots();
+    for (EntityId root : roots) {
+        visit(root, false);
     }
 }
 

@@ -66,6 +66,12 @@ public:
     [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
     // What the game says over the image while playing ("Pickups: 2 / 5"; "": nothing)
     void setGameStatus(const std::string& text) { gameStatus = text; }
+    // Collider outlines (the game's boxes, from the program: game/Colliders.h): drawn over the image while the game
+    // doesn't run, for the selected entity, or for all of them (View > "Collider outlines"). colliderBoxesFor:
+    // whose the program should hand over (0: all), when wantsColliderBoxes.
+    [[nodiscard]] bool wantsColliderBoxes() const { return !gameRunning() && !uiHidden && (showColliders || selected != 0); }
+    [[nodiscard]] EntityId colliderBoxesFor() const { return showColliders ? 0 : selected; }
+    void setColliderBoxes(std::vector<WorldBox> boxes) { colliderBoxes = std::move(boxes); }
     // The game's behaviour types (Game::types), for the game components' Type menu
     void setGameTypes(std::vector<GameComponentType> types) { gameTypes = std::move(types); }
     // A warning for the Log panel (from outside the editor: reading the user settings)
@@ -92,6 +98,9 @@ private:
     };
     std::array<Panel, 8> panels;
     bool showOverlay = true;  // FPS and GPU times over the image
+    bool showColliders = false;  // all collider outlines, not only the selection's
+    std::vector<WorldBox> colliderBoxes;
+    void drawColliderBoxes();
     bool uiHidden = false;    // F1: only the image
     bool resetLayout = false;  // put the panels back where they start (also the first run, without imgui.ini)
     // Log panel: what loading, saving and capturing said

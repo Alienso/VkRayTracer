@@ -123,6 +123,49 @@ void Editor::frameSelection() {
     camera.position = center - camera.forward() * distance;
 }
 
+// The boxes' edges as lines over the image (under the panels and the handles), cut where they pass behind the camera
+void Editor::drawColliderBoxes() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) {
+        return;
+    }
+    const Camera& camera = scene.camera();
+    glm::mat4 viewProjection = glm::perspective(glm::radians(camera.fov), io.DisplaySize.x / io.DisplaySize.y, 0.05f,
+                                                10000.0f) * camera.viewMatrix();  // (as the handles': OpenGL's clip space)
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    ImU32 color = IM_COL32(80, 255, 120, 220);
+    const float nearW = 0.05f;
+    auto line = [&](glm::vec4 a, glm::vec4 b) {
+        if (a.w < nearW && b.w < nearW) {
+            return;
+        }
+        if (a.w < nearW) {
+            a = glm::mix(a, b, (nearW - a.w) / (b.w - a.w));
+        } else if (b.w < nearW) {
+            b = glm::mix(b, a, (nearW - b.w) / (a.w - b.w));
+        }
+        auto screen = [&](const glm::vec4& c) {
+            return ImVec2((c.x / c.w * 0.5f + 0.5f) * io.DisplaySize.x, (0.5f - c.y / c.w * 0.5f) * io.DisplaySize.y);
+        };
+        drawList->AddLine(screen(a), screen(b), color, 1.5f);
+    };
+    for (const WorldBox& box : colliderBoxes) {
+        glm::vec4 corners[8];
+        for (int corner = 0; corner < 8; corner++) {
+            glm::vec3 p((corner & 1) ? box.max.x : box.min.x, (corner & 2) ? box.max.y : box.min.y,
+                        (corner & 4) ? box.max.z : box.min.z);
+            corners[corner] = viewProjection * box.transform * glm::vec4(p, 1.0f);
+        }
+        for (int corner = 0; corner < 8; corner++) {
+            for (int axis = 1; axis < 8; axis <<= 1) {
+                if ((corner & axis) == 0) {
+                    line(corners[corner], corners[corner | axis]);  // the edge along that axis
+                }
+            }
+        }
+    }
+}
+
 void Editor::handleEditorKeys() {
     ImGuiIO& io = ImGui::GetIO();
     deleteKeyUsed = false;

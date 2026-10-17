@@ -36,6 +36,9 @@ void Editor::initUi() {
         if (std::strcmp(name, "Overlay") == 0) {
             editor.showOverlay = open != 0;
         }
+        if (std::strcmp(name, "Colliders") == 0) {
+            editor.showColliders = open != 0;
+        }
         for (Panel& panel : editor.panels) {
             if (std::strcmp(panel.name, name) == 0) {
                 panel.open = open != 0;
@@ -48,7 +51,8 @@ void Editor::initUi() {
         for (const Panel& panel : editor.panels) {
             buffer->appendf("%s=%d\n", panel.name, panel.open ? 1 : 0);
         }
-        buffer->appendf("Overlay=%d\n\n", editor.showOverlay ? 1 : 0);
+        buffer->appendf("Overlay=%d\n", editor.showOverlay ? 1 : 0);
+        buffer->appendf("Colliders=%d\n\n", editor.showColliders ? 1 : 0);
     };
     ImGui::AddSettingsHandler(&handler);
 }
@@ -121,6 +125,13 @@ void Editor::buildMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem("Numbers over the image", nullptr, &showOverlay)) {
             ImGui::MarkIniSettingsDirty();
+        }
+        if (ImGui::MenuItem("Collider outlines", nullptr, &showColliders)) {
+            ImGui::MarkIniSettingsDirty();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("The solid boxes of all collider components (green), drawn over the image while the\n"
+                              "game doesn't run. Off: only the selected entity's.");
         }
         ImGui::MenuItem("Hide the UI", "F1", &uiHidden);
         ImGui::MenuItem("Blend game steps", nullptr, &blendSteps);

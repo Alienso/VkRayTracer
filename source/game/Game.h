@@ -13,6 +13,10 @@
 // one in the update order (game/Behaviours.cpp) wins. The same type twice on one entity is a warning (only the first
 // is used). Entities added or removed while playing are applied after the step (the queue).
 //
+// Portals: any entity the step moved whose origin went through a portal's opening comes out of the other end (the
+// topmost one that moved: what is under it comes along), its behaviours told (the moved hook), shown there at once.
+// The player goes through on its own (its eyes, with the camera).
+//
 // Pause (the editor's F6): no steps; the editor may change the scene meanwhile. Resume compares the scene with how it
 // was at the pause: behaviours of removed entities go, new entities' components and changed components are read
 // (starting then), and entities moved by hand tell their behaviours (the moved hook), so they go on from there.
@@ -24,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "game/Behaviour.h"
 #include "scene/Scene.h"
@@ -78,6 +83,9 @@ private:
     void addEntity(const Scene& scene, const Entity& entity, std::vector<std::string>& warnings, bool spawned,
                    double time);
     void applyQueue(const GameStep& step);
+    // The entities that went through a portal in this step (before: their world origins at its start) carried
+    // through
+    void carryThroughPortals(const GameStep& step, const std::unordered_map<EntityId, glm::vec3>& before);
 };
 
 #endif //VULKANDEMO_GAME_H

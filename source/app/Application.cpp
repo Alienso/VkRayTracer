@@ -10,6 +10,7 @@
 #include <imgui/backends/imgui_impl_glfw.h>
 #include "app/Application.h"
 #include "core/Configuration.h"
+#include "game/Colliders.h"
 
 static const char* defaultModel = "DamagedHelmet.glb";
 
@@ -276,6 +277,9 @@ void Application::mainLoop() {
         assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
         assets.update();  // a model or map loaded in the background arrives
         scene.update();   // and shows up
+        if (editor.wantsColliderBoxes()) {
+            editor.setColliderBoxes(colliderBoxes(scene, editor.colliderBoxesFor()));
+        }
         Clock::time_point uiStart = Clock::now();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -296,7 +300,9 @@ void Application::mainLoop() {
             cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard,
                                     !io.WantCaptureMouse, window.isCursorCaptured());
         }
-        scene.moveCameraThroughPortals(cameraFrom);
+        if (!(editor.gameRunning() && game.running() && game.controlsCamera())) {
+            scene.moveCameraThroughPortals(cameraFrom);  // (the game takes its camera through itself: the player)
+        }
         scene.buildRenderList(renderList);
         updateSelection();
         if (window.takeResized()) {  // dragged, maximized, fullscreen (F11 or the editor)
