@@ -221,6 +221,8 @@ public:
     // carries entities through with it.
     [[nodiscard]] std::optional<glm::mat4> portalCrossing(const glm::vec3& from, const glm::vec3& to) const;
     [[nodiscard]] bool hasPortals() const { return !portalTable.empty(); }
+    // The enabled pairs' openings, as the portals library and the physics take them (2k, 2k + 1: pair k's ends)
+    [[nodiscard]] std::vector<portals::PortalOpening> portalOpenings() const;
     // The camera was moved through a portal by someone else (the game's player): the renderer's history follows it
     // (RenderList::cameraTeleport), as for moveCameraThroughPortals
     void teleportCamera(const glm::mat4& crossing) { cameraTeleport = crossing * cameraTeleport; }
@@ -299,6 +301,8 @@ private:
     };
     // The enabled pairs (both ends visible), in the order of their A ends
     [[nodiscard]] std::vector<PlacedPair> placePairs(const std::vector<Placed>& placed) const;
+    // Their openings (portalOpenings)
+    static std::vector<portals::PortalOpening> openingsOf(const std::vector<PlacedPair>& pairs);
     // The line from `from` to `to` through the pairs' openings: crossed(toPartner) for each opening it goes through,
     // in order (at most 8, as the shader's default "Max portal crossings"); the rest of the line continues from the
     // partner end

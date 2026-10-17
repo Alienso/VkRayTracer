@@ -51,8 +51,8 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
 - The camera can fly through: it comes out of the other end, seeing what it saw through the opening, with no seam
   (also in the DLSS modes: the motion vectors follow it through).
 - Objects part way through are in both places: the part that went in shows at the other end (a ghost of the model,
-  cut to that side), the rest stays, cut at the opening (`source/portals/PortalPieces.h`, shared with collision
-  later). Through several pairs, or between ends facing each other, an object shows once per crossing, up to "Max
+  cut to that side), the rest stays, cut at the opening (`source/portals/PortalPieces.h`, shared with the
+  physics). Through several pairs, or between ends facing each other, an object shows once per crossing, up to "Max
   portal crossings". Clicking either part selects the object; both are outlined.
 - Optional rims.
 
@@ -142,19 +142,25 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   pushing the player but not squeezing it) and `player` (the camera as a body: W/A/S/D walk, Shift runs, Space jumps,
   the mouse turns the view; it is stopped by colliders, slides along walls, walks up low steps and gentle slopes,
   and falls under gravity). Without a player the camera flies (game-style) and stands in for the player.
-- Physics (`source/physics/`, its own library: only glm) sits behind an interface (`physics/PhysicsWorld.h`): our
-  own SimplePhysics (turned boxes, a capsule character) now, collision with the models' own triangles or a library
-  later, without changing the game. The selected entity's collider box is outlined in green over the image (View >
-  "Collider outlines": all of them), so a size can be checked by eye.
+- Physics (`source/physics/`, its own library: only glm and the portal pieces) sits behind an interface
+  (`physics/PhysicsWorld.h`): our own SimplePhysics (turned boxes, a capsule character) now, collision with the
+  models' own triangles or a library later, without changing the game. The selected entity's collider box is
+  outlined in green over the image (View > "Collider outlines": all of them), so a size can be checked by eye; one
+  part way through a portal is outlined as the physics has it: cut at the opening, its part out of the other end in
+  orange.
 - `scenes/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
   collect the coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera
   path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
   the door, a moving lift, a solid box that slides into the wall (and pushes you), and a portal pair that leads
-  behind the wall. What it can't do yet: LIMITATIONS.md,
-  "Game".
+  behind the wall; `scenes/game_portals.json` has portals: one set in a wall (walk in), a solid box sliding through
+  one in a wall and back, a stick between two ends facing each other, and a stick through a chain of two pairs.
+  What it can't do yet: LIMITATIONS.md, "Game".
 - **Portals while playing**: anything the game moves through a portal's opening (the player, a bobbing thing, a
   spawned copy, with what is under it) comes out of the other end and carries on there; the player's view and
-  speed are turned with it.
+  speed are turned with it. The player collides through portals: a wall with a portal in it has a hole there by
+  itself (no colliders built around the opening), and half through, the player bumps into what is beyond the
+  other end (or a collider half through it). Solid colliders too: one sliding into a portal in a wall goes in and
+  comes out of the other end, stopped by what is there; a solid thing coming out into its own way stops.
 
 ## Requirements
 

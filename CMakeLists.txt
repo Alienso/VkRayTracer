@@ -65,10 +65,11 @@ add_library(vulkanDemoPortals STATIC
         source/portals/PortalPieces.cpp source/portals/PortalPieces.h source/portals/PortalTransform.h)
 
 # Physics (PHYSICS_PLAN.md): colliders and the player's capsule behind an interface (physics/PhysicsWorld.h). Knows
-# nothing of the scene, the assets or the game: only glm
+# nothing of the scene, the assets or the game: only glm and the portal pieces
 add_library(vulkanDemoPhysics STATIC
         source/physics/PhysicsTypes.h source/physics/PhysicsWorld.h source/physics/Collision.cpp
         source/physics/Collision.h source/physics/SimplePhysics.cpp source/physics/SimplePhysics.h)
+target_link_libraries(vulkanDemoPhysics vulkanDemoPortals)
 
 # The game (README: Game logic): uses the scene, never the renderer, the editor or the window; it links only the core
 # (and the physics)

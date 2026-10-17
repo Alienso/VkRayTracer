@@ -285,7 +285,7 @@ void Application::mainLoop() {
         assets.update();  // a model or map loaded in the background arrives
         scene.update();   // and shows up
         if (editor.wantsColliderBoxes()) {
-            editor.setColliderBoxes(colliderBoxes(scene, editor.colliderBoxesFor()));
+            editor.setColliderBoxes(colliderBoxes(scene, editor.colliderBoxesFor(), renderSettings.maxPortalCrossings));
         }
         Clock::time_point uiStart = Clock::now();
         ImGui_ImplGlfw_NewFrame();

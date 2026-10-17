@@ -359,4 +359,42 @@ bool pieceKeeps(const PortalPiece& piece, const glm::vec3& worldPoint) {
     return true;
 }
 
+int crossOpenings(const std::vector<PortalOpening>& openings, const glm::vec3& from, const glm::vec3& to,
+                  int maxCrossings, glm::mat4& total) {
+    total = glm::mat4(1.0f);
+    glm::vec3 a = from;
+    glm::vec3 b = to;
+    int cameOutOf = -1;  // (the line starts on its plane)
+    for (int crossing = 0; crossing < maxCrossings; crossing++) {
+        int nearest = -1;
+        float nearestAlong = 2.0f;
+        for (size_t i = 0; i < openings.size(); i++) {
+            const PortalOpening& opening = openings[i];
+            glm::vec3 center(opening.end[3]);
+            glm::vec3 normal(opening.end[2]);
+            float da = glm::dot(a - center, normal);
+            float db = glm::dot(b - center, normal);
+            if (static_cast<int>(i) == cameOutOf || (da >= 0.0f) == (db >= 0.0f)) {
+                continue;
+            }
+            float along = da / (da - db);
+            glm::vec3 offset = a + (b - a) * along - center;
+            glm::vec2 p(glm::dot(offset, glm::vec3(opening.end[0])), glm::dot(offset, glm::vec3(opening.end[1])));
+            if (insideOutline(p, opening.halfSize, opening.ellipse, 0.0f) && along < nearestAlong) {
+                nearest = static_cast<int>(i);
+                nearestAlong = along;
+            }
+        }
+        if (nearest < 0) {
+            return crossing;
+        }
+        glm::mat4 toPartner = portalToPartner(openings[nearest].end, openings[nearest ^ 1].end);
+        a = apply(toPartner, a + (b - a) * nearestAlong);
+        b = apply(toPartner, b);
+        total = toPartner * total;
+        cameOutOf = nearest ^ 1;
+    }
+    return maxCrossings;
+}
+
 }  // namespace portals

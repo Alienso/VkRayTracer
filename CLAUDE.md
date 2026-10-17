@@ -18,8 +18,8 @@ fix one.
 - `source/game`: `vulkanDemoGame` (Game, GameLoop, StepInterpolation). Links only vulkanDemoCore and runs at a
   fixed 60 Hz step. New behaviours: one file in `source/game/behaviours/` (see Behaviour.h), listed in
   Behaviours.cpp.
-- `source/physics` (`vulkanDemoPhysics`), `source/portals` (`vulkanDemoPortals`: portal pieces, portalToPartner): glm
-  only, no scene.
+- `source/physics` (`vulkanDemoPhysics`, links the portals), `source/portals` (`vulkanDemoPortals`: portal pieces,
+  portalToPartner, crossOpenings): glm only, no scene.
 - `source/renderer`: Renderer, Frame, passes (Display, Selection, ...). `shaders/raytrace/*.glsl` are included
   by `raytrace.comp`.
 - `source/editor`: ImGui editor, ImGuizmo gizmo, EditHistory (undo as whole-scene text snapshots).

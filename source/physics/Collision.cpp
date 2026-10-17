@@ -140,7 +140,8 @@ std::optional<Contact> capsuleBoxContact(const glm::vec3& a, const glm::vec3& b,
 }
 
 std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA, const Transform& b,
-                                     const glm::vec3& halfB, std::vector<glm::vec3>* points) {
+                                     const glm::vec3& halfB, std::vector<glm::vec3>* points,
+                                     std::vector<float>* depths) {
     Box boxA = boxOf(a, halfA);
     Box boxB = boxOf(b, halfB);
     glm::vec3 apart = boxA.center - boxB.center;
@@ -194,11 +195,11 @@ std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA,
 
     // The contact's points, on B's surface
     std::vector<glm::vec3> found;
-    std::vector<float> depths;
+    std::vector<float> deep;
     if (kind < 3) {
-        clipFaces(boxA, kind, -normal, boxB, false, found, depths);  // A's face against B: B's corners in it
+        clipFaces(boxA, kind, -normal, boxB, false, found, deep);  // A's face against B: B's corners in it
     } else if (kind < 6) {
-        clipFaces(boxB, kind - 3, normal, boxA, true, found, depths);  // B's face against A: A's corners in it
+        clipFaces(boxB, kind - 3, normal, boxA, true, found, deep);  // B's face against A: A's corners in it
     } else {
         // A's edge along axis i nearest B, B's edge along axis j nearest A: the nearest point of B's to A's
         int i = (kind - 6) / 3;
@@ -223,7 +224,7 @@ std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA,
         float s = denominator > 1e-8f ? glm::clamp((c * f - e) / denominator, -boxA.half[i], boxA.half[i]) : 0.0f;
         float t = glm::clamp(f + s * c, -boxB.half[j], boxB.half[j]);
         found.push_back(pb + ub * t);
-        depths.push_back(best);
+        deep.push_back(best);
     }
     if (found.empty()) {
         // (Clipping missed it numerically) B's surface nearest A's center
@@ -232,12 +233,15 @@ std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA,
             q += boxB.axis[k] * glm::clamp(glm::dot(apart, boxB.axis[k]), -boxB.half[k], boxB.half[k]);
         }
         found.push_back(q);
-        depths.push_back(best);
+        deep.push_back(best);
     }
-    size_t deepest = std::max_element(depths.begin(), depths.end()) - depths.begin();
+    size_t deepest = std::max_element(deep.begin(), deep.end()) - deep.begin();
     Contact contact{normal, best, found[deepest]};
     if (points != nullptr) {
         *points = std::move(found);
+    }
+    if (depths != nullptr) {
+        *depths = std::move(deep);
     }
     return contact;
 }

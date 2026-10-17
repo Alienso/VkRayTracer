@@ -6,10 +6,12 @@
 #include <catch_amalgamated.hpp>
 #include <cmath>
 #include <memory>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include "physics/Collision.h"
 #include "physics/PhysicsWorld.h"
 #include "physics/SimplePhysics.h"
+#include "portals/PortalPieces.h"
 
 using namespace physics;
 
@@ -44,6 +46,22 @@ struct TestWorld {
         return state;
     }
 };
+
+// A pair of openings 1 wide and 2 high on the floor: A at z = -3 (in a wall's face, see walledPortal), B at x = 10,
+// z = 0; both facing +Z
+std::vector<portals::PortalOpening> doorPair() {
+    std::vector<portals::PortalOpening> openings;
+    portals::addPortalPair(openings, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, -3.0f)),
+                           glm::translate(glm::mat4(1.0f), glm::vec3(10.0f, 1.0f, 0.0f)), glm::vec2(0.5f, 1.0f),
+                           false);
+    return openings;
+}
+
+// The world with a wall whose face is at z = -3 (no gap in it) and doorPair's A in it
+void walledPortal(TestWorld& t) {
+    t.world->addBox({glm::vec3(6.0f, 2.0f, 0.5f)}, at({0.0f, 2.0f, -3.5f}));
+    t.world->setPortals(doorPair(), 8);
+}
 
 }  // namespace
 
@@ -421,4 +439,180 @@ TEST_CASE("Physics: bodies and characters come and go; ids are used again", "[Ph
     CHECK(world->bodyCount() == 0);
     CHECK(world->character(player).feet == glm::vec3(0.0f));  // gone: the default state
     (void)b;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Through portals
+
+TEST_CASE("Physics: the character walks into a portal set in a wall and comes out of the other end, on the ground "
+          "all the way", "[Physics][Portals]") {
+    TestWorld t;
+    walledPortal(t);
+    glm::vec3 wanted(0.0f, 0.0f, -4.0f);
+    int crossed = 0;
+    bool grounded = true;
+    float lowest = 0.0f;
+    float highest = 0.0f;
+    for (int i = 0; i < 60; i++) {
+        CharacterState state = t.run(1, wanted);
+        if (state.crossedPortal) {
+            crossed++;
+            wanted = glm::mat3(state.portalCrossing) * wanted;  // (as the player's view turns)
+        }
+        grounded = grounded && state.onGround;
+        lowest = std::min(lowest, state.feet.y);
+        highest = std::max(highest, state.feet.y);
+    }
+    CharacterState state = t.world->character(t.player);
+    CHECK(crossed == 1);
+    CHECK(grounded);
+    CHECK(lowest > -1e-3f);
+    CHECK(highest < 1e-3f);
+    CHECK(state.feet.x == Catch::Approx(10.0f).margin(1e-3));
+    CHECK(state.feet.z > 0.8f);  // walking on, out of B's front
+}
+
+TEST_CASE("Physics: the wall beside a portal still blocks", "[Physics][Portals]") {
+    TestWorld t({2.0f, 0.0f, 0.0f});
+    walledPortal(t);
+    CharacterState state = t.run(60, {0.0f, 0.0f, -4.0f});
+    CHECK(state.feet.z == Catch::Approx(-2.7f).margin(1e-3));
+    CHECK(state.feet.x == Catch::Approx(2.0f).margin(1e-3));
+    // Half beside the opening (more of it than fits): blocked too
+    t.world->teleport(t.player, {0.4f, 0.0f, 0.0f}, glm::vec3(0.0f));
+    state = t.run(60, {0.0f, 0.0f, -4.0f});
+    CHECK(state.feet.z == Catch::Approx(-2.7f).margin(1e-3));
+}
+
+TEST_CASE("Physics: half through a portal, what is beyond the exit stops the character", "[Physics][Portals]") {
+    TestWorld t;
+    walledPortal(t);
+    t.world->addBox({glm::vec3(1.0f, 1.0f, 0.25f)}, at({10.0f, 1.0f, 0.4f}));  // its face 0.15 in front of B
+    bool crossed = false;
+    CharacterState state;
+    for (int i = 0; i < 60; i++) {
+        state = t.run(1, {0.0f, 0.0f, -4.0f});
+        crossed = crossed || state.crossedPortal;
+    }
+    CHECK_FALSE(crossed);
+    CHECK(state.feet.z == Catch::Approx(-3.0f + 0.3f - 0.15f).margin(2e-3));  // its front 0.15 into A
+    CHECK(state.feet.x == Catch::Approx(0.0f).margin(1e-3));
+}
+
+TEST_CASE("Physics: a box half through a portal stops the character at the other end too", "[Physics][Portals]") {
+    TestWorld t({10.0f, 0.0f, 3.0f});
+    t.world->setPortals(doorPair(), 8);
+    t.world->addBox({glm::vec3(0.25f)}, at({0.0f, 1.0f, -2.9f}));  // 0.15 of it beyond A: out of B's front
+    CharacterState state = t.run(90, {0.0f, 0.0f, -4.0f});
+    CHECK(state.feet.z == Catch::Approx(0.15f + 0.3f).margin(2e-3));
+    CHECK_FALSE(state.crossedPortal);
+}
+
+TEST_CASE("Physics: portals far away change nothing", "[Physics][Portals]") {
+    TestWorld plain;
+    TestWorld far;
+    std::vector<portals::PortalOpening> openings;
+    portals::addPortalPair(openings, glm::translate(glm::mat4(1.0f), glm::vec3(100.0f, 1.0f, 0.0f)),
+                           glm::translate(glm::mat4(1.0f), glm::vec3(-100.0f, 1.0f, 0.0f)), glm::vec2(0.5f, 1.0f),
+                           false);
+    far.world->setPortals(openings, 8);
+    for (TestWorld* t : {&plain, &far}) {
+        t->world->addBox({glm::vec3(1.0f, 0.15f, 1.0f)}, at({0.0f, 0.15f, -2.0f}));  // a step
+        t->world->addBox({glm::vec3(3.0f, 2.0f, 0.2f)}, at({0.0f, 2.0f, -5.0f}));   // a wall
+    }
+    for (int i = 0; i < 120; i++) {
+        glm::vec3 wanted(std::sin(0.1f * static_cast<float>(i)), 0.0f, -4.0f);
+        float jump = i % 40 == 0 ? 5.0f : 0.0f;
+        CharacterState a = plain.world->moveCharacter(plain.player, wanted, jump, gravity, stepSeconds);
+        CharacterState b = far.world->moveCharacter(far.player, wanted, jump, gravity, stepSeconds);
+        REQUIRE(a.feet == b.feet);
+        REQUIRE(a.velocity == b.velocity);
+        REQUIRE(a.onGround == b.onGround);
+    }
+}
+
+TEST_CASE("Physics: a solid box moved into a portal set in a wall goes in; what is beyond the exit stops it",
+          "[Physics][Portals]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(6.0f, 2.0f, 0.5f)}, at({0.0f, 2.0f, -3.5f}));  // the wall, its face at z = -3
+    BodyId box = world->addBox({glm::vec3(0.25f)}, at({0.0f, 1.0f, -2.0f}));
+    GroupMove move = world->moveBodies({box}, at({0.0f, 1.0f, -2.0f}), at({0.0f, 1.0f, -3.2f}));
+    CHECK(move.blocked);  // no portal: the wall
+    CHECK(move.reached.position.z == Catch::Approx(-2.75f).margin(2e-3));
+
+    world->setPortals(doorPair(), 8);
+    world->setTransform(box, at({0.0f, 1.0f, -2.0f}));
+    move = world->moveBodies({box}, at({0.0f, 1.0f, -2.0f}), at({0.0f, 1.0f, -3.2f}));
+    CHECK_FALSE(move.blocked);  // into the opening (its center past the plane: the game carries it through next)
+
+    world->addBox({glm::vec3(1.0f, 1.0f, 0.25f)}, at({10.0f, 1.0f, 0.4f}));  // its face 0.15 in front of B
+    world->setTransform(box, at({0.0f, 1.0f, -2.0f}));
+    move = world->moveBodies({box}, at({0.0f, 1.0f, -2.0f}), at({0.0f, 1.0f, -3.2f}));
+    CHECK(move.blocked);
+    CHECK(move.reached.position.z == Catch::Approx(-3.0f + 0.25f - 0.15f).margin(2e-3));  // 0.15 of it out of B
+}
+
+TEST_CASE("Physics: a solid box half through a portal is blocked at both ends", "[Physics][Portals]") {
+    for (bool atExit : {false, true}) {
+        std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+        world->setPortals(doorPair(), 8);
+        BodyId box = world->addBox({glm::vec3(0.25f)}, at({0.0f, 1.0f, -2.9f}));  // 0.15 of it beyond A: at B
+        if (atExit) {
+            // A post in front of B where its part there goes when it moves +x (out of B it moves -x)
+            world->addBox({glm::vec3(0.1f, 1.0f, 0.25f)}, at({9.5f, 1.0f, 0.25f}));
+        } else {
+            world->addBox({glm::vec3(0.1f, 1.0f, 0.25f)}, at({0.5f, 1.0f, -2.75f}));
+        }
+        // (Within the opening all the way: past it, nothing of it is at B)
+        GroupMove move = world->moveBodies({box}, at({0.0f, 1.0f, -2.9f}), at({0.2f, 1.0f, -2.9f}));
+        CHECK(move.blocked);
+        CHECK(move.reached.position.x == Catch::Approx(0.15f).margin(2e-3));
+        CHECK(move.reached.position.z == Catch::Approx(-2.9f).margin(1e-4));  // (nothing to slide along)
+    }
+}
+
+TEST_CASE("Physics: a solid stick going into a portal is stopped by its own part coming out of the other end",
+          "[Physics][Portals]") {
+    // A at z = 0 facing +Z; B above the stick's way facing down: what goes into A comes down out of B onto the stick
+    std::vector<portals::PortalOpening> openings;
+    portals::addPortalPair(openings, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.0f, 0.0f)),
+                           glm::rotate(glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 1.6f, 1.0f)),
+                                       glm::radians(90.0f), glm::vec3(1.0f, 0.0f, 0.0f)),
+                           glm::vec2(0.5f, 1.0f), false);
+    for (bool portals : {false, true}) {
+        std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+        if (portals) {
+            world->setPortals(openings, 8);
+        }
+        BodyId stick = world->addBox({glm::vec3(0.1f, 0.1f, 1.0f)}, at({0.0f, 1.0f, 1.5f}));
+        GroupMove move = world->moveBodies({stick}, at({0.0f, 1.0f, 1.5f}), at({0.0f, 1.0f, 0.0f}));
+        if (portals) {
+            CHECK(move.blocked);  // 0.5 in: its part out of B reaches its top
+            CHECK(move.reached.position.z == Catch::Approx(0.5f).margin(5e-3));
+        } else {
+            CHECK_FALSE(move.blocked);
+        }
+    }
+}
+
+TEST_CASE("Physics: a solid move far from portals is the same as without them", "[Physics][Portals]") {
+    std::vector<portals::PortalOpening> far;
+    portals::addPortalPair(far, glm::translate(glm::mat4(1.0f), glm::vec3(100.0f, 1.0f, 0.0f)),
+                           glm::translate(glm::mat4(1.0f), glm::vec3(-100.0f, 1.0f, 0.0f)), glm::vec2(0.5f, 1.0f),
+                           false);
+    GroupMove moves[2];
+    for (int i = 0; i < 2; i++) {
+        std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+        if (i == 1) {
+            world->setPortals(far, 8);
+        }
+        world->addBox({glm::vec3(0.2f, 2.0f, 3.0f)}, at({2.0f, 1.0f, 0.0f}));
+        BodyId box = world->addBox({glm::vec3(0.5f)}, at({0.0f, 1.0f, 0.0f}, turned(20.0f, {0, 1, 0})));
+        moves[i] = world->moveBodies({box}, at({0.0f, 1.0f, 0.0f}, turned(20.0f, {0, 1, 0})),
+                                     at({3.0f, 1.0f, 1.0f}, turned(50.0f, {0, 1, 0})));
+    }
+    CHECK(moves[0].blocked);
+    CHECK(moves[0].blocked == moves[1].blocked);
+    CHECK(moves[0].reached.position == moves[1].reached.position);
+    CHECK(moves[0].reached.rotation == moves[1].reached.rotation);
 }

@@ -38,6 +38,29 @@ float angleBetween(const glm::quat& a, const glm::quat& b) {
     return 2.0f * std::acos(std::min(1.0f, std::abs(glm::dot(a, b))));
 }
 
+glm::vec3 apply(const glm::mat4& m, const glm::vec3& p) {
+    return glm::vec3(m * glm::vec4(p, 1.0f));
+}
+
+// A transform taken through a rigid portal transform
+Transform through(const glm::mat4& m, const Transform& t) {
+    return {apply(m, t.position), glm::normalize(glm::quat_cast(glm::mat3(m)) * t.rotation)};
+}
+
+bool sameOpenings(const std::vector<portals::PortalOpening>& a, const std::vector<portals::PortalOpening>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i].end != b[i].end || a[i].halfSize != b[i].halfSize || a[i].ellipse != b[i].ellipse) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const portals::PortalPiece wholePiece;  // where a shape with no pieces is: whole, where it is
+
 }  // namespace
 
 std::unique_ptr<PhysicsWorld> makeSimplePhysicsWorld() {
@@ -47,10 +70,126 @@ std::unique_ptr<PhysicsWorld> makeSimplePhysicsWorld() {
 // ---------------------------------------------------------------------------------------------
 // Bodies
 
-void SimplePhysicsWorld::place(Body& body, const Transform& transform) {
+void SimplePhysicsWorld::place(Body& body, const Transform& transform, const glm::vec3& anchor) const {
     body.transform = transform;
     body.solid = {transform.position + transform.rotation * body.offset, transform.rotation};
+    body.anchor = anchor;
     boxBounds(body.solid, body.halfExtents, body.min, body.max);
+    piecesOf({body.solid.position, glm::mat3_cast(body.solid.rotation), body.halfExtents}, anchor, body.pieces);
+}
+
+glm::vec3 SimplePhysicsWorld::anchorAfter(const glm::vec3& anchor, const glm::vec3& position) const {
+    glm::mat4 crossing;
+    return portals::crossOpenings(openings, anchor, position, 1, crossing) > 0 ? anchor : position;
+}
+
+void SimplePhysicsWorld::setPortals(const std::vector<portals::PortalOpening>& newOpenings, int maxDepth) {
+    maxDepth = std::max(maxDepth, 1);
+    if (sameOpenings(openings, newOpenings) && maxDepth == portalDepth) {
+        return;
+    }
+    openings = newOpenings;
+    portalDepth = maxDepth;
+    for (Body& body : bodies) {
+        if (body.alive) {
+            place(body, body.transform, body.anchor);
+        }
+    }
+}
+
+void SimplePhysicsWorld::piecesOf(const portals::OrientedBox& box, const glm::vec3& anchor,
+                                  std::vector<portals::PortalPiece>& pieces) const {
+    pieces.clear();
+    // (Only near an opening: within their bounding spheres)
+    bool near = false;
+    float reach = glm::length(box.half);
+    for (size_t i = 0; i < openings.size() && !near; i++) {
+        near = glm::distance(box.center, glm::vec3(openings[i].end[3])) <= reach + glm::length(openings[i].halfSize);
+    }
+    if (!near) {
+        return;
+    }
+    portals::portalPieces(box, anchor, openings, portalDepth, maxPieces, pieces);
+    if (pieces.size() == 1 && pieces[0].cutCount == 0) {
+        pieces.clear();
+    }
+}
+
+SimplePhysicsWorld::Capsule SimplePhysicsWorld::capsuleAt(const glm::vec3& a, const glm::vec3& b, float radius,
+                                                          const glm::vec3& anchor) const {
+    Capsule capsule{a, b, radius, glm::min(a, b) - glm::vec3(radius), glm::max(a, b) + glm::vec3(radius), {}};
+    if (!openings.empty()) {
+        glm::vec3 axis = b - a;
+        float length = glm::length(axis);
+        portals::OrientedBox box;
+        box.center = 0.5f * (a + b);
+        if (length > 1e-6f) {  // (its own axes: the segment along Y)
+            glm::vec3 y = axis / length;
+            glm::vec3 x = std::abs(y.x) < 0.9f ? glm::vec3(1.0f, 0.0f, 0.0f) : glm::vec3(0.0f, 0.0f, 1.0f);
+            glm::vec3 z = glm::normalize(glm::cross(x, y));
+            box.axes = glm::mat3(glm::cross(y, z), y, z);
+        }
+        box.half = glm::vec3(radius, 0.5f * length + radius, radius);
+        piecesOf(box, anchor, capsule.pieces);
+    }
+    return capsule;
+}
+
+SimplePhysicsWorld::Capsule SimplePhysicsWorld::characterAt(const CharacterSettings& settings,
+                                                            const glm::vec3& feet) const {
+    glm::vec3 a, b;
+    segment(settings, feet, a, b);
+    return capsuleAt(a, b, settings.shape.radius, feet + glm::vec3(0.0f, settings.anchorHeight, 0.0f));
+}
+
+std::optional<Contact> SimplePhysicsWorld::contact(const Capsule& capsule, const Body& body) const {
+    if (capsule.pieces.empty() && body.pieces.empty()) {
+        if (!boundsMeet(capsule.min, capsule.max, body.min, body.max)) {
+            return std::nullopt;
+        }
+        return capsuleBoxContact(capsule.a, capsule.b, capsule.radius, body.solid, body.halfExtents);
+    }
+    // Each piece of the capsule against each of the body's, where both are kept
+    std::optional<Contact> deepest;
+    size_t capsulePieces = std::max<size_t>(capsule.pieces.size(), 1);
+    size_t bodyPieces = std::max<size_t>(body.pieces.size(), 1);
+    for (size_t i = 0; i < capsulePieces; i++) {
+        const portals::PortalPiece& mine = capsule.pieces.empty() ? wholePiece : capsule.pieces[i];
+        glm::vec3 a = i == 0 ? capsule.a : apply(mine.transform, capsule.a);
+        glm::vec3 b = i == 0 ? capsule.b : apply(mine.transform, capsule.b);
+        glm::vec3 min = glm::min(a, b) - glm::vec3(capsule.radius);
+        glm::vec3 max = glm::max(a, b) + glm::vec3(capsule.radius);
+        for (size_t j = 0; j < bodyPieces; j++) {
+            const portals::PortalPiece& its = body.pieces.empty() ? wholePiece : body.pieces[j];
+            Transform solid = body.solid;
+            glm::vec3 boxMin = body.min;
+            glm::vec3 boxMax = body.max;
+            if (j > 0) {
+                solid = through(its.transform, body.solid);
+                boxBounds(solid, body.halfExtents, boxMin, boxMax);
+            }
+            if (!boundsMeet(min, max, boxMin, boxMax)) {
+                continue;
+            }
+            std::optional<Contact> found = capsuleBoxContact(a, b, capsule.radius, solid, body.halfExtents);
+            if (!found) {
+                continue;
+            }
+            glm::vec3 middle = found->point - found->normal * (0.5f * found->depth);
+            if (!portals::pieceKeeps(mine, middle) || !portals::pieceKeeps(its, middle)) {
+                continue;
+            }
+            if (i > 0) {  // back to where the capsule really is
+                glm::mat4 back = glm::inverse(mine.transform);
+                found->normal = glm::normalize(glm::mat3(back) * found->normal);
+                found->point = apply(back, found->point);
+            }
+            if (!deepest || found->depth > deepest->depth) {
+                deepest = found;
+            }
+        }
+    }
+    return deepest;
 }
 
 BodyId SimplePhysicsWorld::addBox(const BoxShape& shape, const Transform& transform) {
@@ -66,7 +205,7 @@ BodyId SimplePhysicsWorld::addBox(const BoxShape& shape, const Transform& transf
         }
     }
     body.alive = true;
-    place(body, transform);
+    place(body, transform, transform.position);
     uint32_t index;
     if (!freeBodies.empty()) {
         index = freeBodies.back();
@@ -89,7 +228,7 @@ SimplePhysicsWorld::Body* SimplePhysicsWorld::findBody(BodyId id) {
 
 void SimplePhysicsWorld::setTransform(BodyId id, const Transform& transform) {
     if (Body* body = findBody(id)) {
-        place(*body, transform);
+        place(*body, transform, anchorAfter(body->anchor, transform.position));
     }
 }
 
@@ -107,10 +246,103 @@ void SimplePhysicsWorld::remove(BodyId id) {
     }
 }
 
+std::optional<Contact> SimplePhysicsWorld::boxContact(const Body& a, const Body& b, bool own) const {
+    if (a.pieces.empty() && b.pieces.empty()) {
+        if (own || !boundsMeet(a.min, a.max, b.min, b.max)) {
+            return std::nullopt;
+        }
+        return boxBoxContact(a.solid, a.halfExtents, b.solid, b.halfExtents);
+    }
+    // Each piece of a against each of b's, judged at the contact's points: the deepest one both keep
+    std::optional<Contact> deepest;
+    size_t piecesA = std::max<size_t>(a.pieces.size(), 1);
+    size_t piecesB = std::max<size_t>(b.pieces.size(), 1);
+    std::vector<glm::vec3> points;
+    std::vector<float> depths;
+    for (size_t i = 0; i < piecesA; i++) {
+        const portals::PortalPiece& pieceA = a.pieces.empty() ? wholePiece : a.pieces[i];
+        Transform solidA = a.solid;
+        glm::vec3 minA = a.min;
+        glm::vec3 maxA = a.max;
+        if (i > 0) {
+            solidA = through(pieceA.transform, a.solid);
+            boxBounds(solidA, a.halfExtents, minA, maxA);
+        }
+        for (size_t j = 0; j < piecesB; j++) {
+            const portals::PortalPiece& pieceB = b.pieces.empty() ? wholePiece : b.pieces[j];
+            if (own && pieceA.transform == pieceB.transform) {
+                continue;  // (rigid together)
+            }
+            Transform solidB = b.solid;
+            glm::vec3 minB = b.min;
+            glm::vec3 maxB = b.max;
+            if (j > 0) {
+                solidB = through(pieceB.transform, b.solid);
+                boxBounds(solidB, b.halfExtents, minB, maxB);
+            }
+            if (!boundsMeet(minA, maxA, minB, maxB)) {
+                continue;
+            }
+            std::optional<Contact> found =
+                boxBoxContact(solidA, a.halfExtents, solidB, b.halfExtents, &points, &depths);
+            if (!found) {
+                continue;
+            }
+            if (pieceA.cutCount > 0 || pieceB.cutCount > 0) {
+                int kept = -1;
+                for (size_t k = 0; k < points.size(); k++) {
+                    glm::vec3 middle = points[k] - found->normal * (0.5f * depths[k]);
+                    if ((kept < 0 || depths[k] > depths[kept]) && portals::pieceKeeps(pieceA, middle) &&
+                        portals::pieceKeeps(pieceB, middle)) {
+                        kept = static_cast<int>(k);
+                    }
+                }
+                if (kept < 0) {
+                    continue;
+                }
+                found->point = points[kept];
+                found->depth = std::min(found->depth, depths[kept]);
+            }
+            if (i > 0) {  // back to where a really is
+                glm::mat4 back = glm::inverse(pieceA.transform);
+                found->normal = glm::normalize(glm::mat3(back) * found->normal);
+                found->point = apply(back, found->point);
+            }
+            if (!deepest || found->depth > deepest->depth) {
+                deepest = found;
+            }
+        }
+    }
+    return deepest;
+}
+
+std::optional<Contact> SimplePhysicsWorld::ownContact(const std::vector<Mover>& movers) const {
+    bool cut = false;
+    for (const Mover& mover : movers) {
+        cut = cut || !mover.body->pieces.empty();
+    }
+    if (!cut) {
+        return std::nullopt;  // (all whole: rigid together)
+    }
+    std::optional<Contact> deepest;
+    for (size_t m = 0; m < movers.size(); m++) {
+        for (size_t n = m; n < movers.size(); n++) {
+            if (!movers[m].body->enabled || !movers[n].body->enabled) {
+                continue;
+            }
+            std::optional<Contact> found = boxContact(*movers[m].body, *movers[n].body, true);
+            if (found && (!deepest || found->depth > deepest->depth)) {
+                deepest = found;
+            }
+        }
+    }
+    return deepest;
+}
+
 bool SimplePhysicsWorld::blockedAt(const std::vector<Mover>& movers, const Transform& pivot, const MoveSkips& skips,
                                    glm::vec3& normal) {
     for (const Mover& mover : movers) {
-        place(*mover.body, compose(pivot, mover.relative));
+        place(*mover.body, compose(pivot, mover.relative), mover.anchor);
     }
     float deepest = contactSkin;
     bool blocked = false;
@@ -120,21 +352,27 @@ bool SimplePhysicsWorld::blockedAt(const std::vector<Mover>& movers, const Trans
         }
         for (size_t i = 0; i < bodies.size(); i++) {
             const Body& other = bodies[i];
-            if (skips.bodies[i] || !other.alive || !other.enabled ||
-                !boundsMeet(mover.body->min, mover.body->max, other.min, other.max)) {
+            if (skips.bodies[i] || !other.alive || !other.enabled) {
                 continue;
             }
-            std::optional<Contact> contact =
-                boxBoxContact(mover.body->solid, mover.body->halfExtents, other.solid, other.halfExtents);
-            if (contact && contact->depth > deepest) {
-                deepest = contact->depth;
-                normal = contact->normal;
+            std::optional<Contact> touching = boxContact(*mover.body, other, false);
+            if (touching && touching->depth > deepest) {
+                deepest = touching->depth;
+                normal = touching->normal;
                 blocked = true;
             }
         }
     }
     if (blocked) {
         return true;
+    }
+    if (!skips.own) {
+        // Into its own other pieces (out of a portal into itself): it only stops
+        std::optional<Contact> own = ownContact(movers);
+        if (own && own->depth > contactSkin) {
+            normal = glm::vec3(0.0f);
+            return true;
+        }
     }
     for (size_t i = 0; i < characters.size(); i++) {
         if (characters[i].alive && !skips.characters[i] && squeezed(characters[i], movers)) {
@@ -194,8 +432,10 @@ GroupMove SimplePhysicsWorld::moveBodies(const std::vector<BodyId>& group, const
     for (BodyId id : group) {
         if (Body* body = findBody(id)) {
             skips.bodies[id.value - 1] = 1;
-            movers.push_back({body, {toGroup * (body->transform.position - from.position),
-                                     glm::normalize(toGroup * body->transform.rotation)}});
+            movers.push_back({body,
+                              {toGroup * (body->transform.position - from.position),
+                               glm::normalize(toGroup * body->transform.rotation)},
+                              body->anchor});
         }
     }
     if (movers.empty()) {
@@ -204,22 +444,25 @@ GroupMove SimplePhysicsWorld::moveBodies(const std::vector<BodyId>& group, const
 
     // What they are in already (as they are now) doesn't block them
     for (const Mover& mover : movers) {
+        place(*mover.body, mover.body->transform, mover.anchor);  // (their pieces from where they start)
+    }
+    for (const Mover& mover : movers) {
         if (!mover.body->enabled) {
             continue;
         }
         for (size_t i = 0; i < bodies.size(); i++) {
             const Body& other = bodies[i];
-            if (skips.bodies[i] || !other.alive || !other.enabled ||
-                !boundsMeet(mover.body->min, mover.body->max, other.min, other.max)) {
+            if (skips.bodies[i] || !other.alive || !other.enabled) {
                 continue;
             }
-            std::optional<Contact> contact =
-                boxBoxContact(mover.body->solid, mover.body->halfExtents, other.solid, other.halfExtents);
-            if (contact && contact->depth > contactSkin) {
+            std::optional<Contact> touching = boxContact(*mover.body, other, false);
+            if (touching && touching->depth > contactSkin) {
                 skips.bodies[i] = 1;
             }
         }
     }
+    std::optional<Contact> own = ownContact(movers);
+    skips.own = own && own->depth > contactSkin;
     for (size_t i = 0; i < characters.size(); i++) {
         if (characters[i].alive && squeezed(characters[i], movers)) {
             skips.characters[i] = 1;
@@ -256,7 +499,8 @@ GroupMove SimplePhysicsWorld::moveBodies(const std::vector<BodyId>& group, const
         result.reached = reached;
     }
     for (const Mover& mover : movers) {
-        place(*mover.body, compose(result.reached, mover.relative));
+        Transform placed = compose(result.reached, mover.relative);
+        place(*mover.body, placed, anchorAfter(mover.anchor, placed.position));
     }
     return result;
 }
@@ -308,29 +552,25 @@ void SimplePhysicsWorld::teleport(CharacterId id, const glm::vec3& feet, const g
 }
 
 void SimplePhysicsWorld::resolve(const CharacterSettings& settings, Moving& moving, int rounds) const {
-    float radius = settings.shape.radius;
     float minGroundY = std::cos(glm::radians(settings.maxSlopeDegrees)) - 1e-4f;
     for (int round = 0; round < rounds; round++) {
-        glm::vec3 a, b;
-        segment(settings, moving.feet, a, b);
-        glm::vec3 min = moving.feet - glm::vec3(radius, 0.0f, radius);
-        glm::vec3 max = moving.feet + glm::vec3(radius, 2.0f * (settings.shape.halfHeight + radius), radius);
+        Capsule capsule = characterAt(settings, moving.feet);
         Contact deepest;
         bool found = false;
         for (const Body& body : bodies) {
-            if (!body.alive || !body.enabled || glm::any(glm::lessThan(body.max, min)) ||
-                glm::any(glm::greaterThan(body.min, max))) {
+            if (!body.alive || !body.enabled) {
                 continue;
             }
-            std::optional<Contact> contact = capsuleBoxContact(a, b, radius, body.solid, body.halfExtents);
-            if (contact && (!found || contact->depth > deepest.depth)) {
-                deepest = *contact;
+            std::optional<Contact> touching = contact(capsule, body);
+            if (touching && (!found || touching->depth > deepest.depth)) {
+                deepest = *touching;
                 found = true;
             }
         }
         if (!found) {
             return;
         }
+        glm::vec3 pushedFrom = moving.feet;
         glm::vec3 n = deepest.normal;
         if (n.y >= minGroundY) {
             // Ground: straight up, so standing on a slope doesn't slide down it
@@ -338,6 +578,7 @@ void SimplePhysicsWorld::resolve(const CharacterSettings& settings, Moving& movi
             moving.ground = true;
             moving.groundNormal = n;
             moving.velocity.y = std::max(moving.velocity.y, 0.0f);
+            carry(settings, moving, pushedFrom);
             continue;
         }
         glm::vec3 flat = horizontal(n);
@@ -354,20 +595,35 @@ void SimplePhysicsWorld::resolve(const CharacterSettings& settings, Moving& movi
             moving.velocity -= into * n;
         }
         moving.wall = moving.wall || flatLength > 0.1f;
+        carry(settings, moving, pushedFrom);
     }
 }
 
+void SimplePhysicsWorld::carry(const CharacterSettings& settings, Moving& moving, const glm::vec3& from) const {
+    if (openings.empty()) {
+        return;
+    }
+    glm::vec3 up(0.0f, settings.anchorHeight, 0.0f);
+    glm::mat4 crossing;
+    if (portals::crossOpenings(openings, from + up, moving.feet + up, portalDepth, crossing) == 0) {
+        return;
+    }
+    // The anchor goes through; the capsule stays upright under it
+    moving.feet = apply(crossing, moving.feet + up) - up;
+    glm::mat3 turn(crossing);
+    moving.velocity = turn * moving.velocity;
+    moving.groundNormal = glm::normalize(turn * moving.groundNormal);
+    moving.crossings++;
+    moving.crossing = crossing * moving.crossing;
+}
+
 float SimplePhysicsWorld::deepestOverlap(const CharacterSettings& settings, const glm::vec3& feet) const {
-    float radius = settings.shape.radius;
-    glm::vec3 a, b;
-    segment(settings, feet, a, b);
-    glm::vec3 min = feet - glm::vec3(radius, 0.0f, radius);
-    glm::vec3 max = feet + glm::vec3(radius, 2.0f * (settings.shape.halfHeight + radius), radius);
+    Capsule capsule = characterAt(settings, feet);
     float deepest = 0.0f;
     for (const Body& body : bodies) {
-        if (body.alive && body.enabled && boundsMeet(body.min, body.max, min, max)) {
-            if (std::optional<Contact> contact = capsuleBoxContact(a, b, radius, body.solid, body.halfExtents)) {
-                deepest = std::max(deepest, contact->depth);
+        if (body.alive && body.enabled) {
+            if (std::optional<Contact> touching = contact(capsule, body)) {
+                deepest = std::max(deepest, touching->depth);
             }
         }
     }
@@ -376,14 +632,12 @@ float SimplePhysicsWorld::deepestOverlap(const CharacterSettings& settings, cons
 
 bool SimplePhysicsWorld::squeezed(const Character& character, const std::vector<Mover>& movers) const {
     const CharacterSettings& settings = character.settings;
-    glm::vec3 a, b;
-    segment(settings, character.state.feet, a, b);
+    Capsule capsule = characterAt(settings, character.state.feet);
     bool touches = false;
     for (const Mover& mover : movers) {
         if (mover.body->enabled) {
-            std::optional<Contact> contact =
-                capsuleBoxContact(a, b, settings.shape.radius, mover.body->solid, mover.body->halfExtents);
-            touches = touches || (contact && contact->depth > contactSkin);
+            std::optional<Contact> touching = contact(capsule, *mover.body);
+            touches = touches || (touching && touching->depth > contactSkin);
         }
     }
     if (!touches) {
@@ -398,10 +652,18 @@ SimplePhysicsWorld::Moving SimplePhysicsWorld::sweep(const CharacterSettings& se
                                                      const glm::vec3& delta) const {
     float maxStep = 0.5f * settings.shape.radius;
     int steps = std::max(1, static_cast<int>(std::ceil(glm::length(delta) / maxStep)));
+    glm::vec3 part = delta / static_cast<float>(steps);
     for (int i = 0; i < steps; i++) {
-        moving.feet += delta / static_cast<float>(steps);
+        glm::vec3 from = moving.feet;
+        int crossings = moving.crossings;
+        glm::mat4 crossed = moving.crossing;
+        moving.feet += part;
+        carry(settings, moving, from);
         moving.ground = false;  // (what the last substep touched)
         resolve(settings, moving);
+        if (moving.crossings != crossings) {
+            part = glm::mat3(moving.crossing * glm::inverse(crossed)) * part;  // (the rest goes on from there)
+        }
     }
     return moving;
 }
@@ -443,6 +705,8 @@ CharacterState SimplePhysicsWorld::moveCharacter(CharacterId id, const glm::vec3
     bool walking = start.onGround && !jumped && glm::length(partFlat) > 1e-6f;
     Moving moving{start.feet, velocity};
     for (int i = 0; i < steps; i++) {
+        int crossings = moving.crossings;
+        glm::mat4 crossed = moving.crossing;
         Moving plain = moving;
         plain.wall = false;
         plain = sweep(settings, plain, part);
@@ -457,7 +721,8 @@ CharacterState SimplePhysicsWorld::moveCharacter(CharacterId id, const glm::vec3
             Moving down = sweep(settings, across, glm::vec3(0.0f, -risen - std::max(-part.y, 0.0f), 0.0f));
             float stepped = glm::dot(horizontal(down.feet - moving.feet), direction);
             float blocked = glm::dot(horizontal(plain.feet - moving.feet), direction);
-            if (down.ground && down.feet.y > moving.feet.y + 1e-4f && stepped > blocked + 1e-5f) {
+            if (down.ground && down.feet.y > moving.feet.y + 1e-4f && stepped > blocked + 1e-5f &&
+                down.crossings == moving.crossings) {
                 Moving raised = moving;
                 raised.feet = glm::vec3(moving.feet.x + partFlat.x, down.feet.y, moving.feet.z + partFlat.z);
                 raised.velocity = glm::vec3(velocity.x, 0.0f, velocity.z);
@@ -469,17 +734,25 @@ CharacterState SimplePhysicsWorld::moveCharacter(CharacterId id, const glm::vec3
             }
         }
         moving = plain;
+        if (moving.crossings != crossings) {  // through a portal: the rest of the move goes on from the other end
+            glm::mat3 turn(moving.crossing * glm::inverse(crossed));
+            part = turn * part;
+            partFlat = horizontal(part);
+            velocity = turn * velocity;
+        }
     }
     // Walking down a slope or a low ledge: kept on the ground when it is within a step straight below (a probe that
     // slid off an edge sideways isn't kept: it falls instead)
     if (start.onGround && !jumped && !moving.ground) {
         Moving probe = sweep(settings, moving, glm::vec3(0.0f, -settings.stepHeight, 0.0f));
-        if (probe.ground && glm::length(horizontal(probe.feet - moving.feet)) < 1e-3f) {
+        if (probe.ground && probe.crossings == moving.crossings &&
+            glm::length(horizontal(probe.feet - moving.feet)) < 1e-3f) {
             moving = probe;
         }
     }
 
-    character->state = CharacterState{moving.feet, moving.velocity, moving.ground, moving.groundNormal};
+    character->state = CharacterState{moving.feet,         moving.velocity,      moving.ground,
+                                      moving.groundNormal, moving.crossings > 0, moving.crossing};
     return character->state;
 }
 
@@ -487,14 +760,9 @@ bool SimplePhysicsWorld::overlapsCapsule(const CapsuleShape& shape, const Transf
     glm::vec3 axis = transform.rotation * glm::vec3(0.0f, shape.halfHeight, 0.0f);
     glm::vec3 a = transform.position - axis;
     glm::vec3 b = transform.position + axis;
-    glm::vec3 min = glm::min(a, b) - glm::vec3(shape.radius);
-    glm::vec3 max = glm::max(a, b) + glm::vec3(shape.radius);
+    Capsule capsule = capsuleAt(a, b, shape.radius, transform.position);
     for (const Body& body : bodies) {
-        if (!body.alive || !body.enabled || glm::any(glm::lessThan(body.max, min)) ||
-            glm::any(glm::greaterThan(body.min, max))) {
-            continue;
-        }
-        if (capsuleBoxContact(a, b, shape.radius, body.solid, body.halfExtents)) {
+        if (body.alive && body.enabled && contact(capsule, body)) {
             return true;
         }
     }

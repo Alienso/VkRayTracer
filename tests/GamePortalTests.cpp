@@ -6,6 +6,7 @@
 
 #include <catch_amalgamated.hpp>
 #include "TestHelpers.h"
+#include "game/Colliders.h"
 #include "game/Game.h"
 #include "game/GameLoop.h"
 #include "game/StepInterpolation.h"
@@ -144,6 +145,53 @@ TEST_CASE("Portals: the player walking through comes out of the other end, its v
     CHECK(t.scene.camera().position.x == Catch::Approx(10.0f).margin(1e-3));
 }
 
+TEST_CASE("Portals: the player walks through a portal set in a wall collider (no gap in it); beside it, the wall stops "
+          "it", "[Game][Portals]") {
+    for (float x : {0.0f, 2.0f}) {
+        TestScene t;
+        t.entityWith("Floor", {{"collider", R"({"size": [60, 1, 60]})"}}, {0.0f, -0.5f, 0.0f});
+        t.entityWith("Wall", {{"collider", R"({"size": [12, 4, 1]})"}}, {0.0f, 2.0f, -3.5f});  // its face at z = -3
+        t.portalPair({0.0f, 1.0f, -3.0f}, none, {10.0f, 1.0f, 0.0f}, none);  // both facing +Z
+        t.entityWith("Player", {{"player", ""}}, {x, 0.0f, 0.0f});
+        t.scene.camera().yaw = 0.0f;  // looking along -z
+        t.scene.camera().pitch = 0.0f;
+        t.play();
+        InputState walk;
+        walk.down[Key::W] = true;
+        t.run(60, walk);
+        if (x == 0.0f) {
+            CHECK(t.scene.camera().position.x == Catch::Approx(10.0f).margin(1e-3));
+            CHECK(t.scene.camera().position.z > 0.5f);  // out of B's front, walking on
+        } else {
+            CHECK(t.scene.camera().position.z == Catch::Approx(-2.7f).margin(1e-3));
+            CHECK(t.scene.camera().position.x == Catch::Approx(2.0f).margin(1e-3));
+        }
+    }
+}
+
+TEST_CASE("Portals: a solid collider slides into a portal set in a wall collider and out of the other end; something "
+          "there stops it half through", "[Game][Portals]") {
+    for (bool blocker : {false, true}) {
+        TestScene t;
+        t.portalPair({0.0f, 1.0f, -5.0f}, none, {10.0f, 1.0f, 0.0f}, none);  // both facing +Z
+        t.entityWith("Wall", {{"collider", R"({"size": [12, 4, 1]})"}}, {0.0f, 2.0f, -5.5f});  // its face at z = -5
+        if (blocker) {
+            t.entityWith("Blocker", {{"collider", R"({"size": [2, 2, 0.5]})"}}, {10.0f, 1.0f, 0.4f});  // 0.15 out
+        }
+        EntityId box = t.entityWith("Box", {{"collider", R"({"size": [0.4, 0.4, 0.4], "solid": true})"},
+                                            {"slide", R"({"axis": [0, 0, -1], "distance": 4, "period": 8})"}},
+                                    {0.0f, 1.0f, -3.0f});
+        t.play();
+        t.run(150);  // at A (z = -5) after 2 s
+        if (blocker) {
+            CHECK(t.world(box).z == Catch::Approx(-5.0f + 0.2f - 0.15f).margin(3e-3));  // held, 0.15 of it out of B
+        } else {
+            CHECK(t.world(box).x == Catch::Approx(10.0f).margin(1e-3));
+            CHECK(t.world(box).z > 0.0f);
+        }
+    }
+}
+
 TEST_CASE("Portals: a solid collider carried through isn't stopped by what is between the two ends", "[Game][Portals]") {
     TestScene t;
     t.portalPair({0.0f, 1.0f, -5.0f}, none, {10.0f, 1.0f, 0.0f}, none);  // both facing +Z
@@ -155,4 +203,18 @@ TEST_CASE("Portals: a solid collider carried through isn't stopped by what is be
     t.run(150);  // at A (z = -5) after 2 s: through it, out of B
     CHECK(t.world(box).x == Catch::Approx(10.0f).margin(1e-3));
     CHECK(t.world(box).z > 0.0f);
+}
+
+TEST_CASE("Portals: a collider half through is outlined at both ends", "[Game][Portals]") {
+    TestScene t;
+    t.portalPair({0.0f, 1.0f, -5.0f}, none, {10.0f, 1.0f, 0.0f}, none);  // both facing +Z
+    EntityId box = t.entityWith("Box", {{"collider", R"({"size": [0.4, 0.4, 0.4]})"}}, {0.0f, 1.0f, -4.9f});
+    std::vector<WorldBox> boxes = colliderBoxes(t.scene, box);
+    REQUIRE(boxes.size() == 2);
+    CHECK_FALSE(boxes[0].ghost);
+    CHECK(boxes[1].ghost);
+    glm::vec3 out(boxes[1].transform[3]);  // its origin taken through: 0.1 behind B (the part beyond A is in front)
+    CHECK(glm::distance(out, glm::vec3(10.0f, 1.0f, -0.1f)) < 1e-4f);
+    t.scene.find(box)->local.position.x = 3.0f;  // beside the opening: once
+    CHECK(colliderBoxes(t.scene, box).size() == 1);
 }

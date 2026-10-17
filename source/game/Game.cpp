@@ -95,6 +95,9 @@ void Game::update(const GameStep& step) {
     world.player = step.scene.camera().position;
     std::unordered_map<EntityId, glm::vec3> before;  // (only in scenes with portals)
     bool portals = step.scene.hasPortals();
+    // The openings where they are at the step's start (the colliders' pieces, the player going through)
+    physics->setPortals(portals ? step.scene.portalOpenings() : std::vector<portals::PortalOpening>(),
+                        step.settings.maxPortalCrossings);
     if (portals) {
         for (const Entity& entity : step.scene.entities()) {
             before[entity.id] = worldPosition(step.scene, entity.id);

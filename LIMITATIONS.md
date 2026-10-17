@@ -827,7 +827,10 @@ instead (PhysicsWorld::overlapsCapsule).
 ### Collider outlines are drawn over everything
 The green collider boxes (the selection's, or all with View > "Collider outlines") are lines drawn over the image,
 not traced: a box behind a wall still shows, and nothing marks which edges are hidden. They show while the game
-doesn't run (paused too), from the components' properties, not the game's bodies.
+doesn't run (paused too), from the components' properties, not the game's bodies. A box part way through a portal
+is drawn as its pieces (its part out of the other end in orange), each edge cut where its piece ends; the faces made
+by a cut have no edges drawn, so a cut box looks open there. (The physics' boxes are grown to 5 cm on thin axes;
+the outlines aren't.)
 - Where: Editor::drawColliderBoxes (source/editor/EditorGizmo.cpp), colliderBoxes (game/Colliders.h).
 
 ### The player is lifted onto a step in one step
@@ -872,15 +875,45 @@ passes the plane. Paths are in world positions taken at Play (points moved while
 ### What portals carry, and what they don't
 While playing, an entity the game moved in a step whose origin's path went through an opening comes out of the
 other end (Game::carryThroughPortals): the topmost one that moved (what is under it comes along), never a portal
-end itself. It is tested at its origin only: a big object goes through all at once when its center does, and a
-model whose origin is outside the opening (a door hinge) never does. Something moving back and forth across an
-opening (a bob through a flat portal facing the same way at both ends) goes through each time it crosses.
-- Colliders don't know about openings: a wall with a portal in it must be built from boxes around the opening, or
-  it stops the player before it gets there; and the player's body (not its eyes) colliding with what is beside the
-  far end before it went through isn't checked. A solid collider is stopped by what is in front of the opening's
-  plane at its own end only, and what goes through is put at the other end without testing it there.
+end itself. Until then a model or collider part way through is in both places (drawn and colliding as pieces:
+"Objects half through a portal: what is drawn", "Collision through portals"); which of its pieces is the real one
+changes when its origin goes through. A model whose origin is outside the opening (a door hinge) never goes through
+(its part beyond shows at the other end for as long as it stays in the opening). Something moving back and forth
+across an opening (a bob through a flat portal facing the same way at both ends) goes through each time it crosses.
+- An object bigger than the opening doesn't go in at all (it crosses the plane partly beside the opening): it stays
+  whole, as without portals, and a wall around the opening stops it. Portal doesn't let such objects in either.
+- Not carried: light from a glowing piece at the other end, punctual lights of a model part way through, the
+  outline and picks through portals (see their own items).
+- The player goes through when its eyes do (the physics carries it: PhysicsWorld::moveCharacter); its body
+  collides through portals (see "Collision through portals").
+- Solid colliders' moves collide through portals too (see "Collision through portals"); the game still carries
+  one through by its entity's origin, after the step.
 - Only in scenes with portals: each step then works out every entity's world position twice (a few microseconds per
   hundred entities).
+
+### Collision through portals
+The player's capsule and the colliders near an opening are cut into pieces (portals/PortalPieces.h, as drawn): a part
+that went in touches what is beyond the other end, and what is behind the entrance within the opening isn't touched
+(PORTAL_PHYSICS_PLAN.md phases 3-4). A solid collider's move tests its pieces the same way, and its own pieces placed
+differently (its real part and the part out of the other end) block each other.
+- Each pair of pieces gives one contact (the capsule against box test's deepest), kept or dropped by the point halfway
+  into the overlap. So a capsule rests on what is under its axis: half through, the floor beyond the exit doesn't
+  hold it up until its middle is through. With portals in walls the eyes and the axis go through together, so it
+  doesn't show; a floor that ends before the opening drops the player as without portals.
+- The player only goes in when its whole outline fits the opening (a 1.8 m player and a 2 m door: fine; off to the
+  side by more than the gap, the wall stops it, as it should).
+- A collider's real side is its box's center (the game carries its entity by the entity's origin: a collider offset
+  far from its entity can be the wrong piece while half through). It keeps the side it had while a move goes on, and
+  when a placement goes through an opening (until the game's carry places it at the other end).
+- Box against box is judged at the contact's points (the deepest one both pieces keep). A solid collider that would
+  go into its own other piece only stops (no slide).
+- A solid move is tried at points along it: a box sliding sideways out of an opening without a wall around it stops
+  being in the portal between two points (its part at the other end is gone at once), so what that part would have
+  hit in between isn't seen. With a wall around the opening the wall stops it first.
+- The character stays upright: a pair that isn't level (a floor to a wall) puts its eyes through, its body standing
+  under them.
+- Where: SimplePhysicsWorld::contact, boxContact, ownContact, carry (source/physics/SimplePhysics.cpp);
+  Game::update hands the openings over (Scene::portalOpenings).
 
 ### F-keys reach the game along with the editor's
 While the game runs the editor's shortcuts are off, but F1, F5, F6, F11 and Esc still work, and the game sees them

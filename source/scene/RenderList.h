@@ -74,6 +74,10 @@ struct WorldBox {
     glm::mat4 transform;
     glm::vec3 min;
     glm::vec3 max;
+    // (Collider outlines) a collider's piece out of a portal's other end, and what of the box its piece keeps (its
+    // transform already applied: the cuts are where the piece is)
+    bool ghost = false;
+    portals::PortalPiece piece;
 };
 
 class RenderList {

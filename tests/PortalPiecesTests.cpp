@@ -219,3 +219,17 @@ TEST_CASE("Portal pieces: a box going into two openings at once branches, its co
     portalPieces(box, box.center, openings, 8, 3, pieces);
     CHECK(pieces.size() == 3);
 }
+
+TEST_CASE("Portal pieces: a line through an opening is carried to the other end, either way; beside it, it isn't",
+          "[Portals]") {
+    std::vector<PortalOpening> openings;
+    addPortalPair(openings, endAt({0, 1, -3}, 0.0f), endAt({10, 1, 0}, 0.0f), doorSize, false);
+    glm::mat4 total;
+    CHECK(crossOpenings(openings, {0.2f, 1.5f, -2.9f}, {0.2f, 1.5f, -3.1f}, 8, total) == 1);
+    glm::vec3 out = apply(total, {0.2f, 1.5f, -3.1f});  // into A's front, out of B's front
+    CHECK(glm::distance(out, glm::vec3(9.8f, 1.5f, 0.1f)) < 1e-4f);
+    CHECK(crossOpenings(openings, {9.8f, 1.5f, -0.1f}, {9.8f, 1.5f, 0.1f}, 8, total) == 1);  // into B's back
+    CHECK(apply(total, {9.8f, 1.5f, 0.1f}).z < -3.0f);  // out of A's back
+    CHECK(crossOpenings(openings, {2.0f, 1.5f, -2.9f}, {2.0f, 1.5f, -3.1f}, 8, total) == 0);  // beside it
+    CHECK(total == glm::mat4(1.0f));
+}

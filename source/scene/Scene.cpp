@@ -717,17 +717,29 @@ bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& mo
     return true;
 }
 
+std::vector<portals::PortalOpening> Scene::openingsOf(const std::vector<PlacedPair>& pairs) {
+    std::vector<portals::PortalOpening> openings;
+    for (const PlacedPair& pair : pairs) {
+        portals::addPortalPair(openings, pair.ends[0], pair.ends[1], pair.portal->size * 0.5f,
+                               pair.portal->shape == PortalShape::Ellipse);
+    }
+    return openings;
+}
+
+std::vector<portals::PortalOpening> Scene::portalOpenings() const {
+    if (portalTable.empty()) {
+        return {};
+    }
+    return openingsOf(placePairs(placeAll()));
+}
+
 std::vector<Scene::ModelPieces> Scene::findPortalPieces(const std::vector<PlacedModel>& models,
                                                         const std::vector<PlacedPair>& pairs) const {
     std::vector<ModelPieces> found;
     if (pairs.empty()) {
         return found;
     }
-    std::vector<portals::PortalOpening> openings;
-    for (const PlacedPair& pair : pairs) {
-        portals::addPortalPair(openings, pair.ends[0], pair.ends[1], pair.portal->size * 0.5f,
-                               pair.portal->shape == PortalShape::Ellipse);
-    }
+    std::vector<portals::PortalOpening> openings = openingsOf(pairs);
     int depth = std::max(1, settings.maxPortalCrossings);
     int ghosts = 0;
     for (size_t i = 0; i < models.size() && ghosts < maxGhosts; i++) {

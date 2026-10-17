@@ -16,11 +16,21 @@
 //   8 times. Overlaps shallower than contactSkin don't block (boxes resting on each other). A character touching a
 //   moved body is pushed out on trial (as its next move would); left in something deeper than squeezeTolerance, it
 //   is squeezed and the move is blocked.
+// - Portals: a body or the character near an opening gets its pieces (portals/PortalPieces.h; bodies when placed, the
+//   character at each push); a contact between a piece of the character and a piece of a body counts when the point
+//   halfway into the overlap is kept by both, and pushes the character back through its piece's transform. Each pair of
+//   pieces gives one contact (the capsule against box test's deepest), judged at that one point. The character goes
+//   through when its anchor crosses an opening, after each substep and each push. Box against box (moveBodies) the
+//   same way, judged at each of the contact's points (the deepest kept one counts); a group's own pieces placed by
+//   different transforms (a body's real piece and its ghost) block each other too. A body's real side is its anchor's:
+//   its position, but kept where it was while a move goes on or when a placement crosses an opening (the game
+//   carries the entity through after the step; its next placement, at the other end, takes the anchor along).
 //
 
 #ifndef VULKANDEMO_SIMPLEPHYSICS_H
 #define VULKANDEMO_SIMPLEPHYSICS_H
 
+#include <optional>
 #include <vector>
 #include "physics/PhysicsWorld.h"
 
@@ -31,6 +41,9 @@ public:
     static constexpr float minHalfThickness = 0.05f;
     static constexpr float contactSkin = 1e-3f;
     static constexpr float squeezeTolerance = 0.01f;
+    static constexpr int maxPieces = 16;  // per shape
+
+    void setPortals(const std::vector<portals::PortalOpening>& openings, int maxDepth) override;
 
     BodyId addBox(const BoxShape& shape, const Transform& transform) override;
     void setTransform(BodyId body, const Transform& transform) override;
@@ -56,7 +69,9 @@ private:
         glm::vec3 offset;       // of the grown box's center, in the box's own space
         Transform transform;    // as given
         Transform solid;        // the grown box's
+        glm::vec3 anchor;       // which side of the openings it is on (its pieces)
         glm::vec3 min, max;     // its bounds
+        std::vector<portals::PortalPiece> pieces;  // near an opening (else empty: whole, where it is)
         bool enabled = true;
         bool alive = false;
     };
@@ -72,17 +87,29 @@ private:
         bool ground = false;
         glm::vec3 groundNormal = glm::vec3(0.0f, 1.0f, 0.0f);
         bool wall = false;  // something too steep to stand on stopped it
+        int crossings = 0;  // portals it went through, and what they did
+        glm::mat4 crossing = glm::mat4(1.0f);
+    };
+    // A capsule placed in the world, with its pieces when near an opening (else none: whole)
+    struct Capsule {
+        glm::vec3 a, b;
+        float radius;
+        glm::vec3 min, max;
+        std::vector<portals::PortalPiece> pieces;
     };
 
-    // A body of a group moved by moveBodies: its transform in the group's
+    // A body of a group moved by moveBodies: its transform in the group's, and its anchor where the move started
     struct Mover {
         Body* body;
         Transform relative;
+        glm::vec3 anchor;
     };
-    // What a group's move doesn't test against: its own bodies and what overlapped it at the start (by index)
+    // What a group's move doesn't test against: its own bodies and what overlapped it at the start (by index); own:
+    // its pieces overlapped each other at the start
     struct MoveSkips {
         std::vector<char> bodies;
         std::vector<char> characters;
+        bool own = false;
     };
 
     std::vector<Body> bodies;
@@ -90,11 +117,30 @@ private:
     size_t liveBodies = 0;
     std::vector<Character> characters;
     std::vector<uint32_t> freeCharacters;
+    std::vector<portals::PortalOpening> openings;
+    int portalDepth = 1;
 
     Body* findBody(BodyId id);
     Character* findCharacter(CharacterId id);
     const Character* findCharacter(CharacterId id) const;
-    static void place(Body& body, const Transform& transform);
+    void place(Body& body, const Transform& transform, const glm::vec3& anchor) const;
+    // A body's anchor moved to position: there, unless that went through an opening (it is then still on the side it
+    // came from: the game carries it through after the step)
+    glm::vec3 anchorAfter(const glm::vec3& anchor, const glm::vec3& position) const;
+    // The pieces of a shape whose bounds are box (none when it is whole: no opening near)
+    void piecesOf(const portals::OrientedBox& box, const glm::vec3& anchor,
+                  std::vector<portals::PortalPiece>& pieces) const;
+    Capsule capsuleAt(const glm::vec3& a, const glm::vec3& b, float radius, const glm::vec3& anchor) const;
+    Capsule characterAt(const CharacterSettings& settings, const glm::vec3& feet) const;
+    // How to push the capsule out of the body (through their pieces), or nothing
+    std::optional<Contact> contact(const Capsule& capsule, const Body& body) const;
+    // How to push box a out of box b (through their pieces), or nothing. own: two bodies of one group (or one body
+    // twice): pieces placed by the same transform are rigid together and aren't tested
+    std::optional<Contact> boxContact(const Body& a, const Body& b, bool own) const;
+    // The deepest overlap of a group's pieces with each other (own pieces placed by different transforms)
+    std::optional<Contact> ownContact(const std::vector<Mover>& movers) const;
+    // Its anchor moved from `from` to where it is now: through the openings it crossed, to the other end
+    void carry(const CharacterSettings& settings, Moving& moving, const glm::vec3& from) const;
     // Pushed out of what it overlaps (ground and wall set by what it touched)
     void resolve(const CharacterSettings& settings, Moving& moving, int rounds = 4) const;
     // Moved by delta in substeps, resolving after each

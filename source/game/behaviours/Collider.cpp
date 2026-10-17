@@ -33,8 +33,10 @@ void colliderBox(const Scene& scene, EntityId entity, GameProperties& properties
     }
 }
 
-std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only) {
+std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only, int maxDepth) {
     std::vector<WorldBox> boxes;
+    std::vector<portals::PortalOpening> openings = scene.portalOpenings();
+    std::vector<portals::PortalPiece> pieces;
     for (const Entity& entity : scene.entities()) {
         const std::vector<GameComponent>* components = scene.game(entity.id);
         if (components == nullptr || (only != 0 && entity.id != only) ||
@@ -47,7 +49,25 @@ std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only) {
                 GameProperties properties(component.properties, "", ignored);
                 glm::vec3 center, halfSize;
                 colliderBox(scene, entity.id, properties, center, halfSize);
-                boxes.push_back({scene.worldTransform(entity.id), center - halfSize, center + halfSize});
+                glm::mat4 world = scene.worldTransform(entity.id);
+                boxes.push_back({world, center - halfSize, center + halfSize, false, {}});
+                if (!openings.empty()) {
+                    // Its pieces as the physics makes them (its real side: the box's center)
+                    portals::OrientedBox box;
+                    box.center = glm::vec3(world * glm::vec4(center, 1.0f));
+                    for (int axis = 0; axis < 3; axis++) {
+                        glm::vec3 column(world[axis]);
+                        float length = glm::length(column);
+                        box.axes[axis] = length > 0.0f ? column / length : glm::vec3(0.0f);
+                        box.half[axis] = halfSize[axis] * length;
+                    }
+                    portals::portalPieces(box, box.center, openings, std::max(maxDepth, 1), 16, pieces);
+                    boxes.back().piece = pieces[0];
+                    for (size_t k = 1; k < pieces.size(); k++) {
+                        boxes.push_back({pieces[k].transform * world, center - halfSize, center + halfSize, true,
+                                         pieces[k]});
+                    }
+                }
                 break;  // (the same type twice: only the first is used)
             }
         }

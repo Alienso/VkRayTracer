@@ -1,0 +1,739 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 23,
+  "portalPairsMade": 5,
+  "camera": {
+    "position": [
+      0.0,
+      1.65,
+      4.0
+    ],
+    "yaw": 0.0,
+    "pitch": 0.0,
+    "fov": 70.0
+  },
+  "environment": {
+    "sunEnabled": true,
+    "sunAzimuth": 35.0,
+    "sunElevation": 50.0,
+    "sunAngularRadius": 2.0,
+    "sunColor": [
+      1.0,
+      0.95,
+      0.85
+    ],
+    "sunIntensity": 1.0,
+    "background": "sky",
+    "skyZenithColor": [
+      0.08,
+      0.36,
+      0.72
+    ],
+    "skyHorizonColor": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "groundColor": [
+      0.35,
+      0.3,
+      0.35
+    ],
+    "skyIntensity": 0.6,
+    "map": null,
+    "mapRotation": 0.0,
+    "mapIntensity": 1.0
+  },
+  "entities": [
+    {
+      "id": 1,
+      "name": "Floor",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        3.0,
+        1.0,
+        3.0
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Floor"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {}
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Player (WASD, Shift, Space)",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        4.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "game": [
+        {
+          "type": "player",
+          "properties": {}
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Wall with a portal (walk in)",
+      "parent": 0,
+      "position": [
+        -8.0,
+        1.5,
+        -6.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        4.0,
+        3.0,
+        0.2
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Cube"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {}
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Portal in the wall",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "id": 5,
+      "name": "End A",
+      "parent": 4,
+      "position": [
+        -8.0,
+        1.1,
+        -5.88
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 6,
+        "endA": true,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 6,
+      "name": "End B",
+      "parent": 4,
+      "position": [
+        -14.0,
+        1.1,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.70711,
+        0.0,
+        0.70711
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 5,
+        "endA": false,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 7,
+      "name": "Wall the box slides through",
+      "parent": 0,
+      "position": [
+        -3.0,
+        1.5,
+        -6.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        3.0,
+        3.0,
+        0.2
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Cube"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {}
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Portal for the box",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "id": 9,
+      "name": "End A",
+      "parent": 8,
+      "position": [
+        -3.0,
+        1.1,
+        -5.88
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 10,
+        "endA": true,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 10,
+      "name": "End B",
+      "parent": 8,
+      "position": [
+        -3.0,
+        1.1,
+        -14.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 9,
+        "endA": false,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 11,
+      "name": "Solid box (slides through the portal and back)",
+      "parent": 0,
+      "position": [
+        -3.0,
+        0.4,
+        -3.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.8,
+        0.8,
+        0.8
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Cube"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {
+            "solid": true
+          }
+        },
+        {
+          "type": "slide",
+          "properties": {
+            "axis": [
+              0,
+              0,
+              -1
+            ],
+            "distance": 5,
+            "period": 8
+          }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "name": "Facing ends",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "id": 13,
+      "name": "End A",
+      "parent": 12,
+      "position": [
+        3.0,
+        1.1,
+        -5.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 14,
+        "endA": true,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 14,
+      "name": "End B",
+      "parent": 12,
+      "position": [
+        3.0,
+        1.1,
+        -2.0
+      ],
+      "rotation": [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 13,
+        "endA": false,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 15,
+      "name": "Stick between facing ends (slides)",
+      "parent": 0,
+      "position": [
+        3.0,
+        1.1,
+        -3.5
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.3,
+        0.3,
+        1.2
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Cube"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {
+            "solid": true
+          }
+        },
+        {
+          "type": "slide",
+          "properties": {
+            "axis": [
+              0,
+              0,
+              -1
+            ],
+            "distance": 3,
+            "period": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "name": "Chain, first pair",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "id": 17,
+      "name": "End A",
+      "parent": 16,
+      "position": [
+        8.0,
+        1.1,
+        -3.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 18,
+        "endA": true,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 18,
+      "name": "End B",
+      "parent": 16,
+      "position": [
+        8.0,
+        1.1,
+        -4.5
+      ],
+      "rotation": [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 17,
+        "endA": false,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 19,
+      "name": "Chain, second pair",
+      "parent": 0,
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "id": 20,
+      "name": "End A",
+      "parent": 19,
+      "position": [
+        8.0,
+        1.1,
+        -6.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 21,
+        "endA": true,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 21,
+      "name": "End B",
+      "parent": 19,
+      "position": [
+        8.0,
+        1.1,
+        -7.5
+      ],
+      "rotation": [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "portal": {
+        "other": 20,
+        "endA": false,
+        "shape": "rectangle",
+        "size": [
+          1.2,
+          2.2
+        ],
+        "rim": true,
+        "rimWidth": 0.06,
+        "rimDepth": 0.04
+      }
+    },
+    {
+      "id": 22,
+      "name": "Stick through the chain (slides)",
+      "parent": 0,
+      "position": [
+        8.0,
+        1.1,
+        -1.5
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.3,
+        0.3,
+        2.5
+      ],
+      "uniformScale": false,
+      "model": {
+        "builtIn": "Cube"
+      },
+      "game": [
+        {
+          "type": "collider",
+          "properties": {}
+        },
+        {
+          "type": "slide",
+          "properties": {
+            "axis": [
+              0,
+              0,
+              -1
+            ],
+            "distance": 5,
+            "period": 10
+          }
+        }
+      ]
+    }
+  ],
+  "models": []
+}

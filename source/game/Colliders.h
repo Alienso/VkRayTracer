@@ -16,7 +16,8 @@ void colliderBox(const Scene& scene, EntityId entity, GameProperties& properties
                  glm::vec3& halfSize);
 
 // The colliders' boxes placed in the world (WorldBox: the entity's world transform, the box in its own space): of
-// the entity given, or of all shown entities (0)
-std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only);
+// the entity given, or of all shown entities (0). Each one part way through a portal is followed by its pieces out of
+// the other ends (ghost: their transform takes the box there; up to maxDepth crossings), as the physics has them.
+std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only, int maxDepth = 8);
 
 #endif //VULKANDEMO_COLLIDERS_H
