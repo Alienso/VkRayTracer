@@ -45,6 +45,17 @@ public:
     void play();
     void stop();
     [[nodiscard]] bool isPlaying() const { return playing; }
+    // Pause / Resume while playing (F6, the menu bar; Esc and the window losing focus pause): the game holds still
+    // and the editor's controls work again; Resume goes on with the changes (Game::resume). Undo then covers only
+    // the changes of this pause (startPauseHistory, called by the program once the scene shows the game's own
+    // state, not a blend).
+    void pause();
+    void resume();
+    [[nodiscard]] bool isPaused() const { return paused; }
+    void startPauseHistory() { pauseHistory.reset(scene); }
+    // The game runs (playing, not paused): the editor's controls are off (handles, clicks on the image, its keys,
+    // changes in the Outliner)
+    [[nodiscard]] bool gameRunning() const { return playing && !paused; }
     // Selecting in the image (EditorScene.cpp). The selected entity (0: none), outlined in the image.
     [[nodiscard]] EntityId selectedEntity() const { return selected; }
     // A click on the image to pick at (0..1 over it, from the top left): the program asks the renderer
@@ -137,6 +148,9 @@ private:
     char saveAsName[128] = "";
     bool askSaveAs = false;     // open the Save As question this frame
     bool playing = false;
+    bool paused = false;
+    EditHistory pauseHistory;  // while paused: this pause's changes only
+    EditHistory& activeHistory() { return paused ? pauseHistory : editHistory; }
     bool blendSteps = true;
     std::string gameStatus;
     std::string playSnapshot;   // Scene::text at Play

@@ -775,12 +775,24 @@ Measured: 0.6-0.7 s saved per file (15-20%: most of the time is optimizing, not 
 
 ## Game
 
-### The camera is the player: no body, no collision
-Distances (door, pickup) and the trigger boxes use the camera's position; the camera flies through walls, doors and
-the floor. There is no CPU-side collision or ray query against the scene (the BVH is on the GPU).
-- Fix: a player entity with a simple shape (a capsule) and collision against boxes the scene marks, or a coarse
-  CPU copy of the static geometry; picking (clicking an object) the same, or a GPU pick read back a frame late.
+### Collision: boxes only, and only the player
+The player (a capsule) collides with boxes the scene marks (`collider`), not with the models' own triangles: a
+Sponza wall without a collider is walked through. Colliders don't collide with each other, nothing is pushed or
+falls (no rigid bodies), and a lift or platform doesn't carry the player along sideways (it only lifts it).
+- Fix: collision against the models' triangles (PHYSICS_PLAN.md, option B: a mesh shape behind the same
+  PhysicsWorld interface, built from Mesh::vertices / indices, which stay on the CPU); rigid bodies with a library
+  (Jolt) behind it.
+
+### Distances are from the eyes
+Doors, pickups and triggers measure from the camera's position: with a player that is its eyes, 1.65 m up, so a
+pickup on the floor needs a radius over 1.65 (the scenes use 1.5 with coins 0.5 up). They could use the body
+instead (PhysicsWorld::overlapsCapsule).
 - Where: `GameWorld::player` (source/game/Behaviour.h), set in Game::update.
+
+### The player is lifted onto a step in one step
+Stepping up a ledge (up to stepHeight) moves the body up at once; the camera is blended between the steps but still
+rises by the whole step within 1/60 s. Games often smooth the camera's height over a few frames.
+- Where: SimplePhysicsWorld::moveCharacter (step up), Player::update.
 
 ### Entity ids in properties aren't remapped
 `"target": 12` names entity 12. Duplicating a door, trigger or spawner copies the id as it is, so the copy still
@@ -797,8 +809,11 @@ the same target both set its visibility. Nothing warns.
 - Fix: put one of them on a child entity (spin the child, swing the parent), or a warning at Play for known pairs.
 
 ### Edits made while playing are lost
-Stop puts back the scene as it was at Play: moving, adding or editing things by hand while playing is undone too
+Stop puts back the scene as it was at Play: moving, adding or editing things by hand while paused is undone too
 (as in Unity). Save is off while playing, so the played state can't be saved by mistake.
+- Resuming after a pause: changed properties start that entity's behaviours over (a half-open door starts closed);
+  a camera path follows its entity moved as a whole, not a point moved on its own; undo can't go back past the
+  pause (it restores whole scene texts: the game's progress would be undone too).
 - Also: Stop logs a missing model's "failed to load" again (putting the scene back asks for it again).
 
 ### What is shown runs up to a step behind
@@ -812,9 +827,9 @@ A camera path sets the camera's position from its points every step, so a portal
 for a frame and the next step puts it back. Paths are in world positions taken at Play (points moved while playing
 don't change the path).
 
-### Keys reach the game along with the editor's
-While playing, the game sees every key the editor isn't typing into, the editor's own shortcuts too (F1, F5, F11).
-Only E is used by a behaviour. Benches never play.
+### F-keys reach the game along with the editor's
+While the game runs the editor's shortcuts are off, but F1, F5, F6, F11 and Esc still work, and the game sees them
+too (no behaviour uses them). Benches never play.
 
 ### Properties are edited as JSON text
 The Details panel's Type menu lists the game's types (Game::types: name, help, default properties) and fills in a

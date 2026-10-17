@@ -40,12 +40,14 @@ void Editor::build() {
     }
 
     ImGuizmo::BeginFrame();
-    if (!uiHidden) {
+    if (!uiHidden && !gameRunning()) {
         buildGizmo();  // (before the clicks: a click on a handle isn't a pick)
     } else {
         finishGizmoDrag();
     }
-    handleImageClicks();
+    if (!gameRunning()) {
+        handleImageClicks();
+    }
     handleEditorKeys();
     // Keys that work wherever the mouse is (but not while typing into a field)
     if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
@@ -53,6 +55,12 @@ void Editor::build() {
     }
     if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F5, false)) {
         playing ? stop() : play();
+    }
+    if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F6, false) && playing) {
+        paused ? resume() : pause();
+    }
+    if (gameRunning() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        pause();  // (as games open their pause menu; it doesn't resume: in the editor Esc selects nothing)
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && !playing) {
         if (scenePath.empty()) {

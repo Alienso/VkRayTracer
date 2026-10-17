@@ -40,6 +40,9 @@ struct Bob {
             e->local.position = start + glm::vec3(0.0f, height * static_cast<float>(std::sin(phase)), 0.0f);
         }
     }
+
+    // Put somewhere else by hand while paused: it bobs around there
+    void moved(const EntityMove& move, GameWorld&) { start += move.newLocal.position - move.oldLocal.position; }
 };
 
 }  // namespace

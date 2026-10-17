@@ -1,0 +1,32 @@
+{
+  "format": "vulkanDemo scene",
+  "version": 1,
+  "nextEntityId": 22,
+  "portalPairsMade": 0,
+  "camera": {"position":[0.0,1.65,8.0],"yaw":0.0,"pitch":0.0,"fov":70.0},
+  "environment": {"sunEnabled":true,"sunAzimuth":35.0,"sunElevation":50.0,"sunAngularRadius":2.0,"sunColor":[1.0,0.95,0.85],"sunIntensity":1.0,"background":"sky","skyZenithColor":[0.08,0.36,0.72],"skyHorizonColor":[1.0,1.0,1.0],"groundColor":[0.35,0.3,0.35],"skyIntensity":0.6,"map":null,"mapRotation":0.0,"mapIntensity":1.0},
+  "entities": [
+    {"id":1,"name":"Floor","parent":0,"position":[0.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,1.0,2.0],"model":{"builtIn":"Floor"},"game":[{"type":"collider","properties":{}}]},
+    {"id":2,"name":"Player (WASD, Shift, Space)","parent":0,"position":[0.0,0.0,8.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"player","properties":{}}]},
+    {"id":3,"name":"Crate (jump on it)","parent":0,"position":[-3.0,0.5,4.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":4,"name":"Coin on the crate","parent":0,"position":[-3.0,1.5,4.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":5,"name":"Stairs","parent":0,"position":[3.0,0.0,4.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":6,"name":"Step 1","parent":5,"position":[0.0,0.125,1.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.25,1.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":7,"name":"Step 2","parent":5,"position":[0.0,0.25,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.5,1.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":8,"name":"Step 3","parent":5,"position":[0.0,0.375,-1.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.75,1.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":9,"name":"Landing","parent":5,"position":[0.0,0.5,-2.5],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,1.0,2.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":10,"name":"Coin on the landing","parent":5,"position":[0.0,1.5,-2.5],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":11,"name":"Ramp (20 degrees)","parent":0,"position":[-7.0,0.95,2.0],"rotation":[0.17365,0.0,0.0,0.98481],"scale":[2.0,0.2,6.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":12,"name":"Ramp top","parent":0,"position":[-7.0,1.0,-2.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,2.0,2.4],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":13,"name":"Wall","parent":0,"position":[0.0,0.0,-5.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0]},
+    {"id":14,"name":"Wall left","parent":13,"position":[-3.5,1.25,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[5.0,2.5,0.2],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":15,"name":"Wall right","parent":13,"position":[3.0,1.25,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[5.0,2.5,0.2],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":16,"name":"Door (E to open)","parent":13,"position":[-1.0,0.0,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.0,1.0,1.0],"game":[{"type":"door","properties":{"openAngle":100,"seconds":0.8,"radius":2.5}}]},
+    {"id":17,"name":"Door panel","parent":16,"position":[0.75,1.1,0.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[1.5,2.2,0.1],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":18,"name":"Coin behind the door","parent":0,"position":[0.0,0.5,-9.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5,"remove":true}},{"type":"spin","properties":{"speed":180}}]},
+    {"id":19,"name":"Lift (stand on it)","parent":0,"position":[7.0,0.4,-8.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.2,2.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}},{"type":"bob","properties":{"height":1.0,"period":5}}]},
+    {"id":20,"name":"High shelf","parent":0,"position":[7.0,2.4,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[2.0,0.2,2.0],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"collider","properties":{}}]},
+    {"id":21,"name":"Coin on the shelf","parent":0,"position":[7.0,3.0,-11.0],"rotation":[0.0,0.0,0.0,1.0],"scale":[0.35,0.35,0.08],"uniformScale":false,"model":{"builtIn":"Cube"},"game":[{"type":"pickup","properties":{"radius":1.5}},{"type":"spin","properties":{"speed":180}}]}
+  ],
+  "models": []
+}

@@ -51,6 +51,9 @@ struct Door {
         open = open < target ? std::min(open + change, target) : std::max(open - change, target);
         e->local.rotation = closed * glm::angleAxis(glm::radians(openAngle * open), axis);
     }
+
+    // Turned by hand while paused: it closes to the turn it was given
+    void moved(const EntityMove& move, GameWorld&) { closed = followRotation(move, closed); }
 };
 
 }  // namespace

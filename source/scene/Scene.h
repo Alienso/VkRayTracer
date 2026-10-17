@@ -171,6 +171,9 @@ public:
     // Boxes around the models shown by the entity and everything under it (those visible in the world, loaded), in
     // the world: where the editor's selection outline can be on the image
     [[nodiscard]] std::vector<WorldBox> selectionBoxes(EntityId id) const;
+    // The box around the entity's own model (all its parts, the model's fit applied), in the entity's own space:
+    // false without a loaded model
+    bool modelBox(EntityId id, glm::vec3& min, glm::vec3& max) const;
 
     // The entity's components, or nullptr. Pointers stay valid while the component exists.
     ModelComponent* model(EntityId id);

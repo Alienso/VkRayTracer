@@ -39,6 +39,9 @@ struct Spin {
             e->local.rotation = start * glm::angleAxis(angle, axis);
         }
     }
+
+    // Turned by hand while paused: it turns on from there
+    void moved(const EntityMove& move, GameWorld&) { start = followRotation(move, start); }
 };
 
 }  // namespace

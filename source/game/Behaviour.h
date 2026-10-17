@@ -10,6 +10,11 @@
 //   static std::optional<T> read(const ReadContext&, GameProperties&)   at Play (or when spawned): its values, or
 //                                               nothing (warned about through the properties)
 //   void update(const GameStep&, GameWorld&)    each step
+// and optionally:
+//   void moved(const EntityMove&, GameWorld&)   something other than the game moved its entity (the editor while
+//                                               paused; later a portal): places kept from Play follow it
+//   void removed(GameWorld&)                    it is dropped (its entity removed, or its components changed while
+//                                               paused): what it holds outside its list goes too
 // BehaviourList<T> keeps one type's behaviours in a list and does the rest (Stop, removed entities, counting); the
 // types are listed once, in game/Behaviours.cpp, in update order.
 //
@@ -21,10 +26,13 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include "core/Input.h"
 #include "game/GameProperties.h"
 #include "game/StepInterpolation.h"
+#include "physics/PhysicsWorld.h"
 #include "scene/Scene.h"
 
 // What one step works with
@@ -65,7 +73,9 @@ struct GameWorld {
     glm::vec3 player = glm::vec3(0.0f);  // the camera's position at the start of the step
     int pickupsTaken = 0;
     int pickupsCounted = 0;      // pickups shown at some point: the "of N"
-    bool controlsCamera = false; // a camera path drives the camera
+    bool controlsCamera = false; // a camera path or the player drives the camera
+    bool mouseLook = false;      // the player turns the view with the mouse (the program captures it)
+    physics::PhysicsWorld* physics = nullptr;  // the colliders and the player's body (Game's)
     std::vector<EntityId> removals;
     std::vector<SpawnRequest> spawns;
 };
@@ -92,6 +102,21 @@ struct ReadContext {
     }
 };
 
+// An entity moved by something other than the game: its local transform before and after, and its world change (new
+// world * old world^-1; the local ones are the same when only a parent moved)
+struct EntityMove {
+    EntityId entity;
+    Transform oldLocal;
+    Transform newLocal;
+    glm::mat4 worldChange;
+};
+
+// The rotation that takes a behaviour's rotation kept from Play along when its entity's local rotation went from
+// oldLocal to newLocal (spin's start, door's closed: shown as kept * the behaviour's own turn)
+inline glm::quat followRotation(const EntityMove& move, const glm::quat& kept) {
+    return glm::normalize(move.newLocal.rotation * glm::inverse(move.oldLocal.rotation) * kept);
+}
+
 inline glm::vec3 worldPosition(const Scene& scene, EntityId id) {
     return glm::vec3(scene.worldTransform(id)[3]);
 }
@@ -106,9 +131,21 @@ public:
     [[nodiscard]] virtual size_t size() const = 0;
     virtual void read(const ReadContext& context, GameProperties& properties) = 0;
     virtual void update(const GameStep& step, GameWorld& world) = 0;
-    virtual void removeGone(const Scene& scene) = 0;  // the behaviours of entities removed while playing
+    virtual void removeGone(const Scene& scene, GameWorld& world) = 0;  // of entities removed while playing
+    virtual void removeEntity(EntityId entity, GameWorld& world) = 0;   // the entity's behaviours, whatever the type
+    virtual void moved(const EntityMove& move, GameWorld& world) = 0;
     virtual void clear() = 0;
 };
+
+// Whether a type has the optional moved / removed
+template <typename T, typename = void> struct HasMoved : std::false_type {};
+template <typename T>
+struct HasMoved<T, std::void_t<decltype(std::declval<T&>().moved(std::declval<const EntityMove&>(),
+                                                                 std::declval<GameWorld&>()))>> : std::true_type {};
+template <typename T, typename = void> struct HasRemoved : std::false_type {};
+template <typename T>
+struct HasRemoved<T, std::void_t<decltype(std::declval<T&>().removed(std::declval<GameWorld&>()))>>
+    : std::true_type {};
 
 template <typename T> class BehaviourList : public BehaviourListBase {
 public:
@@ -127,17 +164,37 @@ public:
             behaviour.update(step, world);
         }
     }
-    void removeGone(const Scene& scene) override {
+    void removeGone(const Scene& scene, GameWorld& world) override {
         if constexpr (T::removedWithEntity) {
-            items.erase(std::remove_if(items.begin(), items.end(),
-                                       [&](const T& behaviour) { return scene.find(behaviour.entity) == nullptr; }),
-                        items.end());
+            drop([&](const T& behaviour) { return scene.find(behaviour.entity) == nullptr; }, world);
+        }
+    }
+    void removeEntity(EntityId entity, GameWorld& world) override {
+        drop([&](const T& behaviour) { return behaviour.entity == entity; }, world);
+    }
+    void moved(const EntityMove& move, GameWorld& world) override {
+        if constexpr (HasMoved<T>::value) {
+            for (T& behaviour : items) {
+                if (behaviour.entity == move.entity) {
+                    behaviour.moved(move, world);
+                }
+            }
         }
     }
     void clear() override { items.clear(); }
 
 private:
     std::vector<T> items;
+
+    template <typename Which> void drop(Which&& which, GameWorld& world) {
+        auto gone = std::stable_partition(items.begin(), items.end(), [&](const T& b) { return !which(b); });
+        if constexpr (HasRemoved<T>::value) {
+            for (auto it = gone; it != items.end(); ++it) {
+                it->removed(world);
+            }
+        }
+        items.erase(gone, items.end());
+    }
 };
 
 #endif //VULKANDEMO_BEHAVIOUR_H

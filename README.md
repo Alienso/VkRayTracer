@@ -120,7 +120,12 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   the properties; the game reads them when Play starts. A typo or a wrong kind of value is a warning in the Log,
   and the default is used. Other entities are named by their id (shown next to the name in the Details panel).
 - **Play / Stop** (F5, or the menu bar): Play keeps the scene, Stop puts it back as it was, so what changes while
-  playing (by the game or by hand) is undone. While playing, New, Open and Save are off. `--play` plays as soon as
+  playing (by the game or by hand) is undone. While playing, New, Open and Save are off. While the game runs it has
+  the mouse (captured, as in a game: the mouse turns the view, W/A/S/D move, Space / Ctrl up and down, Shift faster;
+  unless a camera path drives the camera) and the editor's controls are off.
+- **Pause / Resume** (F6; Esc and switching to another window pause too): the game stops where it is, the mouse is
+  free and the editor works again (select, move, add, delete, edit components, undo the pause's changes); Resume
+  goes on from there with the changes: a bobbing or spinning thing moved by hand carries on where it was put. `--play` plays as soon as
   the scene is open.
 - **Fixed steps**: the game advances 60 times a second whatever the frame rate (`source/game/GameLoop.h`), so it
   behaves the same on any machine. What moves is shown blended between the steps, so it moves smoothly at any
@@ -128,10 +133,17 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
 - **Behaviours**: `spin` and `bob` (turning, floating), `door` (E near it opens and closes it), `pickup` (taken by
   coming near, counted over the image), `trigger` (a box that shows or hides another entity while the camera is
   inside), `spawner` (copies of an entity that come and go), `cameraPath` (the game flies the camera along the
-  entity's children). The camera stands in for the player.
-- `scenes/game_demo.json` has each of them except the camera path (walk up to the door and press E, collect the
-  coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera path around
-  the helmet. What it can't do yet: LIMITATIONS.md, "Game".
+  entity's children), `collider` (a solid box: around the entity's model, or of a given size; it moves with the
+  entity and isn't solid while hidden) and `player` (the camera as a body: W/A/S/D walk, Shift runs, Space jumps,
+  the mouse turns the view; it is stopped by colliders, slides along walls, walks up low steps and gentle slopes,
+  and falls under gravity). Without a player the camera flies (game-style) and stands in for the player.
+- Physics (`source/physics/`, its own library: only glm) sits behind an interface (`physics/PhysicsWorld.h`): our
+  own SimplePhysics (turned boxes, a capsule character) now, collision with the models' own triangles or a library
+  later, without changing the game.
+- `scenes/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
+  collect the coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera
+  path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
+  the door, a moving lift. What it can't do yet: LIMITATIONS.md, "Game".
 
 ## Requirements
 
@@ -175,7 +187,8 @@ Controls (as in Unity and Unreal):
   snap. F frames the selection, Ctrl+D duplicates, Delete deletes (with the mouse over the image), Ctrl+Z / Ctrl+Y
   undo / redo any change to the scene: moves, deletes, re-parenting, components, materials, lights, the environment
   (the Tools menu lists them).
-- F11 fullscreen, F1 hides the UI, Ctrl+S saves the scene, F5 plays / stops, E opens a door while playing.
+- F11 fullscreen, F1 hides the UI, Ctrl+S saves the scene, F5 plays / stops, F6 (or Esc) pauses / resumes, E opens
+  a door while playing.
 
 ## Benches
 

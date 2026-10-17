@@ -45,6 +45,14 @@ void Window::windowedSize(int& width, int& height) const {
     }
 }
 
+void Window::setCursorCaptured(bool on) {
+    cursorCaptured = on;
+    glfwSetInputMode(window, GLFW_CURSOR, on ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    if (glfwRawMouseMotionSupported()) {
+        glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, on ? GLFW_TRUE : GLFW_FALSE);
+    }
+}
+
 bool Window::takeResized() {
     bool was = resized;
     resized = false;

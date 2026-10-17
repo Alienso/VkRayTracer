@@ -42,7 +42,7 @@ struct Spawner {
         if (target == 0) {
             return std::nullopt;
         }
-        return Spawner{context.entity.id, target, interval, lifetime, std::max(max, 0), interval, {}};
+        return Spawner{context.entity.id, target, interval, lifetime, std::max(max, 0), context.time + interval, {}};
     }
 
     void update(const GameStep& step, GameWorld& world) {

@@ -36,10 +36,17 @@ public:
     // True once after the framebuffer changed size (dragging, maximizing, fullscreen), then false until it changes again
     bool takeResized();
 
+    // While the game runs it has the mouse: the cursor hidden and held in the window, its movement read raw
+    // (without the system's acceleration) where the system offers it
+    void setCursorCaptured(bool on);
+    [[nodiscard]] bool isCursorCaptured() const { return cursorCaptured; }
+    [[nodiscard]] bool isFocused() const { return glfwGetWindowAttrib(window, GLFW_FOCUSED) != 0; }
+
 private:
     GLFWwindow* window = nullptr;
     bool resized = false;
     bool fullscreen = false;
+    bool cursorCaptured = false;
     int windowedX = 0, windowedY = 0, windowedWidth = 0, windowedHeight = 0;
     bool windowedMaximized = false;
     std::function<bool()> closeCheck;

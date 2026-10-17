@@ -184,6 +184,22 @@ void Application::updateSelection() {
     }
 }
 
+void Application::updateMouseCapture() {
+    bool wanted = editor.gameRunning() && !bench && game.running() && game.capturesMouse() && window.isFocused();
+    if (wanted == window.isCursorCaptured()) {
+        return;
+    }
+    window.setCursorCaptured(wanted);
+    ImGuiIO& io = ImGui::GetIO();
+    if (wanted) {
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange;
+        ImGui::SetWindowFocus(nullptr);  // (no field keeps the keyboard)
+    } else {
+        io.ConfigFlags &= ~(ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange);
+    }
+    cursorRead = false;  // the cursor jumped: no movement from it
+}
+
 void Application::updateGame(float deltaTime, const InputState& input) {
     bool playing = editor.isPlaying() && !bench;
     if (playing && !game.running()) {
@@ -201,6 +217,22 @@ void Application::updateGame(float deltaTime, const InputState& input) {
         editor.setGameStatus("");
     }
     if (!game.running()) {
+        return;
+    }
+    if (editor.isPaused() && !game.paused()) {
+        interpolation.restore(scene);  // the game's own transforms, not a blend: what the editor edits from
+        interpolation.clear();
+        game.pause(scene);
+        editor.startPauseHistory();
+    } else if (!editor.isPaused() && game.paused()) {
+        for (const std::string& warning : game.resume(scene)) {
+            std::cerr << "game: " << warning << std::endl;
+            editor.warn("Game: " + warning);
+        }
+        gameLoop.dropInput();  // (keys used in the editor meanwhile)
+        interpolation.clear();
+    }
+    if (game.paused()) {
         return;
     }
     interpolation.enabled = editor.blendGameSteps();
@@ -237,6 +269,9 @@ void Application::mainLoop() {
             deltaTime = bench->deltaTime(deltaTime);
         }
 
+        if (editor.gameRunning() && !bench && !window.isFocused()) {
+            editor.pause();  // (another window took the focus: as games do)
+        }
         renderer.beginFrame(deltaTime);
         assets.setUnusedBudget(unusedModelBudget(renderer.gpuMemory(), assets.unusedMemory()));
         assets.update();  // a model or map loaded in the background arrives
@@ -245,6 +280,7 @@ void Application::mainLoop() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         editor.build();  // may change the scene
+        updateMouseCapture();
         ImGui::Render();
         Clock::time_point uiEnd = Clock::now();
         // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
@@ -256,8 +292,9 @@ void Application::mainLoop() {
         Clock::time_point gameEnd = Clock::now();
         if (bench) {
             bench->beforeRender(scene, renderer, assets);  // the camera is the bench's
-        } else if (!game.controlsCamera()) {
-            cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        } else if (!game.controlsCamera() || editor.isPaused()) {
+            cameraController.update(scene.camera(), window.handle(), deltaTime, !io.WantCaptureKeyboard,
+                                    !io.WantCaptureMouse, window.isCursorCaptured());
         }
         scene.moveCameraThroughPortals(cameraFrom);
         scene.buildRenderList(renderList);

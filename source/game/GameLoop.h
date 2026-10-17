@@ -30,6 +30,9 @@ public:
         pending = InputState();
     }
 
+    // Input waiting for a step dropped (resuming after a pause: keys used in the editor meanwhile aren't the game's)
+    void dropInput() { pending = InputState(); }
+
     // One frame: its time and its input. Calls step(const InputState&, uint64_t index) for each step it runs
     // (index: steps since reset, 0 first); returns how many ran.
     template <typename Step> int advance(double frameSeconds, const InputState& frameInput, Step&& step) {

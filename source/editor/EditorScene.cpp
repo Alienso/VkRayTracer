@@ -128,6 +128,9 @@ void Editor::buildEntityTree() {
         ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
         edit = {TreeEdit::Delete, selected, 0};
     }
+    if (gameRunning()) {
+        edit = TreeEdit();  // (the game is running: pause to change the tree)
+    }
 
     switch (edit.kind) {
         case TreeEdit::Move:

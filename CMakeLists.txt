@@ -58,16 +58,23 @@ add_library(vulkanDemoCore STATIC
         include/cgltf/cgltf.h)
 target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
 
+# Physics (PHYSICS_PLAN.md): colliders and the player's capsule behind an interface (physics/PhysicsWorld.h). Knows
+# nothing of the scene, the assets or the game: only glm
+add_library(vulkanDemoPhysics STATIC
+        source/physics/PhysicsTypes.h source/physics/PhysicsWorld.h source/physics/Collision.cpp
+        source/physics/Collision.h source/physics/SimplePhysics.cpp source/physics/SimplePhysics.h)
+
 # The game (README: Game logic): uses the scene, never the renderer, the editor or the window; it links only the core
+# (and the physics)
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
         source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h
         source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Door.cpp
         source/game/behaviours/Pickup.cpp source/game/behaviours/Trigger.cpp source/game/behaviours/Spawner.cpp
-        source/game/behaviours/CameraPath.cpp
+        source/game/behaviours/CameraPath.cpp source/game/behaviours/Collider.cpp source/game/behaviours/Player.cpp
         source/game/GameProperties.h source/game/StepInterpolation.cpp source/game/StepInterpolation.h
         source/core/Input.h)
-target_link_libraries(vulkanDemoGame vulkanDemoCore)
+target_link_libraries(vulkanDemoGame vulkanDemoPhysics vulkanDemoCore)
 
 add_executable(vulkanDemo main.cpp
         include/imgui/imgui.cpp include/imgui/imgui.h
@@ -118,11 +125,12 @@ add_executable(tests
         tests/TransformTests.cpp tests/ModelLoaderTests.cpp tests/UserSettingsTests.cpp tests/GameComponentTests.cpp
         tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
         tests/GameInteractionTests.cpp tests/SelectionTests.cpp
-        tests/EditHistoryTests.cpp)
+        tests/EditHistoryTests.cpp tests/PhysicsTests.cpp tests/GamePauseTests.cpp
+        tests/GamePhysicsTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes
-target_link_libraries(tests vulkanDemoGame vulkanDemoCore -static-libgcc -static-libstdc++)
+target_link_libraries(tests vulkanDemoGame vulkanDemoPhysics vulkanDemoCore -static-libgcc -static-libstdc++)
 enable_testing()
 add_test(NAME unit COMMAND tests)
 

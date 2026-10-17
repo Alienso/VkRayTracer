@@ -56,7 +56,7 @@ struct CameraPath {
             points.push_back(worldPosition(context.scene, child));
         }
         if (context.world.controlsCamera) {
-            properties.warn("the game already has a camera path; ignored");
+            properties.warn("the camera is already driven (a camera path or a player); ignored");
         } else if (points.size() < 2) {
             properties.warn("needs at least 2 children (the points of the path, in their order); ignored");
         } else if (!context.spawned) {
@@ -78,6 +78,16 @@ struct CameraPath {
             camera.lookAt(look);
         }
     }
+
+    // The path's entity moved while paused: the path (its points taken at Play) goes with it. A point moved on its
+    // own isn't followed.
+    void moved(const EntityMove& move, GameWorld&) {
+        for (glm::vec3& point : points) {
+            point = glm::vec3(move.worldChange * glm::vec4(point, 1.0f));
+        }
+    }
+
+    void removed(GameWorld& world) const { world.controlsCamera = false; }
 };
 
 }  // namespace

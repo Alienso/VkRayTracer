@@ -268,7 +268,9 @@ TEST_CASE("Game: each type's defaults are the properties it reads, and read with
         }
         std::vector<std::string> warnings;
         GameProperties properties(list.defaults(), list.type(), warnings);
+        std::unique_ptr<physics::PhysicsWorld> physicsWorld = physics::makeSimplePhysicsWorld();
         GameWorld world;
+        world.physics = physicsWorld.get();
         list.read(ReadContext{t.scene, *t.scene.find(id), false, 0.0, world}, properties);
         properties.finish();
         CHECK(properties.askedKeys() == keys);

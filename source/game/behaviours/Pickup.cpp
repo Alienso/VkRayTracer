@@ -51,6 +51,13 @@ struct Pickup {
             }
         }
     }
+
+    // Deleted (or its properties changed) while paused: one not taken yet isn't one of the "of N" any more
+    void removed(GameWorld& world) const {
+        if (counted && !taken) {
+            world.pickupsCounted--;
+        }
+    }
 };
 
 }  // namespace

@@ -129,8 +129,8 @@ void Editor::handleEditorKeys() {
     if (io.WantTextInput || ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
         return;
     }
-    if (playing) {
-        return;  // the letters are the game's (and nothing is undone while playing: Stop puts the scene back)
+    if (gameRunning()) {
+        return;  // the letters are the game's (and nothing is undone while it runs: Stop puts the scene back)
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Z, false) && io.KeyCtrl && !io.KeyShift) {
         undoEdit();
@@ -170,22 +170,22 @@ void Editor::handleEditorKeys() {
 }
 
 void Editor::commitEdit() {
-    if (!playing) {
-        editHistory.commit(scene);
+    if (!gameRunning()) {
+        activeHistory().commit(scene);
     }
 }
 
 // (The selection stays when its entity is still there: ids are kept by undo; one an undo removed is deselected)
 void Editor::undoEdit() {
     finishGizmoDrag();
-    if (!playing && editHistory.undo(scene) && scene.find(selected) == nullptr) {
+    if (!gameRunning() && activeHistory().undo(scene) && scene.find(selected) == nullptr) {
         selected = 0;
     }
 }
 
 void Editor::redoEdit() {
     finishGizmoDrag();
-    if (!playing && editHistory.redo(scene) && scene.find(selected) == nullptr) {
+    if (!gameRunning() && activeHistory().redo(scene) && scene.find(selected) == nullptr) {
         selected = 0;
     }
 }

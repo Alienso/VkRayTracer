@@ -159,10 +159,10 @@ void Editor::buildMenuBar() {
         if (ImGui::MenuItem("Frame the selection", "F", false, scene.find(selected) != nullptr)) {
             frameSelection();
         }
-        if (ImGui::MenuItem("Undo", "Ctrl+Z", false, editHistory.canUndo() && !playing)) {
+        if (ImGui::MenuItem("Undo", "Ctrl+Z", false, activeHistory().canUndo() && !gameRunning())) {
             undoEdit();
         }
-        if (ImGui::MenuItem("Redo", "Ctrl+Y", false, editHistory.canRedo() && !playing)) {
+        if (ImGui::MenuItem("Redo", "Ctrl+Y", false, activeHistory().canRedo() && !gameRunning())) {
             redoEdit();
         }
         ImGui::Separator();
@@ -192,11 +192,30 @@ void Editor::buildMenuBar() {
                                     "Runs the game on the scene. Stop puts the scene back as it was:\n"
                                     "what changes while playing, also by hand, isn't kept.");
     }
+    if (wasPlaying) {
+        bool wasPaused = paused;
+        if (wasPaused) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.3f, 1.0f));
+        }
+        bool pauseClicked = ImGui::MenuItem(wasPaused ? "Resume" : "Pause", "F6");
+        if (wasPaused) {
+            ImGui::PopStyleColor();
+        }
+        if (pauseClicked) {
+            wasPaused ? resume() : pause();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(wasPaused ? "The game goes on from where it stopped, with the changes made meanwhile." :
+                                       "Stops the world: the mouse is free and the editor works again (Esc too).");
+        }
+    }
 
     // Right-aligned: what is loading, the open scene, and whether it has unsaved changes
     std::string name = scenePath.empty() ? "new scene" : std::filesystem::path(scenePath).filename().string();
-    if (playing) {
-        name = "PLAYING (changes are undone by Stop)    " + name;
+    if (paused) {
+        name = "PAUSED (F6 resumes; changes are undone by Stop)    " + name;
+    } else if (playing) {
+        name = "PLAYING (Esc / F6 pauses; changes are undone by Stop)    " + name;
     }
     if (unsaved) {
         name += "  (unsaved changes)";
@@ -247,6 +266,9 @@ void Editor::buildOverlay() {
             ImGui::Text("CPU: %.2f ms (update %.2f, UI %.2f, render %.2f), waiting %.2f", cpuTimes.workMs(),
                         cpuTimes.ms[CpuFrameTimes::Update], cpuTimes.ms[CpuFrameTimes::Ui],
                         cpuTimes.ms[CpuFrameTimes::Render], cpuTimes.ms[CpuFrameTimes::Wait]);
+        }
+        if (paused) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "PAUSED (F6 resumes)");
         }
         if (playing && !gameStatus.empty()) {
             ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "%s", gameStatus.c_str());

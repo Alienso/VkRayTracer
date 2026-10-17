@@ -429,6 +429,26 @@ std::vector<WorldBox> Scene::selectionBoxes(EntityId id) const {
     return boxes;
 }
 
+bool Scene::modelBox(EntityId id, glm::vec3& min, glm::vec3& max) const {
+    const ModelComponent* component = model(id);
+    if (component == nullptr || !assets.isLoaded(component->model)) {
+        return false;
+    }
+    const SceneModel& sceneModel = assets.model(component->model);
+    glm::mat4 placed = component->originalSize ? glm::mat4(1.0f) : sceneModel.fit;
+    min = glm::vec3(1e30f);
+    max = glm::vec3(-1e30f);
+    for (int corner = 0; corner < 8; corner++) {
+        glm::vec3 p((corner & 1) ? sceneModel.boundsMax.x : sceneModel.boundsMin.x,
+                    (corner & 2) ? sceneModel.boundsMax.y : sceneModel.boundsMin.y,
+                    (corner & 4) ? sceneModel.boundsMax.z : sceneModel.boundsMin.z);
+        glm::vec3 q = glm::vec3(placed * glm::vec4(p, 1.0f));
+        min = glm::min(min, q);
+        max = glm::max(max, q);
+    }
+    return min.x <= max.x;
+}
+
 ModelComponent* Scene::model(EntityId id) {
     auto it = modelTable.find(id);
     return it == modelTable.end() ? nullptr : &it->second;

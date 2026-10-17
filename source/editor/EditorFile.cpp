@@ -136,7 +136,9 @@ void Editor::updateTitle() {
     if (unsaved) {
         title += " *";
     }
-    if (playing) {
+    if (paused) {
+        title += "  [paused]";
+    } else if (playing) {
         title += "  [playing]";
     }
     if (title != shownTitle) {
@@ -305,7 +307,26 @@ void Editor::play() {
                                 // undone while playing, and Stop puts the scene back)
     playSnapshot = scene.text();
     playing = true;
-    log(LogLevel::Info, "Playing: what changes now is undone by Stop");
+    paused = false;
+    log(LogLevel::Info, "Playing: what changes now is undone by Stop (Esc / F6 pauses)");
+}
+
+void Editor::pause() {
+    if (!playing || paused) {
+        return;
+    }
+    paused = true;
+    pauseHistory.reset(scene);  // (again by the program, once the scene is back to the game's own transforms)
+    log(LogLevel::Info, "Paused: edit the scene, then F6 resumes the game with the changes");
+}
+
+void Editor::resume() {
+    if (!playing || !paused) {
+        return;
+    }
+    finishGizmoDrag();
+    paused = false;
+    pauseHistory.reset(scene);  // (the pause's changes can't be undone once the game went on from them)
 }
 
 void Editor::stop() {
@@ -313,6 +334,7 @@ void Editor::stop() {
         return;
     }
     playing = false;
+    paused = false;
     try {
         // Warnings would be the ones opening the scene gave (the text is the scene's own): not logged again
         scene.loadText(playSnapshot, "the scene at Play");

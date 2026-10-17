@@ -7,8 +7,38 @@
 
 static const glm::vec3 worldUp = {0.0f, 1.0f, 0.0f};
 
+static bool down(GLFWwindow* window, int key) {
+    return glfwGetKey(window, key) == GLFW_PRESS;
+}
+
 void CameraController::update(Camera& camera, GLFWwindow* window, float deltaTime, bool keyboardAvailable,
-                              bool mouseAvailable) {
+                              bool mouseAvailable, bool captured) {
+    if (captured) {
+        looking = false;  // (the cursor mode is the window's now)
+        double x, y;
+        glfwGetCursorPos(window, &x, &y);
+        if (capturedRead) {
+            camera.yaw += (float) (x - lastCursorX) * mouseSensitivity;
+            camera.pitch = std::clamp(camera.pitch - (float) (y - lastCursorY) * mouseSensitivity, -89.0f, 89.0f);
+        }
+        lastCursorX = x;
+        lastCursorY = y;
+        capturedRead = true;
+        glm::vec3 movement(0.0f);
+        if (down(window, GLFW_KEY_W)) movement += camera.forward();
+        if (down(window, GLFW_KEY_S)) movement -= camera.forward();
+        if (down(window, GLFW_KEY_D)) movement += camera.right();
+        if (down(window, GLFW_KEY_A)) movement -= camera.right();
+        if (down(window, GLFW_KEY_SPACE)) movement += worldUp;
+        if (down(window, GLFW_KEY_LEFT_CONTROL)) movement -= worldUp;
+        if (glm::length(movement) > 0.0f) {
+            float speed = moveSpeed * (down(window, GLFW_KEY_LEFT_SHIFT) ? 4.0f : 1.0f);
+            camera.position += glm::normalize(movement) * speed * deltaTime;
+        }
+        return;
+    }
+    capturedRead = false;
+
     // Mouse look while the right button is held. The cursor is hidden and locked during that time.
     bool rightButtonDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     if (rightButtonDown && !looking && mouseAvailable) {

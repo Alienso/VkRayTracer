@@ -92,8 +92,10 @@ private:
     InputState readInput(bool keyboard, bool mouse);
     // The editor's selection to the renderer (its outline), its clicks to the renderer and their answers back
     void updateSelection();
-    // Starts or stops the game as the editor plays or stops, and runs this frame's steps
+    // Starts or stops the game as the editor plays or stops, pauses and resumes it, and runs this frame's steps
     void updateGame(float deltaTime, const InputState& input);
+    // The mouse is the game's while it runs and wants it (Game::capturesMouse): captured, and ImGui doesn't see it
+    void updateMouseCapture();
 };
 
 #endif //VULKANDEMO_APPLICATION_H
