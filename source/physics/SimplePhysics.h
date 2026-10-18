@@ -48,6 +48,7 @@ public:
     BodyId addBox(const BoxShape& shape, const Transform& transform) override;
     void setTransform(BodyId body, const Transform& transform) override;
     void setEnabled(BodyId body, bool enabled) override;
+    void setTag(BodyId body, uint64_t tag) override;
     void remove(BodyId body) override;
     [[nodiscard]] size_t bodyCount() const override { return liveBodies; }
     GroupMove moveBodies(const std::vector<BodyId>& group, const Transform& from, const Transform& to) override;
@@ -59,6 +60,8 @@ public:
     CharacterState moveCharacter(CharacterId character, const glm::vec3& wantedVelocity, float jumpSpeed,
                                  const glm::vec3& gravity, float seconds) override;
 
+    [[nodiscard]] std::optional<RayHit> rayCast(const glm::vec3& from, const glm::vec3& direction,
+                                                float maxDistance) const override;
     [[nodiscard]] bool overlapsCapsule(const CapsuleShape& shape, const Transform& transform) const override;
 
     void clear() override;
@@ -72,6 +75,7 @@ private:
         glm::vec3 anchor;       // which side of the openings it is on (its pieces)
         glm::vec3 min, max;     // its bounds
         std::vector<portals::PortalPiece> pieces;  // near an opening (else empty: whole, where it is)
+        uint64_t tag = 0;
         bool enabled = true;
         bool alive = false;
     };

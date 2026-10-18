@@ -18,6 +18,7 @@
 #define VULKANDEMO_PHYSICSWORLD_H
 
 #include <memory>
+#include <optional>
 #include <vector>
 #include "physics/PhysicsTypes.h"
 #include "portals/PortalPieces.h"
@@ -38,6 +39,21 @@ struct CharacterSettings {
 struct GroupMove {
     Transform reached;     // the group's transform where it stopped (the target when nothing blocked it)
     bool blocked = false;
+};
+
+// What a ray hit (rayCast): a face of a body's box
+struct RayHit {
+    BodyId body;
+    uint64_t tag = 0;                                // the body's (setTag)
+    glm::vec3 point = glm::vec3(0.0f);               // where, past the portals it went through
+    glm::vec3 normal = glm::vec3(0.0f, 1.0f, 0.0f);  // the face's, outwards
+    float distance = 0.0f;                           // along the ray, through the portals
+    glm::vec3 direction = glm::vec3(0.0f);           // the ray's where it hit (turned by the portals)
+    // The face: a rectangle around faceCenter, faceHalf[i] along faceAxes[i] (unit length)
+    glm::vec3 faceCenter = glm::vec3(0.0f);
+    glm::vec3 faceAxes[2] = {glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)};
+    glm::vec2 faceHalf = glm::vec2(0.0f);
+    glm::mat4 throughPortals = glm::mat4(1.0f);      // what the portals it went through did to points
 };
 
 struct CharacterState {
@@ -63,6 +79,7 @@ public:
     virtual BodyId addBox(const BoxShape& shape, const Transform& transform) = 0;
     virtual void setTransform(BodyId body, const Transform& transform) = 0;
     virtual void setEnabled(BodyId body, bool enabled) = 0;  // a disabled body is passed through
+    virtual void setTag(BodyId body, uint64_t tag) = 0;      // the game's own value for it (rayCast gives it back)
     virtual void remove(BodyId body) = 0;
     [[nodiscard]] virtual size_t bodyCount() const = 0;
     // Moves the bodies together as one rigid thing whose transform goes from `from` (where they are now) to `to`
@@ -83,6 +100,11 @@ public:
     // Returns where it is now.
     virtual CharacterState moveCharacter(CharacterId character, const glm::vec3& wantedVelocity, float jumpSpeed,
                                          const glm::vec3& gravity, float seconds) = 0;
+
+    // The nearest enabled body a ray (from, direction) hits within maxDistance, going through the portals' openings
+    // as the camera does (bodies it starts inside are passed)
+    [[nodiscard]] virtual std::optional<RayHit> rayCast(const glm::vec3& from, const glm::vec3& direction,
+                                                        float maxDistance) const = 0;
 
     // Whether a capsule (its segment along the transform's Y, centered on its position) overlaps an enabled body
     [[nodiscard]] virtual bool overlapsCapsule(const CapsuleShape& shape, const Transform& transform) const = 0;

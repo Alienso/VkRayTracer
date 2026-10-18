@@ -201,6 +201,23 @@ void Editor::drawColliderBoxes() {
     }
 }
 
+void Editor::drawCrosshair() {
+    ImGuiIO& io = ImGui::GetIO();
+    // The view's center: the camera's projection spans the whole window (as the collider outlines')
+    ImVec2 c(std::floor(io.DisplaySize.x * 0.5f) + 0.5f, std::floor(io.DisplaySize.y * 0.5f) + 0.5f);
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    const float gap = 4.0f;
+    const float length = 9.0f;
+    for (int pass = 0; pass < 2; pass++) {  // a dark outline under a light cross, seen on any background
+        ImU32 color = pass == 0 ? IM_COL32(0, 0, 0, 160) : IM_COL32(255, 255, 255, 230);
+        float thickness = pass == 0 ? 4.0f : 2.0f;
+        drawList->AddLine(ImVec2(c.x - gap - length, c.y), ImVec2(c.x - gap, c.y), color, thickness);
+        drawList->AddLine(ImVec2(c.x + gap, c.y), ImVec2(c.x + gap + length, c.y), color, thickness);
+        drawList->AddLine(ImVec2(c.x, c.y - gap - length), ImVec2(c.x, c.y - gap), color, thickness);
+        drawList->AddLine(ImVec2(c.x, c.y + gap), ImVec2(c.x, c.y + gap + length), color, thickness);
+    }
+}
+
 void Editor::handleEditorKeys() {
     ImGuiIO& io = ImGui::GetIO();
     deleteKeyUsed = false;

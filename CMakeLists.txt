@@ -60,9 +60,10 @@ target_compile_definitions(vulkanDemoCore PRIVATE VULKANDEMO_RESOURCE_DIR="${PRO
 target_link_libraries(vulkanDemoCore vulkanDemoPortals)
 
 # Portal pieces (PORTAL_PHYSICS_PLAN.md): objects half through portals, for drawing and collision, and what going
-# through an end does. Only glm
+# through an end does, where the portal gun puts an end. Only glm
 add_library(vulkanDemoPortals STATIC
-        source/portals/PortalPieces.cpp source/portals/PortalPieces.h source/portals/PortalTransform.h)
+        source/portals/PortalPieces.cpp source/portals/PortalPieces.h source/portals/PortalTransform.h
+        source/portals/PortalPlacement.cpp source/portals/PortalPlacement.h)
 
 # Physics (PHYSICS_PLAN.md): colliders and the player's capsule behind an interface (physics/PhysicsWorld.h). Knows
 # nothing of the scene, the assets or the game: only glm and the portal pieces
@@ -76,7 +77,7 @@ target_link_libraries(vulkanDemoPhysics vulkanDemoPortals)
 add_library(vulkanDemoGame STATIC
         source/game/Game.cpp source/game/Game.h source/game/GameLoop.h source/game/GameProperties.cpp
         source/game/Behaviour.h source/game/Behaviours.cpp source/game/Behaviours.h source/game/Colliders.h
-        source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Slide.cpp
+        source/game/behaviours/Spin.cpp source/game/behaviours/Bob.cpp source/game/behaviours/Slide.cpp source/game/behaviours/PortalGun.cpp
         source/game/behaviours/Door.cpp
         source/game/behaviours/Pickup.cpp source/game/behaviours/Trigger.cpp source/game/behaviours/Spawner.cpp
         source/game/behaviours/CameraPath.cpp source/game/behaviours/Collider.cpp source/game/behaviours/Player.cpp
@@ -134,7 +135,8 @@ add_executable(tests
         tests/PlaySnapshotTests.cpp tests/GameTests.cpp tests/StepInterpolationTests.cpp
         tests/GameInteractionTests.cpp tests/SelectionTests.cpp
         tests/EditHistoryTests.cpp tests/PhysicsTests.cpp tests/GamePauseTests.cpp
-        tests/GamePhysicsTests.cpp tests/GamePortalTests.cpp tests/PortalPiecesTests.cpp)
+        tests/GamePhysicsTests.cpp tests/GamePortalTests.cpp tests/PortalPiecesTests.cpp
+        tests/PortalPlacementTests.cpp tests/GamePortalGunTests.cpp)
 target_include_directories(tests PRIVATE ${PROJECT_SOURCE_DIR}/include/catch2)
 set_source_files_properties(include/catch2/catch_amalgamated.cpp PROPERTIES COMPILE_OPTIONS "-w")
 target_compile_definitions(tests PRIVATE VULKANDEMO_SCENES_DIR="${PROJECT_SOURCE_DIR}/scenes")  # the checked-in scenes
@@ -144,12 +146,12 @@ add_test(NAME unit COMMAND tests)
 
 # Scene files (scenes/): the editor opens and saves them in the scenes folder next to the executable. Copied there
 # when CMake runs, and only those that aren't there yet: a build never overwrites a scene saved there. To keep a
-# saved scene in git, copy it back into scenes/.
-file(GLOB sceneFiles ${PROJECT_SOURCE_DIR}/scenes/*.json)
-foreach (sceneFile IN LISTS sceneFiles)
-    get_filename_component(sceneName ${sceneFile} NAME)
+# saved scene in git, copy it back into scenes/. Subfolders are kept (the editor lists their scenes with the folder).
+file(GLOB_RECURSE sceneFiles RELATIVE ${PROJECT_SOURCE_DIR}/scenes ${PROJECT_SOURCE_DIR}/scenes/*.json)
+foreach (sceneName IN LISTS sceneFiles)
     if (NOT EXISTS ${CMAKE_BINARY_DIR}/scenes/${sceneName})
-        file(COPY ${sceneFile} DESTINATION ${CMAKE_BINARY_DIR}/scenes)
+        get_filename_component(sceneFolder ${sceneName} DIRECTORY)
+        file(COPY ${PROJECT_SOURCE_DIR}/scenes/${sceneName} DESTINATION ${CMAKE_BINARY_DIR}/scenes/${sceneFolder})
     endif ()
 endforeach ()
 

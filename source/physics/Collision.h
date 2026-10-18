@@ -26,6 +26,11 @@ std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA,
                                      const glm::vec3& halfB, std::vector<glm::vec3>* points = nullptr,
                                      std::vector<float>* depths = nullptr);
 
+// A ray (origin, unit direction) into a turned box from outside it: how far along it goes in (up to maxDistance), and
+// through which face (axis 0-2 of the box, sign: its + or - face). False when it misses, or starts inside the box.
+bool rayBoxHit(const Transform& box, const glm::vec3& halfExtents, const glm::vec3& origin,
+               const glm::vec3& direction, float maxDistance, float& distance, int& axis, float& sign);
+
 // The axis-aligned box around a turned box
 void boxBounds(const Transform& box, const glm::vec3& halfExtents, glm::vec3& min, glm::vec3& max);
 

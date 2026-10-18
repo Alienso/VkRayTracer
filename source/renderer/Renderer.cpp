@@ -261,8 +261,14 @@ void Renderer::drawFrame() {
     presentInfo.pResults = nullptr;
 
     result = timedWait(frameWaitMs, [&]() { return vkp.queuePresent(gpu.presentQueue, &presentInfo); });
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
-        framebufferResized = false;
+    // (A resize to the size it already has, such as maximizing before the swapchain was made, makes nothing anew:
+    // a needless swapchain change at startup froze the NVIDIA overlay's banner)
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window, &width, &height);
+    bool sizeChanged = framebufferResized && (static_cast<uint32_t>(width) != swapChainExtent.width ||
+                                              static_cast<uint32_t>(height) != swapChainExtent.height);
+    framebufferResized = false;
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || sizeChanged) {
         recreateSwapChain();
     } else if (result != VK_SUCCESS) {
         throw std::runtime_error("failed to present swap chain image!");

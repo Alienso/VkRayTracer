@@ -818,6 +818,29 @@ straight part of what is left along it (twice at most).
 - Where: SimplePhysicsWorld::moveBodies (source/physics/SimplePhysics.cpp), Collider::updateAll
   (game/behaviours/Collider.cpp).
 
+### The portal gun
+Left and right click put the gun's pair's ends where a ray from the camera hits a collider (PhysicsWorld::rayCast,
+portals::placePortalEnd).
+- Only colliders take portals: a wall drawn without a collider is shot through (mesh colliders, PHYSICS_PLAN.md
+  option B, would fix it).
+- An end is fitted to the box face it hit only: another collider covering part of that face (a wall standing on a
+  floor) or the player standing there isn't checked, so an end can reach a little into a neighbouring wall. Portal
+  ends on the same face are: the gun's own other end is pushed away from; a spot that would cover another pair's end
+  takes no end (it isn't slid aside).
+- On a wall an end hangs down from the hit, or stands on what is below when there is too little room: the room below
+  is found by three rays down the wall (its middle and near both sides), so a thin ledge between them isn't seen.
+  On floors and ceilings it is centered on the hit.
+- An end becomes a child of the entity it was put on (it moves with it, is hidden with it; its scale is taken back
+  out). Under an entity scaled differently along a floor's two axes, an end turned at an angle would be sheared:
+  its top then goes along the floor's nearest axis instead of the shot's way. Removing that entity removes the end,
+  and so its other end too: the gun makes a new pair.
+- A collider offset from its entity (its "offset", or a model whose box isn't centered) still puts the end under
+  that entity: what moves the entity moves the end.
+- Moving an end while something is part way through it: its part at the other end is gone at once, and collision
+  pushes the rest out of the wall.
+- One gun per game (it owns its pair); it shoots from the camera, so it also works without a player body.
+- Where: game/behaviours/PortalGun.cpp, portals/PortalPlacement.cpp, SimplePhysicsWorld::rayCast.
+
 ### Distances are from the eyes
 Doors, pickups and triggers measure from the camera's position: with a player that is its eyes, 1.65 m up, so a
 pickup on the floor needs a radius over 1.65 (the scenes use 1.5 with coins 0.5 up). They could use the body

@@ -6,6 +6,7 @@
 #include <cmath>
 #include "physics/Collision.h"
 #include "physics/SimplePhysics.h"
+#include "portals/PortalTransform.h"
 
 namespace physics {
 
@@ -235,6 +236,12 @@ void SimplePhysicsWorld::setTransform(BodyId id, const Transform& transform) {
 void SimplePhysicsWorld::setEnabled(BodyId id, bool enabled) {
     if (Body* body = findBody(id)) {
         body->enabled = enabled;
+    }
+}
+
+void SimplePhysicsWorld::setTag(BodyId id, uint64_t tag) {
+    if (Body* body = findBody(id)) {
+        body->tag = tag;
     }
 }
 
@@ -754,6 +761,83 @@ CharacterState SimplePhysicsWorld::moveCharacter(CharacterId id, const glm::vec3
     character->state = CharacterState{moving.feet,         moving.velocity,      moving.ground,
                                       moving.groundNormal, moving.crossings > 0, moving.crossing};
     return character->state;
+}
+
+std::optional<RayHit> SimplePhysicsWorld::rayCast(const glm::vec3& from, const glm::vec3& direction,
+                                                  float maxDistance) const {
+    if (glm::length(direction) < 1e-12f) {
+        return std::nullopt;
+    }
+    glm::vec3 origin = from;
+    glm::vec3 d = glm::normalize(direction);
+    float left = maxDistance;
+    float travelled = 0.0f;
+    glm::mat4 through(1.0f);
+    int cameOutOf = -1;  // (the ray starts on its plane)
+    for (int crossing = 0; crossing <= portalDepth; crossing++) {
+        // The nearest body ahead
+        const Body* nearest = nullptr;
+        float nearestDistance = left;
+        int axis = 0;
+        float sign = 1.0f;
+        for (const Body& body : bodies) {
+            float t;
+            int k;
+            float s;
+            if (body.alive && body.enabled &&
+                rayBoxHit(body.solid, body.halfExtents, origin, d, nearestDistance, t, k, s) &&
+                (nearest == nullptr || t < nearestDistance)) {
+                nearest = &body;
+                nearestDistance = t;
+                axis = k;
+                sign = s;
+            }
+        }
+        // An opening before it: on from the other end
+        int opening = -1;
+        float openingAlong = 2.0f;
+        glm::vec3 end = origin + d * nearestDistance;
+        for (size_t i = 0; i < openings.size(); i++) {
+            float along;
+            if (static_cast<int>(i) != cameOutOf && portals::crossesOpening(openings[i], origin, end, along) &&
+                along < openingAlong) {
+                opening = static_cast<int>(i);
+                openingAlong = along;
+            }
+        }
+        if (opening >= 0) {
+            if (crossing == portalDepth) {
+                return std::nullopt;  // (lost, as the renderer's rays past "Max portal crossings")
+            }
+            glm::mat4 toPartner = portalToPartner(openings[opening].end, openings[opening ^ 1].end);
+            float t = openingAlong * nearestDistance;
+            travelled += t;
+            left -= t;
+            origin = apply(toPartner, origin + d * t);
+            d = glm::normalize(glm::mat3(toPartner) * d);
+            through = toPartner * through;
+            cameOutOf = opening ^ 1;
+            continue;
+        }
+        if (nearest == nullptr) {
+            return std::nullopt;
+        }
+        RayHit hit;
+        hit.body = BodyId{static_cast<uint32_t>(nearest - bodies.data()) + 1};
+        hit.tag = nearest->tag;
+        hit.point = origin + d * nearestDistance;
+        hit.distance = travelled + nearestDistance;
+        hit.direction = d;
+        glm::mat3 turn = glm::mat3_cast(nearest->solid.rotation);
+        hit.normal = turn[axis] * sign;
+        hit.faceCenter = nearest->solid.position + hit.normal * nearest->halfExtents[axis];
+        hit.faceAxes[0] = turn[(axis + 1) % 3];
+        hit.faceAxes[1] = turn[(axis + 2) % 3];
+        hit.faceHalf = glm::vec2(nearest->halfExtents[(axis + 1) % 3], nearest->halfExtents[(axis + 2) % 3]);
+        hit.throughPortals = through;
+        return hit;
+    }
+    return std::nullopt;
 }
 
 bool SimplePhysicsWorld::overlapsCapsule(const CapsuleShape& shape, const Transform& transform) const {

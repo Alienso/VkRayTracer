@@ -83,6 +83,9 @@ void portalPieces(const OrientedBox& box, const glm::vec3& anchor, const std::ve
 // Whether a point of the world is in the piece (its cuts' regions; points on a cut's plane are kept)
 bool pieceKeeps(const PortalPiece& piece, const glm::vec3& worldPoint);
 
+// Whether the line from a to b goes through the opening (into either side), and where along it (0..1)
+bool crossesOpening(const PortalOpening& opening, const glm::vec3& a, const glm::vec3& b, float& along);
+
 // The line from `from` to `to` through the openings, as the camera and the game's entities go (Scene::crossPortals):
 // the nearest opening it goes through first (either way: into the back of an end comes out of the back of the other),
 // then on from the other end, not back into the end it came out of; at most maxCrossings. total: what the crossings do

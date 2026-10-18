@@ -9,6 +9,9 @@ void Window::create(int width, int height, const char* title) {
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    // Hidden until the program can draw into it (show): shown at once, it sat there for seconds with nothing drawn
+    // (a maximized one showed its first size's blank area in a black window)
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     window = glfwCreateWindow(width, height, title, nullptr, nullptr);
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);

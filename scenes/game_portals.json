@@ -79,7 +79,7 @@
     },
     {
       "id": 2,
-      "name": "Player (WASD, Shift, Space)",
+      "name": "Player (WASD, Shift, Space; left / right click: portals)",
       "parent": 0,
       "position": [
         0.0,
@@ -100,6 +100,10 @@
       "game": [
         {
           "type": "player",
+          "properties": {}
+        },
+        {
+          "type": "portalGun",
           "properties": {}
         }
       ]

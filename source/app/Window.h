@@ -12,8 +12,10 @@
 
 class Window {
 public:
-    // GLFW and the window (no OpenGL context: Vulkan draws into it)
+    // GLFW and the window (no OpenGL context: Vulkan draws into it), hidden until show: maximize and fullscreen
+    // work on it hidden, so it appears at its size
     void create(int width, int height, const char* title);
+    void show() { glfwShowWindow(window); }
     void destroy();
 
     [[nodiscard]] GLFWwindow* handle() const { return window; }

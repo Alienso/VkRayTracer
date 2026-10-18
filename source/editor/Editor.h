@@ -66,6 +66,8 @@ public:
     [[nodiscard]] bool blendGameSteps() const { return blendSteps; }
     // What the game says over the image while playing ("Pickups: 2 / 5"; "": nothing)
     void setGameStatus(const std::string& text) { gameStatus = text; }
+    // A crosshair at the image's center while the game runs (the game aims with the view's center: the portal gun)
+    void setCrosshair(bool on) { crosshair = on; }
     // Collider outlines (the game's boxes, from the program: game/Colliders.h): drawn over the image while the game
     // doesn't run, for the selected entity, or for all of them (View > "Collider outlines"). colliderBoxesFor:
     // whose the program should hand over (0: all), when wantsColliderBoxes.
@@ -101,6 +103,7 @@ private:
     bool showColliders = false;  // all collider outlines, not only the selection's
     std::vector<WorldBox> colliderBoxes;
     void drawColliderBoxes();
+    void drawCrosshair();
     bool uiHidden = false;    // F1: only the image
     bool resetLayout = false;  // put the panels back where they start (also the first run, without imgui.ini)
     // Log panel: what loading, saving and capturing said
@@ -153,7 +156,8 @@ private:
     std::string savedText;   // Scene::contentText at the last new / open / save: different now = unsaved changes
     bool unsaved = false;    // checked once a second (contentText isn't free in huge scenes), and before asking
     double unsavedCheckTime = -1.0;
-    std::vector<std::string> sceneFiles;  // .json files in scenesDirectory (scanned when File > Open opens)
+    // .json files in scenesDirectory and its subfolders, as paths in it (scanned when File > Open opens)
+    std::vector<std::string> sceneFiles;
     char saveAsName[128] = "";
     bool askSaveAs = false;     // open the Save As question this frame
     bool playing = false;
@@ -162,6 +166,7 @@ private:
     EditHistory& activeHistory() { return paused ? pauseHistory : editHistory; }
     bool blendSteps = true;
     std::string gameStatus;
+    bool crosshair = false;
     std::string playSnapshot;   // Scene::text at Play
     std::string saveError;      // why the last save failed (also in the log), shown in the save questions
     // New / Open / Exit wait for the unsaved-changes question

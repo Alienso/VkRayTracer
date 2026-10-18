@@ -33,6 +33,21 @@ void colliderBox(const Scene& scene, EntityId entity, GameProperties& properties
     }
 }
 
+bool colliderPortalable(const Scene& scene, EntityId entity) {
+    const std::vector<GameComponent>* components = scene.game(entity);
+    if (components == nullptr) {
+        return false;
+    }
+    for (const GameComponent& component : *components) {
+        if (component.type == "collider") {
+            std::vector<std::string> ignored;  // (said at Play)
+            GameProperties properties(component.properties, "", ignored);
+            return properties.flag("portalable", true);
+        }
+    }
+    return false;
+}
+
 std::vector<WorldBox> colliderBoxes(const Scene& scene, EntityId only, int maxDepth) {
     std::vector<WorldBox> boxes;
     std::vector<portals::PortalOpening> openings = scene.portalOpenings();
@@ -102,8 +117,10 @@ struct Collider {
         "(a unit cube without one); else that size, centered at offset, in the entity's own space (scaled with it).\n"
         "It moves with the entity (a door, a platform); while the entity is hidden it isn't solid.\n"
         "solid: when the game moves it, it stops at other colliders (and when it would squeeze the player) instead\n"
-        "of going through them; pushing the player is fine.";
-    static constexpr const char* defaults = R"({"size": [0, 0, 0], "offset": [0, 0, 0], "solid": false})";
+        "of going through them; pushing the player is fine.\n"
+        "portalable: the portal gun can put portals on it (when false, its shots still stop at it).";
+    static constexpr const char* defaults =
+        R"({"size": [0, 0, 0], "offset": [0, 0, 0], "solid": false, "portalable": true})";
     static constexpr bool removedWithEntity = true;
     static constexpr bool onSpawnedCopies = true;
 
@@ -141,6 +158,7 @@ struct Collider {
             }
             body = physics.addBox(shape, transform);
             physics.setEnabled(body, enabled);
+            physics.setTag(body, entity);  // (what a ray cast hit: the portal gun)
             placedHalf = shape.halfExtents;
         } else {
             physics.setTransform(body, transform);
@@ -185,6 +203,7 @@ struct Collider {
         collider.entity = context.entity.id;
         colliderBox(context.scene, context.entity.id, properties, collider.center, collider.halfSize);
         collider.solid = properties.flag("solid", false);
+        properties.flag("portalable", true);  // (read when a shot hits it: colliderPortalable)
         if (context.world.physics != nullptr) {
             collider.enabled = context.scene.visibleInWorld(context.entity.id);
             collider.place(context.scene, *context.world.physics);

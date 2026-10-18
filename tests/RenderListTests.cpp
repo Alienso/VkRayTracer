@@ -166,10 +166,17 @@ TEST_CASE("RenderList: a portal pair gives two portal ends and rim bars after th
     CHECK(t.list.changedInstances()[0].first == floorParts);
     requireSameAsRemade(t.scene, t.list);
 
-    // A hidden end: the pair is off
+    // A hidden end: the pair is off, the other end's rim still shows where it is (in its own colour: B's)
     t.scene.find(a)->visible = false;
     t.scene.buildRenderList(t.list);
     CHECK(t.list.portals.empty());
+    REQUIRE(t.list.instances.size() == floorParts + 4);
+    const SceneModel& rim = t.assets.model(t.scene.portalRimModel());
+    CHECK(t.list.instances[floorParts].mesh == rim.parts[1].meshIndex);
+    requireSameAsRemade(t.scene, t.list);
+    // Both hidden: nothing
+    t.scene.find(t.scene.find(pair)->children[1])->visible = false;
+    t.scene.buildRenderList(t.list);
     CHECK(t.list.instances.size() == floorParts);
 }
 

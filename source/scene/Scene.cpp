@@ -541,40 +541,46 @@ static glm::mat4 rimBar(const glm::mat4& end, glm::vec2 center, glm::vec2 along,
 // A rectangle's rim: four bars around it (top and bottom covering the corners). An ellipse's: short straight
 // bars along its edge, each touching it in its middle (so lying outside it: the tangent of a convex shape stays
 // outside), a little longer than their share of the edge so neighbors overlap on the outside.
-std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims(const std::vector<PlacedPair>& pairs) const {
+std::vector<std::pair<uint32_t, glm::mat4>> Scene::buildPortalRims(const std::vector<PlacedPair>& pairs,
+                                                                   const std::vector<LoneEnd>& lone) const {
     std::vector<std::pair<uint32_t, glm::mat4>> bars;
-    if (pairs.empty()) {
+    if (pairs.empty() && lone.empty()) {
         return bars;
     }
     const SceneModel& model = assets.model(rimModel);
-    for (const PlacedPair& pair : pairs) {
-        const PortalComponent& portal = *pair.portal;
+    // Each end's rim: the rim model's part 0 for A ends, 1 for B ends (their colours)
+    auto addRim = [&](const glm::mat4& end, const PortalComponent& portal, int part) {
         if (!portal.rim || portal.rimWidth <= 0.0f) {
-            continue;
+            return;
         }
         float w = portal.size.x * 0.5f, h = portal.size.y * 0.5f, r = portal.rimWidth, d = std::max(portal.rimDepth, 1e-4f);
-        for (int e = 0; e < 2; e++) {
-            uint32_t mesh = model.parts[e].meshIndex;
-            const glm::mat4& end = pair.ends[e];
-            if (portal.shape == PortalShape::Rectangle) {
-                bars.push_back({mesh, rimBar(end, {0.0f, h + r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
-                bars.push_back({mesh, rimBar(end, {0.0f, -h - r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
-                bars.push_back({mesh, rimBar(end, {-w - r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
-                bars.push_back({mesh, rimBar(end, {w + r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
-            } else {
-                const int segments = 48;
-                float step = glm::two_pi<float>() / segments;
-                for (int k = 0; k < segments; k++) {
-                    float angle = (k + 0.5f) * step;
-                    glm::vec2 point = {w * std::cos(angle), h * std::sin(angle)};
-                    glm::vec2 outward = glm::normalize(glm::vec2(std::cos(angle) / w, std::sin(angle) / h));
-                    glm::vec2 along = {-outward.y, outward.x};
-                    float edge = glm::length(glm::vec2(-w * std::sin(angle), h * std::cos(angle))) * step;
-                    float length = edge * (1.0f + r / std::min(w, h)) * 1.1f;
-                    bars.push_back({mesh, rimBar(end, point + outward * (r * 0.5f), along, length, r, d)});
-                }
+        uint32_t mesh = model.parts[part].meshIndex;
+        if (portal.shape == PortalShape::Rectangle) {
+            bars.push_back({mesh, rimBar(end, {0.0f, h + r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
+            bars.push_back({mesh, rimBar(end, {0.0f, -h - r * 0.5f}, {1.0f, 0.0f}, 2.0f * (w + r), r, d)});
+            bars.push_back({mesh, rimBar(end, {-w - r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
+            bars.push_back({mesh, rimBar(end, {w + r * 0.5f, 0.0f}, {0.0f, 1.0f}, 2.0f * h, r, d)});
+        } else {
+            const int segments = 48;
+            float step = glm::two_pi<float>() / segments;
+            for (int k = 0; k < segments; k++) {
+                float angle = (k + 0.5f) * step;
+                glm::vec2 point = {w * std::cos(angle), h * std::sin(angle)};
+                glm::vec2 outward = glm::normalize(glm::vec2(std::cos(angle) / w, std::sin(angle) / h));
+                glm::vec2 along = {-outward.y, outward.x};
+                float edge = glm::length(glm::vec2(-w * std::sin(angle), h * std::cos(angle))) * step;
+                float length = edge * (1.0f + r / std::min(w, h)) * 1.1f;
+                bars.push_back({mesh, rimBar(end, point + outward * (r * 0.5f), along, length, r, d)});
             }
         }
+    };
+    for (const PlacedPair& pair : pairs) {
+        for (int e = 0; e < 2; e++) {
+            addRim(pair.ends[e], *pair.portal, e);
+        }
+    }
+    for (const LoneEnd& end : lone) {
+        addRim(end.end, *end.portal, end.portal->endA ? 0 : 1);
     }
     return bars;
 }
@@ -854,6 +860,27 @@ std::vector<Scene::PlacedPair> Scene::placePairs(const std::vector<Placed>& plac
     return pairs;
 }
 
+std::vector<Scene::LoneEnd> Scene::placeLoneEnds(const std::vector<Placed>& placed) const {
+    std::vector<LoneEnd> lone;
+    if (portalTable.empty()) {
+        return lone;
+    }
+    std::unordered_map<EntityId, bool> shown;
+    for (const Placed& p : placed) {
+        shown[p.entity->id] = p.visible;
+    }
+    for (const Placed& p : placed) {
+        const PortalComponent* portal = this->portal(p.entity->id);
+        if (portal != nullptr && p.visible) {
+            auto other = shown.find(portal->other);
+            if (other == shown.end() || !other->second) {
+                lone.push_back({withoutScale(p.world), portal});
+            }
+        }
+    }
+    return lone;
+}
+
 // Whether the line from a to b crosses an end's opening (end: its placement without scale), and where along it
 // (0..1). The same test as the shader's portalOpeningHit, for a line instead of a ray.
 static bool crossesOpening(const glm::mat4& end, const PortalComponent& portal, const glm::vec3& a, const glm::vec3& b,
@@ -939,7 +966,7 @@ void Scene::buildRenderList(RenderList& list) {
         }
     }
     std::vector<PlacedPair> pairs = placePairs(placed);
-    std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims(pairs);
+    std::vector<std::pair<uint32_t, glm::mat4>> rims = buildPortalRims(pairs, placeLoneEnds(placed));
     // Model entities going into portal openings: their instances cut, their ghosts at the list's end (placeGhosts)
     std::vector<ModelPieces> pieces = findPortalPieces(models, pairs);
     std::vector<uint32_t> clips(models.size(), 0);

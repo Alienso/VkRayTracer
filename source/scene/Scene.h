@@ -309,9 +309,16 @@ private:
     template <typename Crossed>
     void crossPortals(const std::vector<PlacedPair>& pairs, const glm::vec3& from, const glm::vec3& to,
                       Crossed&& crossed) const;
-    // The bars of the pairs' rims: (mesh, world matrix) for each
+    // A visible end whose other end is hidden: the pair is off, but its rim shows where the end is (the portal gun
+    // placing its first end)
+    struct LoneEnd {
+        glm::mat4 end;
+        const PortalComponent* portal;
+    };
+    [[nodiscard]] std::vector<LoneEnd> placeLoneEnds(const std::vector<Placed>& placed) const;
+    // The bars of the pairs' rims and the lone ends': (mesh, world matrix) for each
     [[nodiscard]] std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims(
-            const std::vector<PlacedPair>& pairs) const;
+            const std::vector<PlacedPair>& pairs, const std::vector<LoneEnd>& lone) const;
     // A model entity as this frame has it (buildRenderList)
     struct PlacedModel {
         EntityId id;

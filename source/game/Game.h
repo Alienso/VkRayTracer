@@ -7,7 +7,7 @@
 // Distances (doors, pickups, triggers) are to the camera's position: the player's eyes when there is a player, a
 // body walking among colliders (physics/PhysicsWorld.h, owned here); else the fly camera.
 //
-// Behaviours: spin, bob, slide, door, pickup, trigger, spawner, collider, player, cameraPath, one file each in game/behaviours/ (what each
+// Behaviours: spin, bob, slide, door, pickup, trigger, spawner, collider, player, portalGun, cameraPath, one file each in game/behaviours/ (what each
 // does and reads: its help and defaults there; how a type is made: game/Behaviour.h). Several on one entity work
 // together when they move different things (spin turns, bob moves); two that turn it (spin and door) fight: the later
 // one in the update order (game/Behaviours.cpp) wins. The same type twice on one entity is a warning (only the first
@@ -59,6 +59,8 @@ public:
     // The game wants the mouse captured while it runs (the view turned by moving it): the player's, or the
     // game-style fly camera when nothing drives the camera (not under a camera path)
     [[nodiscard]] bool capturesMouse() const { return world.mouseLook || !world.controlsCamera; }
+    // A crosshair at the view's center: something aims with it (the portal gun)
+    [[nodiscard]] bool wantsCrosshair() const { return world.portalGun; }
     // The colliders and the player's body (our own SimplePhysics; another implementation goes in Game.cpp)
     [[nodiscard]] const physics::PhysicsWorld& physicsWorld() const { return *physics; }
     // What the overlay shows while playing ("" : nothing)

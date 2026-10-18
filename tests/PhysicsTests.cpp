@@ -616,3 +616,61 @@ TEST_CASE("Physics: a solid move far from portals is the same as without them", 
     CHECK(moves[0].reached.position == moves[1].reached.position);
     CHECK(moves[0].reached.rotation == moves[1].reached.rotation);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Ray casts
+
+TEST_CASE("Physics: a ray hits the nearest box's face, with its tag", "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    BodyId far = world->addBox({glm::vec3(0.5f)}, at({8.0f, 1.0f, 0.0f}));
+    BodyId near = world->addBox({glm::vec3(0.5f, 1.0f, 2.0f)}, at({4.0f, 1.0f, 0.0f}));
+    world->setTag(near, 42);
+    std::optional<RayHit> hit = world->rayCast({0.0f, 1.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, 100.0f);
+    REQUIRE(hit);
+    CHECK(hit->body.value == near.value);
+    CHECK(hit->tag == 42);
+    CHECK(hit->distance == Catch::Approx(3.5f));
+    CHECK(glm::distance(hit->point, glm::vec3(3.5f, 1.5f, 0.5f)) < 1e-5f);
+    CHECK(glm::distance(hit->normal, glm::vec3(-1.0f, 0.0f, 0.0f)) < 1e-5f);
+    CHECK(glm::distance(hit->faceCenter, glm::vec3(3.5f, 1.0f, 0.0f)) < 1e-5f);
+    // The face's other two axes, with the box's half sizes along them
+    for (int i = 0; i < 2; i++) {
+        CHECK(std::abs(glm::dot(hit->faceAxes[i], hit->normal)) < 1e-5f);
+        float along = std::abs(hit->faceAxes[i].y) > 0.5f ? 1.0f : 2.0f;
+        CHECK(hit->faceHalf[i] == Catch::Approx(along));
+    }
+    world->setEnabled(near, false);  // passed: the far one
+    hit = world->rayCast({0.0f, 1.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, 100.0f);
+    REQUIRE(hit);
+    CHECK(hit->body.value == far.value);
+    CHECK_FALSE(world->rayCast({0.0f, 1.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, 5.0f));  // too far
+    CHECK_FALSE(world->rayCast({0.0f, 1.5f, 0.5f}, {-1.0f, 0.0f, 0.0f}, 100.0f));  // nothing that way
+    CHECK(world->rayCast({8.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, 100.0f) == std::nullopt);  // (from inside it: passed)
+}
+
+TEST_CASE("Physics: a ray hits a turned box on the face it meets", "[Physics]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(1.0f)}, at({0.0f, 0.0f, -5.0f}, turned(30.0f, {0, 1, 0})));
+    std::optional<RayHit> hit = world->rayCast({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}, 100.0f);
+    REQUIRE(hit);
+    glm::vec3 expected = turned(30.0f, {0, 1, 0}) * glm::vec3(0.0f, 0.0f, 1.0f);
+    CHECK(glm::distance(hit->normal, expected) < 1e-5f);
+    CHECK(std::abs(glm::dot(hit->point - hit->faceCenter, hit->normal)) < 1e-5f);  // on the face's plane
+}
+
+TEST_CASE("Physics: a ray goes through an active portal and hits what is beyond the other end", "[Physics][Portals]") {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(0.5f)}, at({10.0f, 1.0f, 3.0f}));  // in front of B
+    CHECK_FALSE(world->rayCast({0.0f, 1.5f, 0.0f}, {0.0f, 0.0f, -1.0f}, 100.0f));  // no portal: nothing
+    world->setPortals(doorPair(), 8);
+    std::optional<RayHit> hit = world->rayCast({0.0f, 1.5f, 0.0f}, {0.0f, 0.0f, -1.0f}, 100.0f);
+    REQUIRE(hit);  // into A's front, out of B's front
+    CHECK(glm::distance(hit->point, glm::vec3(10.0f, 1.5f, 2.5f)) < 1e-4f);
+    CHECK(hit->distance == Catch::Approx(3.0f + 2.5f));
+    CHECK(glm::distance(hit->normal, glm::vec3(0.0f, 0.0f, -1.0f)) < 1e-5f);
+    CHECK(glm::distance(hit->direction, glm::vec3(0.0f, 0.0f, 1.0f)) < 1e-5f);
+    CHECK(glm::distance(glm::vec3(hit->throughPortals * glm::vec4(0.0f, 1.5f, -3.0f, 1.0f)),
+                        glm::vec3(10.0f, 1.5f, 0.0f)) < 1e-4f);
+    CHECK_FALSE(world->rayCast({0.0f, 1.5f, 0.0f}, {0.0f, 0.0f, -1.0f}, 5.0f));  // its length counts through
+}
+

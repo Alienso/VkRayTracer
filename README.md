@@ -54,7 +54,7 @@ denoises and upscales each frame with NVIDIA DLSS Ray Reconstruction.
   cut to that side), the rest stays, cut at the opening (`source/portals/PortalPieces.h`, shared with the
   physics). Through several pairs, or between ends facing each other, an object shows once per crossing, up to "Max
   portal crossings". Clicking either part selects the object; both are outlined.
-- Optional rims.
+- Optional rims. A pair with one end hidden is off; its visible end's rim still shows where it is.
 
 ### Noise reduction and real-time modes
 - **ReSTIR DI**: reservoir resampling of direct light at the first surface, with temporal and spatial reuse and
@@ -141,7 +141,12 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   entity and isn't solid while hidden; `"solid": true` also stops it at other colliders when the game moves it,
   pushing the player but not squeezing it) and `player` (the camera as a body: W/A/S/D walk, Shift runs, Space jumps,
   the mouse turns the view; it is stopped by colliders, slides along walls, walks up low steps and gentle slopes,
-  and falls under gravity). Without a player the camera flies (game-style) and stands in for the player.
+  and falls under gravity), and `portalGun` (left click shoots the first end of its portal pair onto the collider at
+  the view's center, right click the second; shooting again moves that end; the pair works once both ends are
+  placed; a crosshair shows where it aims; on a wall an end hangs down from where it hit, or stands on the floor
+  when there is too little room, so a shot at eye height can be walked into; an end goes under the entity it was
+  put on and moves with it; colliders with `"portalable": false` stop the shot but take no end).
+  Without a player the camera flies (game-style) and stands in for the player.
 - Physics (`source/physics/`, its own library: only glm and the portal pieces) sits behind an interface
   (`physics/PhysicsWorld.h`): our own SimplePhysics (turned boxes, a capsule character) now, collision with the
   models' own triangles or a library later, without changing the game. The selected entity's collider box is
@@ -153,7 +158,8 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
   the door, a moving lift, a solid box that slides into the wall (and pushes you), and a portal pair that leads
   behind the wall; `scenes/game_portals.json` has portals: one set in a wall (walk in), a solid box sliding through
-  one in a wall and back, a stick between two ends facing each other, and a stick through a chain of two pairs.
+  one in a wall and back, a stick between two ends facing each other, a stick through a chain of two pairs, and
+  the portal gun on the player.
   What it can't do yet: LIMITATIONS.md, "Game".
 - **Portals while playing**: anything the game moves through a portal's opening (the player, a bobbing thing, a
   spawned copy, with what is under it) comes out of the other end and carries on there; the player's view and

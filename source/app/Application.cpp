@@ -48,6 +48,7 @@ int Application::run() {
     editor.setGameTypes(Game::types());
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);  // true: install input callbacks, chaining the window's own
     renderer.init(window.handle(), renderList);
+    window.show();  // (ready to draw: the first frame follows)
     if (bench) {
         bench->start(renderSettings);
     } else if (playAtStart) {
@@ -223,6 +224,7 @@ void Application::updateGame(float deltaTime, const InputState& input) {
         game.stop();  // (the editor put the scene back)
         interpolation.clear();
         editor.setGameStatus("");
+        editor.setCrosshair(false);
     }
     if (!game.running()) {
         return;
@@ -253,6 +255,7 @@ void Application::updateGame(float deltaTime, const InputState& input) {
     });
     interpolation.blend(scene, steps, static_cast<float>(gameLoop.owed() / GameLoop::stepSeconds));
     editor.setGameStatus(game.status());
+    editor.setCrosshair(game.wantsCrosshair());
 }
 
 void Application::mainLoop() {
@@ -294,9 +297,11 @@ void Application::mainLoop() {
         updateMouseCapture();
         ImGui::Render();
         Clock::time_point uiEnd = Clock::now();
-        // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...)
+        // Leave mouse/keyboard to ImGui while it is using them (dragging a slider, typing in a field, ...). While the
+        // game has captured the cursor the mouse is its own (ImGui ignores it then, yet says it wants it while a
+        // button is down: the game's clicks were lost)
         ImGuiIO& io = ImGui::GetIO();
-        InputState input = readInput(!io.WantCaptureKeyboard, !io.WantCaptureMouse);
+        InputState input = readInput(!io.WantCaptureKeyboard, window.isCursorCaptured() || !io.WantCaptureMouse);
         glm::vec3 cameraFrom = scene.camera().position;  // (the game may move it too: through portals as well)
         Clock::time_point gameStart = Clock::now();
         updateGame(deltaTime, input);

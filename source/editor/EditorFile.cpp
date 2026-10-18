@@ -15,12 +15,19 @@
 void Editor::scanSceneFiles() {
     sceneFiles.clear();
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(scenesDirectory, error)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".json") {
-            sceneFiles.push_back(entry.path().filename().string());
+    for (auto entry = std::filesystem::recursive_directory_iterator(scenesDirectory, error);
+         entry != std::filesystem::recursive_directory_iterator(); entry.increment(error)) {
+        if (entry->is_regular_file() && entry->path().extension() == ".json") {
+            // Its path in the folder: those in subfolders keep theirs as a prefix ("test/portal_rooms.json")
+            sceneFiles.push_back(std::filesystem::relative(entry->path(), scenesDirectory, error).generic_string());
         }
     }
-    std::sort(sceneFiles.begin(), sceneFiles.end());
+    // The folder's own first, then each subfolder's together
+    std::sort(sceneFiles.begin(), sceneFiles.end(), [](const std::string& a, const std::string& b) {
+        bool aNested = a.find('/') != std::string::npos;
+        bool bNested = b.find('/') != std::string::npos;
+        return aNested != bNested ? bNested : a < b;
+    });
 }
 
 bool Editor::hasUnsavedChanges() {
@@ -99,6 +106,10 @@ bool Editor::openSceneFile(const std::string& path) {
 
 bool Editor::saveTo(const std::string& path) {
     try {
+        std::filesystem::path folder = std::filesystem::path(path).parent_path();
+        if (!folder.empty()) {
+            std::filesystem::create_directories(folder);  // (a name typed with a subfolder: "test/rooms")
+        }
         scene.save(path);
         scenePath = path;
         userSettings.addRecentScene(path);

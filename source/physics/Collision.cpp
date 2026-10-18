@@ -246,6 +246,42 @@ std::optional<Contact> boxBoxContact(const Transform& a, const glm::vec3& halfA,
     return contact;
 }
 
+bool rayBoxHit(const Transform& box, const glm::vec3& halfExtents, const glm::vec3& origin,
+               const glm::vec3& direction, float maxDistance, float& distance, int& axis, float& sign) {
+    // In the box's own space, where it is axis-aligned: the slabs' entries and exits
+    glm::quat toBox = glm::conjugate(box.rotation);
+    glm::vec3 o = toBox * (origin - box.position);
+    glm::vec3 d = toBox * direction;
+    float enter = -INFINITY;
+    float leave = INFINITY;
+    int enterAxis = -1;
+    for (int k = 0; k < 3; k++) {
+        if (std::abs(d[k]) < 1e-12f) {
+            if (std::abs(o[k]) > halfExtents[k]) {
+                return false;  // parallel to the slab, outside it
+            }
+            continue;
+        }
+        float t1 = (-halfExtents[k] - o[k]) / d[k];
+        float t2 = (halfExtents[k] - o[k]) / d[k];
+        if (t1 > t2) {
+            std::swap(t1, t2);
+        }
+        if (t1 > enter) {
+            enter = t1;
+            enterAxis = k;
+        }
+        leave = std::min(leave, t2);
+    }
+    if (enterAxis < 0 || enter > leave || enter < 0.0f || enter > maxDistance) {
+        return false;
+    }
+    distance = enter;
+    axis = enterAxis;
+    sign = d[enterAxis] > 0.0f ? -1.0f : 1.0f;  // (in through the face that faces the ray)
+    return true;
+}
+
 void boxBounds(const Transform& box, const glm::vec3& halfExtents, glm::vec3& min, glm::vec3& max) {
     glm::mat3 r = glm::mat3_cast(box.rotation);
     glm::vec3 extent(0.0f);

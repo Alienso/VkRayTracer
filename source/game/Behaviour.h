@@ -80,6 +80,7 @@ struct GameWorld {
     bool mouseLook = false;      // the player turns the view with the mouse (the program captures it)
     physics::PhysicsWorld* physics = nullptr;  // the colliders and the player's body (Game's)
     EntityId playerEntity = 0;   // goes through portals on its own (its eyes, with the camera), not by Game's pass
+    bool portalGun = false;      // there is one (only one: it owns its pair)
     // Entities moved by something other than the behaviours since the last step (a portal, the editor while paused):
     // solid colliders under them are put there, not moved there (which their way could block). Cleared after the
     // step's behaviours.
