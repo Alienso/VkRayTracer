@@ -223,7 +223,8 @@ private:
     void drawFrame();
 
     // VulkanInitHelper.cpp
-    void createSwapChain();
+    // oldSwapchain: the one this replaces (still alive: destroyed by the caller after)
+    void createSwapChain(VkSwapchainKHR oldSwapchain = VK_NULL_HANDLE);
     void createImageViews();
     void createRenderPass();
     void createFramebuffers();
@@ -233,7 +234,8 @@ private:
     void createRenderFinishedSemaphores();
     void destroyRenderFinishedSemaphores();
     void recreateSwapChain();
-    void cleanupSwapChain();
+    void cleanupSwapChainViews();  // its framebuffers and image views
+    void cleanupSwapChain();       // and the swapchain
 
     // Frame.cpp
     bool dlssActive() const { return activeRenderMode != static_cast<int>(RenderMode::Accumulation); }

@@ -27,7 +27,7 @@ VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR>& avai
 VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats);
 std::vector<char> readFile(const std::string& filename);
 
-void Renderer::createSwapChain() {
+void Renderer::createSwapChain(VkSwapchainKHR oldSwapchain) {
     SwapChainSupportDetails swapChainSupport = querySwapChainSupport(gpu.physicalDevice, gpu.surface);
 
     VkSurfaceFormatKHR surfaceFormat = chooseSwapSurfaceFormat(swapChainSupport.formats);
@@ -70,7 +70,9 @@ void Renderer::createSwapChain() {
     createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     createInfo.presentMode = presentMode;
     createInfo.clipped = VK_TRUE;
-    createInfo.oldSwapchain = VK_NULL_HANDLE;
+    // A replacement names the one it replaces: layers that keep state per swapchain (the NVIDIA overlay's "Alt+Z"
+    // banner, Streamline) carry it over instead of seeing one vanish and another appear (the banner froze)
+    createInfo.oldSwapchain = oldSwapchain;
 
     if (vkp.createSwapchain(gpu.device, &createInfo, nullptr, &swapChain) != VK_SUCCESS) {
         throw std::runtime_error("failed to create swap chain!");
@@ -281,10 +283,12 @@ void Renderer::recreateSwapChain() {
 
     vkp.deviceWaitIdle(gpu.device);
 
-    cleanupSwapChain();
+    cleanupSwapChainViews();
     destroyRenderFinishedSemaphores();
 
-    createSwapChain();
+    VkSwapchainKHR old = swapChain;
+    createSwapChain(old);
+    vkp.destroySwapchain(gpu.device, old, nullptr);
     createImageViews();
     createFramebuffers();
     createRenderFinishedSemaphores();
@@ -292,13 +296,17 @@ void Renderer::recreateSwapChain() {
     recreateRenderImages();
 }
 
-void Renderer::cleanupSwapChain() {
+void Renderer::cleanupSwapChainViews() {
     for (auto framebuffer : swapChainFramebuffers) {
         vkDestroyFramebuffer(gpu.device, framebuffer, nullptr);
     }
     for (auto imageView : swapChainImageViews) {
         vkDestroyImageView(gpu.device, imageView, nullptr);
     }
+}
+
+void Renderer::cleanupSwapChain() {
+    cleanupSwapChainViews();
     vkp.destroySwapchain(gpu.device, swapChain, nullptr);
 }
 
