@@ -76,7 +76,8 @@ void SimplePhysicsWorld::place(Body& body, const Transform& transform, const glm
     body.solid = {transform.position + transform.rotation * body.offset, transform.rotation};
     body.anchor = anchor;
     boxBounds(body.solid, body.halfExtents, body.min, body.max);
-    piecesOf({body.solid.position, glm::mat3_cast(body.solid.rotation), body.halfExtents}, anchor, body.pieces);
+    piecesOf({body.solid.position, glm::mat3_cast(body.solid.rotation), body.halfExtents}, anchor, openings,
+             body.pieces);
 }
 
 glm::vec3 SimplePhysicsWorld::anchorAfter(const glm::vec3& anchor, const glm::vec3& position) const {
@@ -91,6 +92,7 @@ void SimplePhysicsWorld::setPortals(const std::vector<portals::PortalOpening>& n
     }
     openings = newOpenings;
     portalDepth = maxDepth;
+    grownSlack = -1.0f;
     for (Body& body : bodies) {
         if (body.alive) {
             place(body, body.transform, body.anchor);
@@ -98,26 +100,42 @@ void SimplePhysicsWorld::setPortals(const std::vector<portals::PortalOpening>& n
     }
 }
 
+const std::vector<portals::PortalOpening>& SimplePhysicsWorld::openingsFor(const CharacterSettings& settings) const {
+    if (settings.portalSlack <= 0.0f) {
+        return openings;
+    }
+    if (grownSlack != settings.portalSlack) {
+        grownOpenings = openings;
+        for (portals::PortalOpening& opening : grownOpenings) {
+            opening.halfSize += glm::vec2(settings.portalSlack);
+        }
+        grownSlack = settings.portalSlack;
+    }
+    return grownOpenings;
+}
+
 void SimplePhysicsWorld::piecesOf(const portals::OrientedBox& box, const glm::vec3& anchor,
+                                  const std::vector<portals::PortalOpening>& within,
                                   std::vector<portals::PortalPiece>& pieces) const {
     pieces.clear();
     // (Only near an opening: within their bounding spheres)
     bool near = false;
     float reach = glm::length(box.half);
-    for (size_t i = 0; i < openings.size() && !near; i++) {
-        near = glm::distance(box.center, glm::vec3(openings[i].end[3])) <= reach + glm::length(openings[i].halfSize);
+    for (size_t i = 0; i < within.size() && !near; i++) {
+        near = glm::distance(box.center, glm::vec3(within[i].end[3])) <= reach + glm::length(within[i].halfSize);
     }
     if (!near) {
         return;
     }
-    portals::portalPieces(box, anchor, openings, portalDepth, maxPieces, pieces);
+    portals::portalPieces(box, anchor, within, portalDepth, maxPieces, pieces);
     if (pieces.size() == 1 && pieces[0].cutCount == 0) {
         pieces.clear();
     }
 }
 
 SimplePhysicsWorld::Capsule SimplePhysicsWorld::capsuleAt(const glm::vec3& a, const glm::vec3& b, float radius,
-                                                          const glm::vec3& anchor) const {
+                                                          const glm::vec3& anchor,
+                                                          const std::vector<portals::PortalOpening>& within) const {
     Capsule capsule{a, b, radius, glm::min(a, b) - glm::vec3(radius), glm::max(a, b) + glm::vec3(radius), {}};
     if (!openings.empty()) {
         glm::vec3 axis = b - a;
@@ -131,7 +149,7 @@ SimplePhysicsWorld::Capsule SimplePhysicsWorld::capsuleAt(const glm::vec3& a, co
             box.axes = glm::mat3(glm::cross(y, z), y, z);
         }
         box.half = glm::vec3(radius, 0.5f * length + radius, radius);
-        piecesOf(box, anchor, capsule.pieces);
+        piecesOf(box, anchor, within, capsule.pieces);
     }
     return capsule;
 }
@@ -140,7 +158,8 @@ SimplePhysicsWorld::Capsule SimplePhysicsWorld::characterAt(const CharacterSetti
                                                             const glm::vec3& feet) const {
     glm::vec3 a, b;
     segment(settings, feet, a, b);
-    return capsuleAt(a, b, settings.shape.radius, feet + glm::vec3(0.0f, settings.anchorHeight, 0.0f));
+    return capsuleAt(a, b, settings.shape.radius, feet + glm::vec3(0.0f, settings.anchorHeight, 0.0f),
+                     openingsFor(settings));
 }
 
 std::optional<Contact> SimplePhysicsWorld::contact(const Capsule& capsule, const Body& body) const {
@@ -612,7 +631,7 @@ void SimplePhysicsWorld::carry(const CharacterSettings& settings, Moving& moving
     }
     glm::vec3 up(0.0f, settings.anchorHeight, 0.0f);
     glm::mat4 crossing;
-    if (portals::crossOpenings(openings, from + up, moving.feet + up, portalDepth, crossing) == 0) {
+    if (portals::crossOpenings(openingsFor(settings), from + up, moving.feet + up, portalDepth, crossing) == 0) {
         return;
     }
     // The anchor goes through; the capsule stays upright under it
@@ -844,7 +863,7 @@ bool SimplePhysicsWorld::overlapsCapsule(const CapsuleShape& shape, const Transf
     glm::vec3 axis = transform.rotation * glm::vec3(0.0f, shape.halfHeight, 0.0f);
     glm::vec3 a = transform.position - axis;
     glm::vec3 b = transform.position + axis;
-    Capsule capsule = capsuleAt(a, b, shape.radius, transform.position);
+    Capsule capsule = capsuleAt(a, b, shape.radius, transform.position, openings);
     for (const Body& body : bodies) {
         if (body.alive && body.enabled && contact(capsule, body)) {
             return true;

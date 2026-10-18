@@ -16,10 +16,14 @@ struct Player {
         "The player: a body (radius, height) starting at the entity, the camera at its eyes (eyeHeight). The mouse\n"
         "turns the view (sensitivity: degrees per pixel), W/A/S/D walk at speed (Shift: runSpeed), Space jumps\n"
         "(jumpSpeed, gravity); slopes up to maxSlope degrees and ledges up to stepHeight are walked up. Falling below\n"
-        "respawnBelow (y) puts it back at the start. The entity follows it. One per game.";
+        "respawnBelow (y) puts it back at the start. The entity follows it. One per game.\n"
+        "portalSlack: how far the body may stick out past a portal's edges (every side) and still go through:\n"
+        "the wall around the opening doesn't stop it within that (a portal a little above the floor, the eyes at\n"
+        "its top edge). 0: only through the opening itself.";
     static constexpr const char* defaults =
         R"({"radius": 0.3, "height": 1.8, "eyeHeight": 1.65, "speed": 4, "runSpeed": 7, "jumpSpeed": 5,)"
-        R"( "gravity": 9.81, "maxSlope": 45, "stepHeight": 0.3, "respawnBelow": -50, "sensitivity": 0.1})";
+        R"( "gravity": 9.81, "maxSlope": 45, "stepHeight": 0.3, "respawnBelow": -50, "sensitivity": 0.1,)"
+        R"( "portalSlack": 0.25})";
     static constexpr bool removedWithEntity = true;
     static constexpr bool onSpawnedCopies = false;  // (one player)
 
@@ -37,6 +41,7 @@ struct Player {
         settings.maxSlopeDegrees = properties.number("maxSlope", 45.0f);
         settings.stepHeight = std::max(properties.number("stepHeight", 0.3f), 0.0f);
         settings.anchorHeight = properties.number("eyeHeight", 1.65f);  // (it goes through portals with its eyes)
+        settings.portalSlack = std::max(properties.number("portalSlack", 0.25f), 0.0f);
         Player player{context.entity.id,
                       physics::CharacterId(),
                       properties.number("eyeHeight", 1.65f),

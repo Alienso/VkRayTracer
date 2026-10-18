@@ -36,6 +36,7 @@ void GpuScene::buildPortalList() {
         gpu.halfHeight = std::max(portal.halfSize.y, 1e-4f);
         gpu.shape = static_cast<uint32_t>(portal.shape);
         gpu.toPartner = glm::mat4x3(portalToPartner(portal.world, partner.world));
+        gpu.lastFromPartner = glm::mat4x3(portalToPartner(partner.previous, portal.previous));
         framePortals.push_back(gpu);
     }
 }

@@ -156,15 +156,27 @@ TEST_CASE("RenderList: a portal pair gives two portal ends and rim bars after th
     size_t floorParts = t.visibleParts(t.scene.roots()[0]);
     CHECK(t.list.instances.size() == floorParts + 8);  // a rectangle's rim: 4 bars per end
 
-    // Moving an end rewrites the rims
+    // Moving an end rewrites the rims; the end and its rim bars know where they were (the motion vectors)
+    CHECK(t.list.portals[0].previous == t.list.portals[0].world);  // new: where it is
     uint64_t revision = t.list.instanceRevision();
     EntityId a = t.scene.find(pair)->children[0];
+    glm::mat4 before = t.list.portals[0].world;
+    glm::vec3 barBefore(t.list.instances[floorParts].world[3]);
     t.scene.find(a)->local.position.y += 1.0f;
     t.scene.buildRenderList(t.list);
     CHECK(t.list.instanceRevision() == revision);
     REQUIRE(t.list.changedInstances().size() == 1);
     CHECK(t.list.changedInstances()[0].first == floorParts);
+    CHECK(t.list.motionsChanged());
+    CHECK(t.list.portals[0].previous == before);
+    CHECK(t.list.portals[1].previous == t.list.portals[1].world);
+    const RenderInstance& bar = t.list.instances[floorParts];
+    CHECK(nearlyEqual(glm::vec3(t.list.motions[bar.motion] * bar.world[3]), barBefore, 1e-5f));
     requireSameAsRemade(t.scene, t.list);
+    // Still again: no motion
+    t.scene.buildRenderList(t.list);
+    CHECK(t.list.portals[0].previous == t.list.portals[0].world);
+    CHECK(t.list.motions[t.list.instances[floorParts].motion] == glm::mat4(1.0f));
 
     // A hidden end: the pair is off, the other end's rim still shows where it is (in its own colour: B's)
     t.scene.find(a)->visible = false;

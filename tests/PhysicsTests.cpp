@@ -484,6 +484,68 @@ TEST_CASE("Physics: the wall beside a portal still blocks", "[Physics][Portals]"
     CHECK(state.feet.z == Catch::Approx(-2.7f).margin(1e-3));
 }
 
+namespace {
+
+// The character (1.8 tall, eyes at 1.65, with this portal slack) walking 2 s towards -Z from feet at (x, 0, 0) into a
+// wall whose face is at z = -3, with A of a pair 1 wide in it from y = bottom to top (B at x = 10 the same): the
+// portals it went through and where it ended
+int walkIntoPortal(float slack, float x, float bottom, float top, glm::vec3* feet = nullptr) {
+    std::unique_ptr<PhysicsWorld> world = makeSimplePhysicsWorld();
+    world->addBox({glm::vec3(20.0f, 0.5f, 20.0f)}, at({0.0f, -0.5f, 0.0f}));
+    world->addBox({glm::vec3(6.0f, 2.0f, 0.5f)}, at({0.0f, 2.0f, -3.5f}));
+    float middle = 0.5f * (bottom + top);
+    std::vector<portals::PortalOpening> openings;
+    portals::addPortalPair(openings, glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, middle, -3.0f)),
+                           glm::translate(glm::mat4(1.0f), glm::vec3(10.0f, middle, 0.0f)),
+                           glm::vec2(0.5f, 0.5f * (top - bottom)), false);
+    world->setPortals(openings, 8);
+    CharacterSettings settings;
+    settings.portalSlack = slack;
+    CharacterId player = world->addCharacter(settings, {x, 0.0f, 0.0f});
+    glm::vec3 wanted(0.0f, 0.0f, -2.0f);
+    int crossed = 0;
+    CharacterState state;
+    for (int i = 0; i < 120; i++) {
+        state = world->moveCharacter(player, wanted, 0.0f, gravity, stepSeconds);
+        if (state.crossedPortal) {
+            crossed++;
+            wanted = glm::mat3(state.portalCrossing) * wanted;
+        }
+    }
+    if (feet != nullptr) {
+        *feet = state.feet;
+    }
+    return crossed;
+}
+
+}  // namespace
+
+TEST_CASE("Physics: with portal slack the character goes through an opening it sticks out of a little, on any side",
+          "[Physics][Portals]") {
+    glm::vec3 feet;
+    // An opening 6 cm above the floor: its feet stick out below
+    CHECK(walkIntoPortal(0.0f, 0.0f, 0.06f, 2.06f, &feet) == 0);
+    CHECK(feet.z == Catch::Approx(-2.7f).margin(1e-3));  // stopped by the wall
+    CHECK(walkIntoPortal(0.25f, 0.0f, 0.06f, 2.06f, &feet) == 1);
+    CHECK(feet.x == Catch::Approx(10.0f).margin(1e-3));
+    CHECK(feet.z > 0.5f);  // walked on out of B
+    // Its eyes at the top edge (the head above it), or a little above
+    CHECK(walkIntoPortal(0.0f, 0.0f, 0.0f, 1.65f) == 0);
+    CHECK(walkIntoPortal(0.25f, 0.0f, 0.0f, 1.65f) == 1);
+    CHECK(walkIntoPortal(0.25f, 0.0f, 0.0f, 1.55f) == 1);
+    // Beside the opening's edge (the capsule 0.2 past it)
+    CHECK(walkIntoPortal(0.0f, 0.4f, 0.0f, 2.0f) == 0);
+    CHECK(walkIntoPortal(0.25f, 0.4f, 0.0f, 2.0f) == 1);
+}
+
+TEST_CASE("Physics: further out than the portal slack the wall around the opening still blocks", "[Physics][Portals]") {
+    glm::vec3 feet;
+    CHECK(walkIntoPortal(0.25f, 0.6f, 0.0f, 2.0f, &feet) == 0);  // 0.4 past the edge
+    CHECK(feet.z == Catch::Approx(-2.7f).margin(1e-3));
+    CHECK(walkIntoPortal(0.25f, 0.0f, 0.0f, 1.3f, &feet) == 0);  // the head 0.5 above the top
+    CHECK(feet.z == Catch::Approx(-2.7f).margin(1e-3));
+}
+
 TEST_CASE("Physics: half through a portal, what is beyond the exit stops the character", "[Physics][Portals]") {
     TestWorld t;
     walledPortal(t);

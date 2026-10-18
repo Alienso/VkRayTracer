@@ -26,6 +26,30 @@ vec2 motionVector(vec4 current, vec4 previous) {
     return clamp(motion, vec2(-65504.0), vec2(65504.0));
 }
 
+// Where a point seen through `crossings` openings along the camera ray appeared last frame: point (where it was last
+// frame) taken back through those openings as they were then. The camera ray is followed through the openings
+// again (their tests only, no ray queries): the same ones the trace went through. Through ends that stood still this
+// is where the point appears now, unless the point itself moved.
+vec4 seenThroughPortalsLastFrame(vec3 cameraDirection, uint crossings, vec4 point) {
+    vec3 origin = scene.cameraPosition.xyz;
+    vec3 direction = cameraDirection;
+    int skip = -1;
+    mat4 back = mat4(1.0);
+    for (uint i = 0; i < crossings; i++) {
+        float t;
+        int portal = nearestPortal(origin, direction, RAY_FAR, skip, t);
+        if (portal < 0) {
+            break;
+        }
+        back = back * mat4(portals[portal].lastFromPartner);
+        mat4x3 toPartner = portals[portal].toPartner;
+        origin = toPartner * vec4(origin + direction * t, 1.0);
+        direction = normalize(mat3(toPartner) * direction);
+        skip = portal ^ 1;
+    }
+    return back * point;
+}
+
 // Rays that hit nothing: far away, moving only with the camera's rotation. The other guides as DLSS RR's guide
 // recommends for the sky: albedo 0.5, no specular, normal and roughness 0, the largest half float as hit distance.
 void storeSkyGuides(ivec2 pixel, vec3 direction) {
@@ -41,14 +65,20 @@ void storeSkyGuides(ivec2 pixel, vec3 direction) {
 // (energy compensated) reflection doesn't return; light going through glass counts as specular (it stays sharp,
 // like a reflection). The specular hit distance is 0 (unknown) unless the bounce from here reflects (tracePath).
 // direction: the ray's last part (after portals), cameraDirection: the camera ray's own. Seen through a portal, the
-// surface is where it appears: `distance` (the whole length) along the camera ray (portals don't move with the
-// camera), not where it is. Seen through mirrors (storeMirrorGuides) likewise, its normal turned the way the
-// mirrors turn it (toCamera) and its albedos tinted by their color (tint).
+// surface is where it appears: `distance` (the whole length) along the camera ray, not where it is; last frame it
+// appeared where the openings it went through (portalCrossings, straight from the camera) showed it then, with its
+// object's motion (a moving end, or a moving object seen through one, moves on the image). Seen through mirrors
+// (storeMirrorGuides) likewise, as if they stood still (portalCrossings 0), its normal turned the way the mirrors turn
+// it (toCamera) and its albedos tinted by their color (tint).
 void storeSurfaceGuides(ivec2 pixel, Hit hit, vec3 direction, vec3 cameraDirection, bool virtualPosition,
-                        float distance, mat3 toCamera, vec3 tint) {
+                        uint portalCrossings, float distance, mat3 toCamera, vec3 tint) {
     // A point on an object that moved is reprojected with the object's own motion as well
     vec4 position = vec4(virtualPosition ? scene.cameraPosition.xyz + cameraDirection * distance : hit.position, 1.0);
-    vec4 previousPosition = virtualPosition ? position : instanceMotion(hit.instanceIndex) * position;
+    vec4 previousPosition = !virtualPosition ? instanceMotion(hit.instanceIndex) * position
+                            : FEATURE_PORTALS && portalCrossings > 0
+                                ? seenThroughPortalsLastFrame(cameraDirection, portalCrossings,
+                                                              instanceMotion(hit.instanceIndex) * vec4(hit.position, 1.0))
+                                : position;
     imageStore(linearDepthImage, pixel, vec4(distance * dot(cameraDirection, scene.cameraForward.xyz)));
     imageStore(motionVectorImage, pixel, vec4(motionVector(position, previousPosition), 0.0, 0.0));
     ReflectionEnergy energy = reflectionEnergy(hit, dot(hit.normal, -direction));
@@ -133,7 +163,8 @@ void storeMirrorGuides(ivec2 pixel, vec3 cameraDirection, uint seed) {
         bool virtualPosition = i > 0 || intersection.travelled != 0.0;
         if (!found || (!guideMirror(hit) && !clear)) {
             if (found) {
-                storeSurfaceGuides(pixel, hit, direction, cameraDirection, virtualPosition, distance, toCamera, tint);
+                storeSurfaceGuides(pixel, hit, direction, cameraDirection, virtualPosition,
+                                   i == 0 ? intersection.crossings : 0u, distance, toCamera, tint);
             } else if (intersection.travelled >= 0.0) {
                 storeSkyGuides(pixel, cameraDirection);
             } else {
@@ -204,7 +235,8 @@ bool traceCameraRay(ivec2 pixel, inout vec3 direction, inout uint seed, out Inte
         if (!found || !guideMirror(hit) || i == scene.maxBounces || FOG != 0) {
             if (travelled > 0.0 && scene.writeGuides != 0) {
                 if (found) {
-                    storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, travelled + hit.t, toCamera, tint);
+                    storeSurfaceGuides(pixel, hit, direction, cameraDirection, true, 0u, travelled + hit.t, toCamera,
+                                       tint);
                 } else {
                     storeSkyGuides(pixel, cameraDirection);
                 }

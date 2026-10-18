@@ -638,11 +638,15 @@ So that a portal set into a wall shows its view, not the wall, rays stop 1 mm be
 after its partner.
 - Where: `PORTAL_GAP`.
 
-### DLSS through portals: normals and moving portals
-Through a portal, depth and motion vectors are for where the surface appears (correct while the portals stand
-still), but the normal guide is the surface's real one, not turned like the view. A moving portal or an object
-moving behind one gives wrong motion vectors there.
-- Where: `storeSurfaceGuides`.
+### DLSS through portals: normals, and portals seen in mirrors
+Through a portal, depth and motion vectors are for where the surface appears. Moving portals and objects moving behind
+one are handled: last frame's position comes back through the openings as they were then (`RenderPortal::previous`,
+`seenThroughPortalsLastFrame`; before, the view through a moving end had no motion and DLSS smeared it). The rims move
+with their ends too (each bar has its own motion). Left:
+- The normal guide is the surface's real one, not turned like the view.
+- A portal seen in a mirror or through clear glass: its view is reprojected as if everything there stood still.
+- A pair turned on or off: DLSS starts from what was there before (the wall), like any sudden change.
+- Where: `storeSurfaceGuides`, `seenThroughPortalsLastFrame` (dlss_inputs.glsl).
 
 ### Objects half through a portal: what is drawn
 A model going into an opening is cut there and shown again at the other end (Scene::findPortalPieces, ghosts at the
@@ -923,8 +927,11 @@ differently (its real part and the part out of the other end) block each other.
   into the overlap. So a capsule rests on what is under its axis: half through, the floor beyond the exit doesn't
   hold it up until its middle is through. With portals in walls the eyes and the axis go through together, so it
   doesn't show; a floor that ends before the opening drops the player as without portals.
-- The player only goes in when its whole outline fits the opening (a 1.8 m player and a 2 m door: fine; off to the
-  side by more than the gap, the wall stops it, as it should).
+- The player goes in when its whole outline fits the opening grown by its `portalSlack` (player property, default
+  0.25 m, on every side): a portal a little above the floor, or the eyes at its top edge, still let it through. Within
+  the slack the wall around the opening doesn't stop it, and its eyes go through there too, so with a large slack the
+  camera can come right up to the wall beside or above the opening before it goes through (a frame or so of wall up
+  close). Further out the wall stops it, as it should. Colliders get no slack.
 - A collider's real side is its box's center (the game carries its entity by the entity's origin: a collider offset
   far from its entity can be the wrong piece while half through). It keeps the side it had while a move goes on, and
   when a placement goes through an opening (until the game's carry places it at the other end).

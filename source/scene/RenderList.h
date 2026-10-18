@@ -58,6 +58,8 @@ struct RenderLight {
 // One end of an enabled portal pair. The pairs' ends follow each other: entries 2k and 2k + 1 are a pair.
 struct RenderPortal {
     glm::mat4 world;      // the end entity's world placement without scale: the opening in its XY plane, facing +Z
+    // Last frame's (world when it is new): what is seen through a moving end moves with it (the motion vectors)
+    glm::mat4 previous;
     glm::vec2 halfSize;   // half the width and height
     PortalShape shape;
 };
@@ -181,7 +183,8 @@ private:
     std::vector<BuiltEntity> builtEntities;
     uint64_t builtLayout = 0;  // Scene's layout revision and the AssetStore's revision the list was made with
     uint64_t builtAssets = 0;
-    // The portal rims' bars (mesh, world matrix), after the entities' instances from firstRim on
+    // The portal rims' bars (mesh, world matrix), after the entities' instances from firstRim on, each with its own
+    // motion (they move with their ends)
     std::vector<std::pair<uint32_t, glm::mat4>> builtRims;
     uint32_t firstRim = 0;
     // The ghosts (an entity's piece through portals), after the rims, each with a motion after the others' from
@@ -195,6 +198,8 @@ private:
     };
     std::vector<BuiltGhost> builtGhosts;
     uint32_t firstGhostMotion = 0;
+    // The portal ends' entities and their placements, for next frame's RenderPortal::previous
+    std::vector<std::pair<uint64_t, glm::mat4>> builtPortalEnds;
 };
 
 #endif //VULKANDEMO_RENDERLIST_H

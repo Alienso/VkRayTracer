@@ -123,6 +123,9 @@ private:
     std::vector<uint32_t> freeCharacters;
     std::vector<portals::PortalOpening> openings;
     int portalDepth = 1;
+    // The openings grown by a character's portalSlack (made when asked for another slack, or new openings)
+    mutable std::vector<portals::PortalOpening> grownOpenings;
+    mutable float grownSlack = -1.0f;
 
     Body* findBody(BodyId id);
     Character* findCharacter(CharacterId id);
@@ -131,10 +134,13 @@ private:
     // A body's anchor moved to position: there, unless that went through an opening (it is then still on the side it
     // came from: the game carries it through after the step)
     glm::vec3 anchorAfter(const glm::vec3& anchor, const glm::vec3& position) const;
-    // The pieces of a shape whose bounds are box (none when it is whole: no opening near)
+    // The openings as a character sees them (CharacterSettings::portalSlack)
+    const std::vector<portals::PortalOpening>& openingsFor(const CharacterSettings& settings) const;
+    // The pieces of a shape whose bounds are box, by these openings (none when it is whole: no opening near)
     void piecesOf(const portals::OrientedBox& box, const glm::vec3& anchor,
-                  std::vector<portals::PortalPiece>& pieces) const;
-    Capsule capsuleAt(const glm::vec3& a, const glm::vec3& b, float radius, const glm::vec3& anchor) const;
+                  const std::vector<portals::PortalOpening>& within, std::vector<portals::PortalPiece>& pieces) const;
+    Capsule capsuleAt(const glm::vec3& a, const glm::vec3& b, float radius, const glm::vec3& anchor,
+                      const std::vector<portals::PortalOpening>& within) const;
     Capsule characterAt(const CharacterSettings& settings, const glm::vec3& feet) const;
     // How to push the capsule out of the body (through their pieces), or nothing
     std::optional<Contact> contact(const Capsule& capsule, const Body& body) const;

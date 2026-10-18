@@ -399,8 +399,9 @@ struct GpuPortal {
     glm::vec3 right;         // along its width
     uint32_t shape;          // PortalShape
     glm::mat4x3 toPartner;   // takes points (and directions) from this end to the other one
+    glm::mat4x3 lastFromPartner;  // last frame's way back: from the other end to this one, as they were then
 };
-static_assert(sizeof(GpuPortal) == 96, "GpuPortal must match Portal in shaders/raytrace/portals.glsl");
+static_assert(sizeof(GpuPortal) == 144, "GpuPortal must match Portal in shaders/raytrace/portals.glsl");
 
 // Must match ClipCut and ClipRegion in shaders/raytrace/bindings.glsl (scalar layout). What an instance cut by portal
 // openings keeps (RenderList::clipRegions, portals::pieceKeeps); its TLAS instance's shader binding table offset is

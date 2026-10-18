@@ -249,7 +249,8 @@ vec3 tracePath(vec3 origin, vec3 direction, inout uint seed, bool storeGuides, b
         tiltTowardsViewer(hit, direction);
         // Seen in mirrors through the RESTIR_PASS's stored hit: that pass wrote the guides (traceCameraRay)
         if (bounce == 0 && wantGuides && !(crossedPortal && intersection.crossings == 0) && !isFog(hit)) {
-            storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, hit.t, mat3(1.0), vec3(1.0));
+            storeSurfaceGuides(pixel, hit, direction, rayDirection, crossedPortal, intersection.crossings, hit.t,
+                               mat3(1.0), vec3(1.0));
             guidesRetrace = guideMirror(hit) || guideClear(hit);
         }
 

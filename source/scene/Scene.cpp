@@ -636,14 +636,14 @@ void Scene::remakeInstances(RenderList& list, const std::vector<PlacedModel>& mo
         }
         list.builtEntities.push_back(built);
     }
-    // The portal rims: still (no motion), one shared identity motion
+    // The portal rims' bars, each with its own motion: from last frame's bar in the same place in the list (the
+    // same mesh), none for a new one
     list.firstRim = static_cast<uint32_t>(list.instances.size());
-    if (!rims.empty()) {
+    for (size_t i = 0; i < rims.size(); i++) {
+        bool same = i < list.builtRims.size() && list.builtRims[i].first == rims[i].first;
         uint32_t motionIndex = static_cast<uint32_t>(list.motions.size());
-        list.motions.push_back(glm::mat4(1.0f));
-        for (const auto& [mesh, world] : rims) {
-            list.instances.push_back({mesh, motionIndex, world});
-        }
+        list.motions.push_back(motionFrom(same ? &list.builtRims[i].second : nullptr, rims[i].second));
+        list.instances.push_back({rims[i].first, motionIndex, rims[i].second});
     }
     list.builtRims = std::move(rims);
     list.firstGhostMotion = static_cast<uint32_t>(list.motions.size());
@@ -713,10 +713,16 @@ bool Scene::updateInstances(RenderList& list, const std::vector<PlacedModel>& mo
         list.builtEntities[i].world = models[i].world;
         list.builtEntities[i].originalSize = models[i].component->originalSize;
     }
-    if (rims != list.builtRims) {
-        for (size_t i = 0; i < rims.size(); i++) {
-            list.instances[list.firstRim + i].world = rims[i].second;
+    for (size_t i = 0; i < rims.size(); i++) {
+        RenderInstance& instance = list.instances[list.firstRim + i];
+        glm::mat4 motion = motionFrom(&list.builtRims[i].second, rims[i].second);
+        if (list.motions[instance.motion] != motion) {
+            list.motions[instance.motion] = motion;
+            list.motionChanged = true;
         }
+        instance.world = rims[i].second;
+    }
+    if (rims != list.builtRims) {
         list.changed.push_back({list.firstRim, static_cast<uint32_t>(rims.size())});
         list.builtRims = std::move(rims);
     }
@@ -853,7 +859,8 @@ std::vector<Scene::PlacedPair> Scene::placePairs(const std::vector<Placed>& plac
         if (portal != nullptr && portal->endA && p.visible) {
             auto other = placedIndex.find(portal->other);
             if (other != placedIndex.end() && placed[other->second].visible) {
-                pairs.push_back({{withoutScale(p.world), withoutScale(placed[other->second].world)}, portal});
+                pairs.push_back({{withoutScale(p.world), withoutScale(placed[other->second].world)}, portal,
+                                 {p.entity->id, portal->other}});
             }
         }
     }
@@ -995,11 +1002,13 @@ void Scene::buildRenderList(RenderList& list) {
     std::vector<RenderList::BuiltGhost> ghostsBefore;
     std::vector<ClipRegion> regionsBefore;
     std::vector<std::pair<uint32_t, glm::mat4>> rimsBefore;
+    std::vector<std::pair<uint32_t, glm::mat4>> builtRimsBefore;
     if (checkUpdates) {
         before = list.builtEntities;
         ghostsBefore = list.builtGhosts;
         regionsBefore = list.clipRegions;
         rimsBefore = rims;
+        builtRimsBefore = list.builtRims;
     }
     bool updated = updateInstances(list, models, rims, clips);
     if (!updated) {
@@ -1013,6 +1022,7 @@ void Scene::buildRenderList(RenderList& list) {
         scratch.builtEntities = std::move(before);
         scratch.builtGhosts = std::move(ghostsBefore);
         scratch.clipRegions = std::move(regionsBefore);
+        scratch.builtRims = std::move(builtRimsBefore);
         remakeInstances(scratch, models, rimsBefore, clips);
         placeGhosts(scratch, models, pieces);
         size_t wrong = 0;
@@ -1031,11 +1041,20 @@ void Scene::buildRenderList(RenderList& list) {
 
     list.lights.clear();
     list.portals.clear();
+    std::vector<std::pair<uint64_t, glm::mat4>> portalEnds;
     for (const PlacedPair& pair : pairs) {
-        for (const glm::mat4& end : pair.ends) {
-            list.portals.push_back({end, pair.portal->size * 0.5f, pair.portal->shape});
+        for (int k = 0; k < 2; k++) {
+            glm::mat4 previous = pair.ends[k];
+            for (const auto& [id, placement] : list.builtPortalEnds) {  // (a few)
+                if (id == pair.ids[k]) {
+                    previous = placement;
+                }
+            }
+            list.portals.push_back({pair.ends[k], previous, pair.portal->size * 0.5f, pair.portal->shape});
+            portalEnds.emplace_back(pair.ids[k], pair.ends[k]);
         }
     }
+    list.builtPortalEnds = std::move(portalEnds);
     for (const PlacedModel& placedModel : models) {
         if (!placedModel.visible) {
             continue;

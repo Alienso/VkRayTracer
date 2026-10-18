@@ -33,6 +33,10 @@ struct CharacterSettings {
     // The point this high above the feet goes through portals for the character (the player's eyes): when it goes
     // through an opening, the character comes out of the other end; until then the character is on its side
     float anchorHeight = 1.65f;
+    // How far the body may stick out past a portal opening's edges (every side) and still go through it: for it the
+    // openings are this much bigger, so the wall around one doesn't stop it there (a portal a little above the floor,
+    // or the head above its top edge). Its anchor goes through them too.
+    float portalSlack = 0.0f;
 };
 
 // Where a group of bodies moved with moveBodies got to

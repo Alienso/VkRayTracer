@@ -298,6 +298,7 @@ private:
     struct PlacedPair {
         glm::mat4 ends[2];
         const PortalComponent* portal;
+        EntityId ids[2];  // the ends' entities
     };
     // The enabled pairs (both ends visible), in the order of their A ends
     [[nodiscard]] std::vector<PlacedPair> placePairs(const std::vector<Placed>& placed) const;

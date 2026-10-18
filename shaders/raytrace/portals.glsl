@@ -26,6 +26,7 @@ struct Portal {
     vec3 right;          // along its width; its height is along cross(normal, right)
     uint shape;          // 0 rectangle, PORTAL_ELLIPSE (PortalShape in Portal.h)
     mat4x3 toPartner;
+    mat4x3 lastFromPartner;  // last frame's way back from the partner (the motion vectors through a moving end)
 };
 layout(binding = 31, scalar) readonly buffer Portals { Portal portals[]; };
 const uint PORTAL_ELLIPSE = 1;
