@@ -377,9 +377,9 @@ TEST_CASE("Camera path: blended between steps like entities", "[Game][Interactio
 // ---------------------------------------------------------------------------------------------
 // The checked-in game scenes
 
-TEST_CASE("Game scenes: scenes/game_demo.json, game_flythrough.json and game_walk.json play without a warning",
-          "[Game][Scenes]") {
-    for (const char* name : {"game_demo.json", "game_flythrough.json", "game_walk.json"}) {
+TEST_CASE("Game scenes: the scenes in scenes/game/ play without a warning", "[Game][Scenes]") {
+    for (const char* name :
+         {"game/game_demo.json", "game/game_flythrough.json", "game/game_walk.json", "game/game_portals.json"}) {
         INFO(name);
         TestScene t;  // (only built-in models here: the helmet is missing, its components stay)
         std::vector<std::string> sceneWarnings = t.scene.load(std::string(VULKANDEMO_SCENES_DIR) + "/" + name);

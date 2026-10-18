@@ -158,6 +158,7 @@ private:
     double unsavedCheckTime = -1.0;
     // .json files in scenesDirectory and its subfolders, as paths in it (scanned when File > Open opens)
     std::vector<std::string> sceneFiles;
+    std::vector<std::string> sceneFolders;  // its subfolders (also the empty ones), as paths in it
     char saveAsName[128] = "";
     bool askSaveAs = false;     // open the Save As question this frame
     bool playing = false;
@@ -211,6 +212,9 @@ private:
     void buildSaveAsQuestion();
     void buildUnsavedQuestion();
     void scanSceneFiles();
+    // File > Open's entries for a folder in the scenes folder ("": the scenes folder): its subfolders as menus, then
+    // its scenes
+    void buildSceneMenu(const std::string& folder);
     bool hasUnsavedChanges();  // checks now
     // New / Open / Exit: right away, or after asking when there are unsaved changes
     void request(FileAction action, const std::string& path = "");

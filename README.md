@@ -153,11 +153,11 @@ general engine: one game, in C++, with one file per behaviour in `source/game/be
   outlined in green over the image (View > "Collider outlines": all of them), so a size can be checked by eye; one
   part way through a portal is outlined as the physics has it: cut at the opening, its part out of the other end in
   orange.
-- `scenes/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
-  collect the coins and the helmet, go into the room behind the door); `scenes/game_flythrough.json` has a camera
-  path around the helmet; `scenes/game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
+- `scenes/game/game_demo.json` has each of the first ones except the camera path (walk up to the door and press E,
+  collect the coins and the helmet, go into the room behind the door); `game_flythrough.json` has a camera
+  path around the helmet; `game_walk.json` has a player among colliders: a crate to jump on, stairs, a ramp,
   the door, a moving lift, a solid box that slides into the wall (and pushes you), and a portal pair that leads
-  behind the wall; `scenes/game_portals.json` has portals: one set in a wall (walk in), a solid box sliding through
+  behind the wall; `game_portals.json` has portals: one set in a wall (walk in), a solid box sliding through
   one in a wall and back, a stick between two ends facing each other, a stick through a chain of two pairs, and
   the portal gun on the player.
   What it can't do yet: LIMITATIONS.md, "Game".

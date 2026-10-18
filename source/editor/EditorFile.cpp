@@ -14,20 +14,53 @@
 
 void Editor::scanSceneFiles() {
     sceneFiles.clear();
+    sceneFolders.clear();
     std::error_code error;
     for (auto entry = std::filesystem::recursive_directory_iterator(scenesDirectory, error);
          entry != std::filesystem::recursive_directory_iterator(); entry.increment(error)) {
-        if (entry->is_regular_file() && entry->path().extension() == ".json") {
-            // Its path in the folder: those in subfolders keep theirs as a prefix ("test/portal_rooms.json")
-            sceneFiles.push_back(std::filesystem::relative(entry->path(), scenesDirectory, error).generic_string());
+        // Paths in the folder ("test/portal_rooms.json"): the Open menu nests them by folder
+        std::string path = std::filesystem::relative(entry->path(), scenesDirectory, error).generic_string();
+        if (entry->is_directory()) {
+            sceneFolders.push_back(path);
+        } else if (entry->is_regular_file() && entry->path().extension() == ".json") {
+            sceneFiles.push_back(path);
         }
     }
-    // The folder's own first, then each subfolder's together
-    std::sort(sceneFiles.begin(), sceneFiles.end(), [](const std::string& a, const std::string& b) {
-        bool aNested = a.find('/') != std::string::npos;
-        bool bNested = b.find('/') != std::string::npos;
-        return aNested != bNested ? bNested : a < b;
-    });
+    std::sort(sceneFiles.begin(), sceneFiles.end());
+    std::sort(sceneFolders.begin(), sceneFolders.end());
+}
+
+// The folder a path in the scenes folder is in ("" for the scenes folder itself), and its own name
+static std::string folderOf(const std::string& path) {
+    size_t slash = path.rfind('/');
+    return slash == std::string::npos ? "" : path.substr(0, slash);
+}
+static std::string nameOf(const std::string& path) {
+    return path.substr(path.rfind('/') + 1);  // (npos + 1: all of it)
+}
+
+void Editor::buildSceneMenu(const std::string& folder) {
+    bool any = false;
+    for (const std::string& sub : sceneFolders) {  // its subfolders first, as menus
+        if (folderOf(sub) == folder) {
+            any = true;
+            if (ImGui::BeginMenu(nameOf(sub).c_str())) {
+                buildSceneMenu(sub);
+                ImGui::EndMenu();
+            }
+        }
+    }
+    for (const std::string& file : sceneFiles) {
+        if (folderOf(file) == folder) {
+            any = true;
+            if (ImGui::MenuItem(nameOf(file).c_str())) {
+                request(FileAction::Open, std::string(scenesDirectory) + "/" + file);
+            }
+        }
+    }
+    if (!any) {
+        ImGui::TextDisabled(folder.empty() ? "no scenes in the %s folder yet" : "no scenes here", scenesDirectory);
+    }
 }
 
 bool Editor::hasUnsavedChanges() {
@@ -170,14 +203,7 @@ void Editor::buildFileMenu() {
         if (ImGui::IsWindowAppearing()) {
             scanSceneFiles();
         }
-        if (sceneFiles.empty()) {
-            ImGui::TextDisabled("no scenes in the %s folder yet", scenesDirectory);
-        }
-        for (const std::string& file : sceneFiles) {
-            if (ImGui::MenuItem(file.c_str())) {
-                request(FileAction::Open, std::string(scenesDirectory) + "/" + file);
-            }
-        }
+        buildSceneMenu("");
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Open recent", !userSettings.recentScenes.empty())) {
