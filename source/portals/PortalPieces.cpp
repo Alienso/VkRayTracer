@@ -359,6 +359,27 @@ bool pieceKeeps(const PortalPiece& piece, const glm::vec3& worldPoint) {
     return true;
 }
 
+bool pieceMissesBox(const PortalPiece& piece, const OrientedBox& box) {
+    for (int i = 0; i < piece.cutCount; i++) {
+        const PortalCut& cut = piece.cuts[i];
+        if (!cut.keepNear) {
+            continue;
+        }
+        // The box's nearest point to the kept side: its center's height over the plane plus its reach along the
+        // plane's normal
+        float height = cut.side * apply(cut.worldToEnd, box.center).z;
+        glm::mat3 turn(cut.worldToEnd);
+        float reach = 0.0f;
+        for (int k = 0; k < 3; k++) {
+            reach += std::abs((turn * box.axes[k]).z) * box.half[k];
+        }
+        if (height + reach < -keepTolerance) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool crossesOpening(const PortalOpening& opening, const glm::vec3& a, const glm::vec3& b, float& along) {
     glm::vec3 center(opening.end[3]);
     glm::vec3 normal(opening.end[2]);

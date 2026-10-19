@@ -83,6 +83,11 @@ void portalPieces(const OrientedBox& box, const glm::vec3& anchor, const std::ve
 // Whether a point of the world is in the piece (its cuts' regions; points on a cut's plane are kept)
 bool pieceKeeps(const PortalPiece& piece, const glm::vec3& worldPoint);
 
+// Whether a box of the world lies all in what one of the piece's exit cuts removes (behind the end it came out of):
+// nothing of it can touch the piece. A contact judged by one point (pieceKeeps) can't tell this: a deep overlap with
+// something right behind an exit (a wall 1 cm behind the end) can have its middle in front of the end.
+bool pieceMissesBox(const PortalPiece& piece, const OrientedBox& box);
+
 // Whether the line from a to b goes through the opening (into either side), and where along it (0..1)
 bool crossesOpening(const PortalOpening& opening, const glm::vec3& a, const glm::vec3& b, float& along);
 

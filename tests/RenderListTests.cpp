@@ -178,6 +178,29 @@ TEST_CASE("RenderList: a portal pair gives two portal ends and rim bars after th
     CHECK(t.list.portals[0].previous == t.list.portals[0].world);
     CHECK(t.list.motions[t.list.instances[floorParts].motion] == glm::mat4(1.0f));
 
+    // Another pair, then the first pair's rims turned off and on: the second's bars move in the list but not in the
+    // world, so no motion (matched by which bar they are, not by their place in the list)
+    EntityId second = t.scene.addPortalPair();
+    t.scene.find(second)->local.position.x += 4.0f;
+    t.scene.buildRenderList(t.list);
+    t.scene.buildRenderList(t.list);
+    auto stillRims = [&]() {
+        for (size_t i = floorParts; i < t.list.instances.size(); i++) {
+            CHECK(t.list.motions[t.list.instances[i].motion] == glm::mat4(1.0f));
+        }
+    };
+    stillRims();
+    for (bool rim : {false, true}) {
+        t.scene.portal(a)->rim = rim;
+        t.scene.portal(t.scene.find(pair)->children[1])->rim = rim;
+        t.scene.buildRenderList(t.list);
+        CHECK(t.list.instances.size() == floorParts + (rim ? 16 : 8));
+        stillRims();
+        requireSameAsRemade(t.scene, t.list);
+    }
+    t.scene.remove(second);
+    t.scene.buildRenderList(t.list);
+
     // A hidden end: the pair is off, the other end's rim still shows where it is (in its own colour: B's)
     t.scene.find(a)->visible = false;
     t.scene.buildRenderList(t.list);

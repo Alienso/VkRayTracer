@@ -546,6 +546,39 @@ TEST_CASE("Physics: further out than the portal slack the wall around the openin
     CHECK(feet.z == Catch::Approx(-2.7f).margin(1e-3));
 }
 
+TEST_CASE("Physics: a wall right behind the exit doesn't push the character back out of the entrance",
+          "[Physics][Portals]") {
+    // (Its part out of B, the ghost, is mostly behind B, deep in that wall while it goes in: cut away there, it must
+    // not count, though the overlap's middle can land in the 1 cm in front of B.) A short character (1 m, eyes at
+    // 0.8), as in the scene this was found in.
+    for (float x : {-0.15f, 0.0f, 0.15f}) {
+        TestWorld t;
+        walledPortal(t);
+        t.world->addBox({glm::vec3(2.0f, 2.0f, 0.08f)}, at({10.0f, 2.0f, -0.01f - 0.08f}));
+        CharacterSettings settings;
+        settings.shape = {0.3f, 0.2f};
+        settings.anchorHeight = 0.8f;
+        CharacterId player = t.world->addCharacter(settings, {x, 0.0f, 0.0f});
+        glm::vec3 wanted(0.0f, 0.0f, -2.0f);
+        int crossed = 0;
+        int pushedBack = 0;
+        CharacterState state = t.world->character(player);
+        for (int i = 0; i < 120; i++) {
+            glm::vec3 before = state.feet;
+            state = t.world->moveCharacter(player, wanted, 0.0f, gravity, stepSeconds);
+            if (state.crossedPortal) {
+                crossed++;
+                wanted = glm::mat3(state.portalCrossing) * wanted;
+            } else if (glm::dot(state.feet - before, wanted) < 0.0f) {
+                pushedBack++;
+            }
+        }
+        CHECK(crossed == 1);
+        CHECK(pushedBack == 0);
+        CHECK(state.feet.z > 0.8f);  // walked on out of B
+    }
+}
+
 TEST_CASE("Physics: half through a portal, what is beyond the exit stops the character", "[Physics][Portals]") {
     TestWorld t;
     walledPortal(t);

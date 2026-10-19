@@ -134,6 +134,26 @@ TEST_CASE("Portal pieces: what a cut keeps", "[Portals]") {
     CHECK(pieceKeeps(piece, {0, 0, 0}));
 }
 
+TEST_CASE("Portal pieces: a box all behind an exit can't touch the piece; an entrance never rules one out",
+          "[Portals]") {
+    PortalPiece piece;
+    piece.cutCount = 1;
+    piece.cuts[0] = PortalCut{glm::mat4(1.0f), doorSize, false, true, 1.0f};  // an exit: only its front kept
+    CHECK(pieceMissesBox(piece, boxAt({0, 0, -0.11f}, {5, 2, 0.1f})));         // a wall 1 cm behind it
+    CHECK_FALSE(pieceMissesBox(piece, boxAt({0, 0, -0.09f}, {5, 2, 0.1f})));   // 1 cm into the front
+    // Turned 45 degrees: its edge reaches 0.141 forward (straight, 0.1 would still be 3 cm behind)
+    OrientedBox turned{{0, 0, -0.13f}, glm::mat3(glm::rotate(glm::mat4(1.0f), glm::radians(45.0f), {0, 1, 0})),
+                       glm::vec3(0.1f)};
+    CHECK(pieceMissesBox(piece, boxAt(turned.center, turned.half)));
+    CHECK_FALSE(pieceMissesBox(piece, turned));
+    turned.center.z = -0.15f;
+    CHECK(pieceMissesBox(piece, turned));
+    piece.cuts[0].side = -1.0f;  // its back kept instead
+    CHECK_FALSE(pieceMissesBox(piece, boxAt({0, 0, -0.11f}, {5, 2, 0.1f})));
+    piece.cuts[0].keepNear = false;  // an entrance: what is behind it beside the opening stays
+    CHECK_FALSE(pieceMissesBox(piece, boxAt({0, 0, 0.5f}, glm::vec3(0.1f))));
+}
+
 TEST_CASE("Portal pieces: a stick through a chain of pairs is a piece per gap", "[Portals]") {
     std::vector<PortalOpening> openings = chain();
     std::vector<PortalPiece> pieces;

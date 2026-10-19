@@ -20,6 +20,7 @@
 
 #include <glm/glm.hpp>
 #include <cstdint>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "scene/Camera.h"
@@ -186,6 +187,15 @@ private:
     // The portal rims' bars (mesh, world matrix), after the entities' instances from firstRim on, each with its own
     // motion (they move with their ends)
     std::vector<std::pair<uint32_t, glm::mat4>> builtRims;
+    std::vector<uint64_t> builtRimKeys;  // which bar each is (Scene::buildPortalRims), for next frame's motions
+    // The rims' bars' world matrices by key
+    [[nodiscard]] std::unordered_map<uint64_t, glm::mat4> builtRimsByKey() const {
+        std::unordered_map<uint64_t, glm::mat4> byKey;
+        for (size_t i = 0; i < builtRims.size() && i < builtRimKeys.size(); i++) {
+            byKey.emplace(builtRimKeys[i], builtRims[i].second);
+        }
+        return byKey;
+    }
     uint32_t firstRim = 0;
     // The ghosts (an entity's piece through portals), after the rims, each with a motion after the others' from
     // firstGhostMotion on. world: the piece's transform * the entity's world transform, for next frame's motion.

@@ -642,7 +642,8 @@ after its partner.
 Through a portal, depth and motion vectors are for where the surface appears. Moving portals and objects moving behind
 one are handled: last frame's position comes back through the openings as they were then (`RenderPortal::previous`,
 `seenThroughPortalsLastFrame`; before, the view through a moving end had no motion and DLSS smeared it). The rims move
-with their ends too (each bar has its own motion). Left:
+with their ends too (each bar has its own motion, from last frame's same bar: found by its end and its number, as a
+rim turned on or off moves the others in the list). Left:
 - The normal guide is the surface's real one, not turned like the view.
 - A portal seen in a mirror or through clear glass: its view is reprojected as if everything there stood still.
 - A pair turned on or off: DLSS starts from what was there before (the wall), like any sudden change.
@@ -924,7 +925,9 @@ that went in touches what is beyond the other end, and what is behind the entran
 (PORTAL_PHYSICS_PLAN.md phases 3-4). A solid collider's move tests its pieces the same way, and its own pieces placed
 differently (its real part and the part out of the other end) block each other.
 - Each pair of pieces gives one contact (the capsule against box test's deepest), kept or dropped by the point halfway
-  into the overlap. So a capsule rests on what is under its axis: half through, the floor beyond the exit doesn't
+  into the overlap. A box all behind the exit a piece came out of is skipped first (`pieceMissesBox`): with a wall
+  1 cm behind an end, the ghost's deep overlap with it had its middle in front of the end, and pushed the player back
+  out of the entrance. So a capsule rests on what is under its axis: half through, the floor beyond the exit doesn't
   hold it up until its middle is through. With portals in walls the eyes and the axis go through together, so it
   doesn't show; a floor that ends before the opening drops the player as without portals.
 - The player goes in when its whole outline fits the opening grown by its `portalSlack` (player property, default

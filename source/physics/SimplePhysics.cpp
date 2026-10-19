@@ -191,6 +191,13 @@ std::optional<Contact> SimplePhysicsWorld::contact(const Capsule& capsule, const
             if (!boundsMeet(min, max, boxMin, boxMax)) {
                 continue;
             }
+            // (One all behind the other's exit can't touch it, wherever the overlap's middle is)
+            if ((mine.cutCount > 0 &&
+                 portals::pieceMissesBox(mine, {solid.position, glm::mat3_cast(solid.rotation), body.halfExtents})) ||
+                (its.cutCount > 0 &&
+                 portals::pieceMissesBox(its, {0.5f * (min + max), glm::mat3(1.0f), 0.5f * (max - min)}))) {
+                continue;
+            }
             std::optional<Contact> found = capsuleBoxContact(a, b, capsule.radius, solid, body.halfExtents);
             if (!found) {
                 continue;
@@ -307,6 +314,13 @@ std::optional<Contact> SimplePhysicsWorld::boxContact(const Body& a, const Body&
                 boxBounds(solidB, b.halfExtents, minB, maxB);
             }
             if (!boundsMeet(minA, maxA, minB, maxB)) {
+                continue;
+            }
+            // (One all behind the other's exit can't touch it, as for the capsule)
+            if ((pieceA.cutCount > 0 &&
+                 portals::pieceMissesBox(pieceA, {solidB.position, glm::mat3_cast(solidB.rotation), b.halfExtents})) ||
+                (pieceB.cutCount > 0 &&
+                 portals::pieceMissesBox(pieceB, {solidA.position, glm::mat3_cast(solidA.rotation), a.halfExtents}))) {
                 continue;
             }
             std::optional<Contact> found =

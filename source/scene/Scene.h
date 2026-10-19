@@ -315,11 +315,13 @@ private:
     struct LoneEnd {
         glm::mat4 end;
         const PortalComponent* portal;
+        EntityId id;  // the end's entity
     };
     [[nodiscard]] std::vector<LoneEnd> placeLoneEnds(const std::vector<Placed>& placed) const;
-    // The bars of the pairs' rims and the lone ends': (mesh, world matrix) for each
+    // The bars of the pairs' rims and the lone ends': (mesh, world matrix) for each, and in keys which bar it is (its
+    // end's entity and its number in that rim: the same bar next frame, wherever it is in the list)
     [[nodiscard]] std::vector<std::pair<uint32_t, glm::mat4>> buildPortalRims(
-            const std::vector<PlacedPair>& pairs, const std::vector<LoneEnd>& lone) const;
+            const std::vector<PlacedPair>& pairs, const std::vector<LoneEnd>& lone, std::vector<uint64_t>& keys) const;
     // A model entity as this frame has it (buildRenderList)
     struct PlacedModel {
         EntityId id;
@@ -331,9 +333,11 @@ private:
     // when the layout turned out different: then nothing useful was done). clips: per model, its instances' clip
     // (RenderInstance::clip)
     void remakeInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, const std::vector<uint32_t>& clips) const;
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, std::vector<uint64_t>& rimKeys,
+                         const std::vector<uint32_t>& clips) const;
     bool updateInstances(RenderList& list, const std::vector<PlacedModel>& models,
-                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, const std::vector<uint32_t>& clips) const;
+                         std::vector<std::pair<uint32_t, glm::mat4>>& rims, std::vector<uint64_t>& rimKeys,
+                         const std::vector<uint32_t>& clips) const;
     // A visible model entity going into portal openings: its pieces (portals/PortalPieces.h; models[model])
     struct ModelPieces {
         size_t model;
